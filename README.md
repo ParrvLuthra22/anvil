@@ -16,7 +16,7 @@
 git clone https://github.com/ParrvLuthra22/anvil.git && cd anvil
 
 # 2. Set your API key (never written to disk)
-export AI_API_KEY=<your-openai-compatible-key>
+export AI_API_KEY="your-openai-compatible-key"
 
 # 3. Install everything (idempotent — safe to re-run)
 make setup
@@ -71,6 +71,12 @@ key in `config.yaml`:
 | `max_tokens_total` | `1 500 000` | Token budget for the whole run; hitting it forces graceful FINALIZE |
 | `wall_clock_seconds` | `1800` | 30-minute wall-clock limit; hitting it forces graceful FINALIZE |
 | `tool_output_char_cap` | `8000` | Max characters of any single tool/shell output; longer output keeps head + tail with `[N lines omitted]` |
+| `token_saving.read_file_max_lines` | `150` | With token budgets on, shorten longer file reads |
+| `token_saving.read_file_head_lines` | `60` | Leading lines retained in a shortened read, plus an outline |
+| `token_saving.context_keep_steps` | `3` | Tool-result retention window when token budgets are enabled |
+| `token_saving.tool_output_char_cap` | `4000` | Tighter output cap when token budgets are enabled |
+| `token_saving.repo_map_chars` | `3000` | Repository-map size when token budgets are enabled |
+| `token_saving.phase_calls` | Per-phase map | Call caps for UNDERSTAND, LOCALIZE, REPRODUCE, PATCH, VERIFY, REVIEW |
 | `max_context_tokens` | `32000` | Estimated token budget for the prompt (chars ÷ 4); leave headroom for tool schemas |
 | `context_keep_steps` | `6` | Tool output from earlier steps is replaced by a one-line summary after this many steps |
 | `context_summarize_threshold` | `0.75` | Fraction of `max_context_tokens` that triggers folding old turns into a digest (one extra LLM call) |
@@ -82,9 +88,15 @@ key in `config.yaml`:
 | `cost_per_million_prompt_tokens` | `0` | Optional cost reporting (USD per million prompt tokens); 0 = free tier / unknown |
 | `cost_per_million_completion_tokens` | `0` | Optional cost reporting (USD per million completion tokens) |
 | `sandbox` | `worktree` | Sandbox backend: `worktree` (default) \| `docker` (opt-in and experimental, no network in containers) \| `auto` |
+| `features.token_budgets` | `true` | Applies tighter per-phase caps, context retention, read, output, and repo-map limits |
+| `features.weak_model_prompts` | `true` | Adds explicit minimal-change and exception-handling guidance to PATCH and REVIEW |
+| `features.patch_sanity` | `true` | Checks non-empty/applicable patch and removes unrelated test-file edits |
+| `features.nav_tools` | `true` | Offers `outline` and `find_symbol` in LOCALIZE and PATCH when registered |
 
-> **Future work** (not yet implemented): Stable Docker sandbox containers, parallel benchmark workers,
-> per-model tokenizer, secrets scrubbing from sandbox environment beyond the fixed list.
+`max_output_tokens` is optional and otherwise comes from the selected model
+profile/provider. `llm_extra_params` is an optional provider-specific mapping.
+Nested `token_saving` values only tighten top-level settings when
+`features.token_budgets` is enabled. Feature switches accept `true` or `false`.
 
 ### Environment overrides (never put these in config.yaml)
 
@@ -103,8 +115,7 @@ key in `config.yaml`:
 python -m anvil
 python -m anvil --issue <url>
 
-# Headless — runs the REAL agent pipeline, no TUI, prints result to stdout
-# Requires AI_API_KEY and the real orchestrator to be wired up.
+# Headless — runs the same pipeline without the TUI; requires AI_API_KEY.
 python -m anvil --issue <url> --headless
 
 # Fallback when GitHub rate-limits you (passes repo URL + description to pipeline)
@@ -153,17 +164,24 @@ All tests are offline — no network, no real LLM, no API key required.
 
 ---
 
-## Benchmarks (Experimental)
-
-> **Status:** Experimental, with no published numbers yet (`bench/results.md` says "no results yet").
+## Benchmarks
 
 ```bash
-AI_API_KEY=<key> make bench
+make bench
 ```
 
-Runs each issue in `bench/issues.yaml` headlessly and writes results to
-`bench/results.md`.  Issues are verified by Akshat from `candidates.yaml`
-before being added — no fabricated entries.
+`make bench` runs `bench/instances.json`, scores patches in fresh checkouts,
+prints the results table and resolved rate, and analyzes traces. Set
+`AI_API_KEY` in the environment first. A labelled one-instance run is:
+
+```sh
+.venv/bin/python bench/run_bench.py --only <instance-id> --label trial-name
+.venv/bin/python bench/score.py
+.venv/bin/python bench/analyze.py
+```
+
+Benchmark runs consume provider quota and resume by completed instance id. Use
+a separate results file when intentionally rerunning completed ids.
 
 ---
 
@@ -212,13 +230,15 @@ anvil/
 │   └── test_*.py             # Per-module tests (Parrv / Akshat)
 │
 ├── bench/
-│   ├── issues.yaml           # Benchmark issue list (verified by Akshat)
-│   ├── run_bench.py          # Headless benchmark runner (Sneha)
-│   └── results.md            # Auto-generated results table
+│   ├── instances.json        # Benchmark cases plus scorer-only oracle data
+│   ├── run_bench.py          # Headless, resumable runner (Sneha)
+│   ├── score.py              # Fresh-checkout patch and test scoring
+│   └── analyze.py            # Failure, token, phase, and recovery summaries
 │
 └── docs/
-    ├── ARCHITECTURE.md        # Component diagram, phase FSM, decision records
-    └── EVALUATION.md          # How to reproduce a run and read a trace
+    ├── ARCHITECTURE.md        # Implemented lifecycle and component contracts
+    ├── EVALUATION.md          # Run protocol and measured comparison
+    └── sample_trace.jsonl     # Trace sample for offline replay
 ```
 
 ---
