@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
+from anvil.agent.budget import PhaseUsage
 from anvil.agent.state import RunState
 
 SCRATCH_DIR = ".anvil"
@@ -73,7 +75,9 @@ def write_outputs(output_dir: Path, patch: str, report: str) -> tuple[Path, Path
     return patch_path, report_path
 
 
-def render_report(state: RunState, patch: str, *, steps: int, tokens: int, seconds: float) -> str:
+def render_report(
+    state: RunState, patch: str, *, steps: int, tokens: int, seconds: float, phase_usage: Mapping[str, PhaseUsage] | None = None
+) -> str:
     """Render ``report.md``: warnings, issue summary, files changed, confidence, tests, budget, limitations."""
     files = changed_files(patch)
     confidence = state.confidence(bool(files))
@@ -109,9 +113,28 @@ def render_report(state: RunState, patch: str, *, steps: int, tokens: int, secon
     out.append(f"- Wall clock: {seconds:.1f}s")
     out.append(f"- Patch attempts: {state.patch_attempts}, rollbacks: {state.rollbacks}")
 
+    if phase_usage:
+        out += ["", "## Tokens by phase", ""] + _phase_table(phase_usage)
+
     out += ["", "## Known limitations", ""]
     out += [f"- {note}" for note in state.limitations] or ["- None noted."]
     return "\n".join(out) + "\n"
+
+
+def _phase_table(usage: Mapping[str, PhaseUsage]) -> list[str]:
+    """A markdown table of calls and tokens per phase, with a total row and the prompt size per call."""
+    rows = ["| Phase | Calls | Prompt tokens | Completion tokens | Prompt tokens per call |", "|---|---:|---:|---:|---:|"]
+    calls = prompt = completion = 0
+    for phase, used in usage.items():
+        rows.append(_row(phase, used.calls, used.prompt_tokens, used.completion_tokens))
+        calls, prompt, completion = calls + used.calls, prompt + used.prompt_tokens, completion + used.completion_tokens
+    rows.append(_row("**total**", calls, prompt, completion))
+    return rows
+
+
+def _row(label: str, calls: int, prompt: int, completion: int) -> str:
+    per_call = f"{round(prompt / calls):,}" if calls else "-"
+    return f"| {label} | {calls} | {prompt:,} | {completion:,} | {per_call} |"
 
 
 # ---- diff parsing ---------------------------------------------------------------------------

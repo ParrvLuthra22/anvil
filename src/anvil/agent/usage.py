@@ -14,6 +14,7 @@ def record_usage(response: LLMResponse, budget: Budget, emitter: Emitter, settin
     prompt, completion = _count(usage, "prompt_tokens"), _count(usage, "completion_tokens")
     total = _count(usage, "total_tokens") or prompt + completion
     budget.add_tokens(total)
+    budget.add_phase_usage(emitter.phase.value if emitter.phase else "none", prompt, completion)
     emitter.usage(prompt, completion, total, settings.cost_estimate(prompt, completion))
 
 

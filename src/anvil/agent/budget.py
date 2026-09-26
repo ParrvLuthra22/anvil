@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 from anvil.agent.settings import AgentSettings
@@ -19,6 +20,15 @@ class BudgetExceeded(Exception):
         self.kind = kind
 
 
+@dataclass
+class PhaseUsage:
+    """What the model calls made during one phase cost."""
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class Budget:
     """Counts LLM calls ("steps"), tokens and elapsed time against the configured limits."""
 
@@ -30,6 +40,7 @@ class Budget:
         self._started = clock()
         self.steps = 0
         self.tokens = 0
+        self.by_phase: dict[str, PhaseUsage] = {}  # in the order the phases were first charged
 
     @property
     def elapsed(self) -> float:
@@ -53,3 +64,10 @@ class Budget:
     def add_tokens(self, count: int) -> None:
         """Record tokens consumed by a completed call."""
         self.tokens += max(0, count)
+
+    def add_phase_usage(self, phase: str, prompt_tokens: int, completion_tokens: int) -> None:
+        """Attribute one completed call to ``phase`` (for the report's tokens-by-phase table)."""
+        usage = self.by_phase.setdefault(phase, PhaseUsage())
+        usage.calls += 1
+        usage.prompt_tokens += max(0, prompt_tokens)
+        usage.completion_tokens += max(0, completion_tokens)
