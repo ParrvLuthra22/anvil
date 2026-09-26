@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from anvil.agent.budget import Budget
 from anvil.agent.emitter import Emitter
-from anvil.agent.prompts import GIVE_UP, PHASE_DONE, PhaseSpec, control_tools
+from anvil.agent.prompts import GIVE_UP, PHASE_DONE, PhaseSpec, closing_message, control_tools
 from anvil.agent.recovery import ErrorClass, PhaseGuard, llm_failure_advice
 from anvil.agent.settings import AgentSettings
 from anvil.agent.text import clip_head
@@ -73,6 +73,7 @@ class PhaseOutcome:
     summary: str = ""
     args: dict = field(default_factory=dict)
     records: list[ToolRecord] = field(default_factory=list)
+    forced: bool = False  # the phase ran into its call cap and was made to close (whether or not it then did)
 
     @property
     def done(self) -> bool:
@@ -113,6 +114,7 @@ class PhaseRunner:
         self._budget = budget
         self._settings = settings
         self._call_seq = 0
+        self._forced = False
 
     def run(self, spec: PhaseSpec, kickoff: str, gate: Gate | None = None) -> PhaseOutcome:
         """Run ``spec``'s phase, starting from the ``kickoff`` message.
@@ -129,14 +131,21 @@ class PhaseRunner:
         steps = self._settings.max_steps_per_phase
         if spec.text_only:
             steps = min(steps, TEXT_ONLY_STEP_CAP)
+        cap = self._settings.call_cap(spec.phase.value)  # a cap of ``steps`` or more never comes up: the hard limit is first
+        self._forced = False
 
-        for _ in range(steps):
+        for step in range(steps):
+            if cap is not None and step == cap:
+                schemas = self._force_close(spec, cap)
             response = self._ask(spec, schemas)
             calls = [self._normalise(raw) for raw in response.tool_calls or []]
             self._record_assistant(response.text, calls)
             if not calls:
                 if spec.text_only:
-                    return PhaseOutcome(PhaseStatus.DONE, response.text.strip(), records=records)
+                    return PhaseOutcome(PhaseStatus.DONE, response.text.strip(), records=records, forced=self._forced)
+                if self._forced:
+                    reason = f"call cap ({cap}) reached and the closing call made no tool call: {clip_head(response.text.strip(), 300)}"
+                    return PhaseOutcome(PhaseStatus.STEP_LIMIT, reason, records=records, forced=True)
                 nudge = guard.silent_reply()
                 if nudge is None:
                     reason = f"the model stopped calling tools: {clip_head(response.text.strip(), 300)}"
@@ -147,8 +156,22 @@ class PhaseRunner:
             guard.tool_used()
             outcome = self._execute(spec, calls, gate, records, guard)
             if outcome is not None:
+                outcome.forced = self._forced
                 return outcome
+            if self._forced:
+                return PhaseOutcome(
+                    PhaseStatus.STEP_LIMIT, f"call cap ({cap}) reached and the closing call did not end the phase",
+                    records=records, forced=True,
+                )
         return PhaseOutcome(PhaseStatus.STEP_LIMIT, f"phase step limit ({steps}) reached", records=records)
+
+    def _force_close(self, spec: PhaseSpec, cap: int) -> list[dict]:
+        """Tell the model its calls are used up and offer it nothing but the two ways to end the phase."""
+        self._forced = True
+        message = closing_message(spec.phase, cap)
+        self._ctx.add_message("user", message)
+        self._emitter.message("user", message)
+        return control_tools(spec.phase)
 
     # ---- model call -------------------------------------------------------------------------
 
@@ -217,6 +240,9 @@ class PhaseRunner:
         self, spec: PhaseSpec, call: _Call, gate: Gate | None, records: list[ToolRecord], guard: PhaseGuard
     ) -> PhaseOutcome | None:
         control = call.name in (PHASE_DONE, GIVE_UP)
+        if self._forced and not control:
+            self._reply(call, False, "This phase's calls are used up: only phase_done or give_up can be called now.")
+            return None
         if not control:
             verdict = guard.repeated(call.name, call.args)
             if verdict is not None:

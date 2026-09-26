@@ -500,6 +500,11 @@ class Orchestrator:
         self._enter(phase)
         self._ctx.set_diff(self._patch_text())
         outcome = self._runner.run(PHASE_SPECS[phase], kickoff, gate)
+        if outcome.forced:
+            self._state.limit(
+                f"{phase.value.upper()} used its {self._settings.call_cap(phase.value)}-call cap and was closed by the "
+                f"harness with what it had ({outcome.status.value})."
+            )
         text = outcome.summary if outcome.done else f"did not complete ({outcome.status.value}): {outcome.summary}"
         message = phase_summary(phase, text)
         if outcome.status in _COMPRESSIBLE:

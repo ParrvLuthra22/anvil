@@ -240,7 +240,7 @@ def test_text_only_phase_also_accepts_phase_done():
 
 
 def test_text_only_phase_gets_at_most_three_steps_and_no_registry_tools():
-    h = Harness([reply(call("grep", pattern="x")) for _ in range(6)])
+    h = Harness([reply(call("grep", pattern="x")) for _ in range(6)], token_budgets=False)
     outcome = h.run(UNDERSTAND)
     assert outcome.status is PhaseStatus.STEP_LIMIT and h.budget.steps == 3
     assert {t["function"]["name"] for t in h.llm.calls[0][1]} == {"phase_done", "give_up"}

@@ -115,6 +115,36 @@ PHASE_SPECS: dict[Phase, PhaseSpec] = {
 }
 
 
+_CLOSING = {
+    Phase.UNDERSTAND: "the issue in your own words: the behaviour it expects and what to look for.",
+    Phase.LOCALIZE: (
+        "the suspected file:line locations ranked by likelihood, your root-cause hypothesis and the relevant test "
+        "files, as far as you know them."
+    ),
+    Phase.REPRODUCE: (
+        "with repro_cmd set to the command that runs the repro script you wrote. If you have no repro that fails for "
+        "the reason given in the issue, call give_up(reason) instead."
+    ),
+    Phase.PATCH: "what you changed and why. If you have made no change, call give_up(reason) instead.",
+    Phase.VERIFY: (
+        "only if the repro and the relevant tests passed. Otherwise call give_up(reason) with the essential failing "
+        "output."
+    ),
+    Phase.REVIEW: (
+        "to approve the patch. To ask for changes call give_up(reason) instead, listing exactly what to change."
+    ),
+}
+
+
+def closing_message(phase: Phase, cap: int) -> str:
+    """The message that ends a phase which has used its call cap: close now, with what you have."""
+    return (
+        f"You have used the {cap} model calls this phase allows. Stop investigating and close it now: call "
+        f"phase_done(summary) with the best {phase.value} findings you have so far - "
+        f"{_CLOSING.get(phase, 'what you found.')}"
+    )
+
+
 def control_tools(phase: Phase) -> list[dict]:
     """OpenAI-format schemas of the two control tools offered in ``phase``.
 
