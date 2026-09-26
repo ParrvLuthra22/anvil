@@ -114,7 +114,7 @@ demo:
 # ---------------------------------------------------------------------------
 test:
 	@test -f "$(VPY)" || { \
-	  echo "ERROR: virtual environment not found. Run: make setup\"; exit 1; }
+	  echo "ERROR: virtual environment not found. Run: make setup"; exit 1; }
 	@$(VPY) -m pytest -q
 
 # ---------------------------------------------------------------------------

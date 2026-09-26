@@ -179,7 +179,7 @@ async def test_error_event_shows_banner():
     """An 'error' event makes the ErrorBanner visible."""
     app = _make_app()
     async with app.run_test(size=(120, 40)) as pilot:
-        ev = _ev("error", Phase.PATCH, {"kind": "timeout", "message": "git timed out"})
+        ev = _ev("error", Phase.PATCH, {"kind": "llm", "message": "LLM gave up"})
         app._handle_event(ev)
         banner = app.query_one("#error-banner", ErrorBanner)
         assert "visible" in banner.classes
@@ -197,26 +197,41 @@ async def test_new_phase_clears_error_banner():
 
 
 # ===========================================================================
-# 4b. Severity mapping (Item 5)
+# 4b. Severity mapping (Item 4 — kinds per src/anvil/agent/NOTES.md)
 # ===========================================================================
 
-def test_is_fatal_for_unknown_kind():
-    """An unknown error kind is treated as fatal."""
+def test_is_fatal_for_truly_fatal_kinds():
+    """llm, budget, internal are the only fatal kinds."""
     from anvil.tui.app import _is_fatal
-    assert _is_fatal("unknown_kind") is True
-    assert _is_fatal("crash") is True
+    for kind in ("llm", "budget", "internal"):
+        assert _is_fatal(kind) is True, f"Expected {kind!r} to be fatal"
 
 
-def test_is_fatal_false_for_benign_kinds():
-    """All benign/recovery kinds are not fatal."""
+def test_is_fatal_false_for_all_benign_kinds():
+    """All real benign/recovery kinds (per NOTES.md) must NOT be fatal."""
     from anvil.tui.app import _is_fatal
-    for kind in ("edit", "loop", "rollback", "retry", "truncate", "context", "timeout_retry"):
+    benign = [
+        "loop", "edit", "invalid_call", "no_tool_call", "test_failure",
+        "timeout", "tool", "deps", "sandbox", "context", "rollback",
+        "config", "io", "finalize",
+        # phase names used as kind
+        "ingest", "profile", "understand", "localize", "reproduce",
+        "patch", "verify", "review",
+    ]
+    for kind in benign:
         assert _is_fatal(kind) is False, f"Expected {kind!r} to be non-fatal"
 
 
+def test_is_fatal_false_is_case_insensitive():
+    """Kind matching must be case-insensitive."""
+    from anvil.tui.app import _is_fatal
+    assert _is_fatal("LOOP") is False
+    assert _is_fatal("LLM") is True
+
+
 @pytest.mark.asyncio
-async def test_benign_error_does_not_show_banner():
-    """A benign 'loop' error must NOT show the ErrorBanner."""
+async def test_benign_loop_does_not_show_banner():
+    """A 'loop' error (benign) must NOT show the ErrorBanner."""
     app = _make_app()
     async with app.run_test(size=(120, 40)) as pilot:
         ev = _ev("error", Phase.PATCH, {"kind": "loop", "message": "loop detected"})
@@ -226,26 +241,58 @@ async def test_benign_error_does_not_show_banner():
 
 
 @pytest.mark.asyncio
-async def test_benign_error_does_not_show_banner_rollback():
-    """A benign 'rollback' error must NOT show the ErrorBanner."""
+async def test_benign_invalid_call_does_not_show_banner():
+    """'invalid_call' is benign — no red banner."""
     app = _make_app()
     async with app.run_test(size=(120, 40)) as pilot:
-        ev = _ev("error", Phase.PATCH, {"kind": "rollback", "message": "rolling back"})
+        ev = _ev("error", Phase.LOCALIZE, {"kind": "invalid_call", "message": "unknown tool"})
         app._handle_event(ev)
         banner = app.query_one("#error-banner", ErrorBanner)
         assert "visible" not in banner.classes
 
 
 @pytest.mark.asyncio
-async def test_fatal_error_shows_banner():
-    """A fatal error (unknown kind) MUST show the ErrorBanner."""
+async def test_benign_no_tool_call_does_not_show_banner():
+    """'no_tool_call' is benign — no red banner."""
     app = _make_app()
     async with app.run_test(size=(120, 40)) as pilot:
-        ev = _ev("error", Phase.PATCH, {"kind": "fatal_crash", "message": "something broke"})
+        ev = _ev("error", Phase.UNDERSTAND, {"kind": "no_tool_call", "message": "no tool"})
         app._handle_event(ev)
         banner = app.query_one("#error-banner", ErrorBanner)
-        assert "visible" in banner.classes, "Fatal error must show red banner"
+        assert "visible" not in banner.classes
 
+
+@pytest.mark.asyncio
+async def test_fatal_llm_shows_banner():
+    """'llm' is fatal — must show the red ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.PATCH, {"kind": "llm", "message": "LLM gave up"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" in banner.classes, "'llm' error must show red banner"
+
+
+@pytest.mark.asyncio
+async def test_fatal_budget_shows_banner():
+    """'budget' is fatal — must show the red ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.VERIFY, {"kind": "budget", "message": "token budget exceeded"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" in banner.classes, "'budget' error must show red banner"
+
+
+@pytest.mark.asyncio
+async def test_fatal_internal_shows_banner():
+    """'internal' is fatal — must show the red ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.PATCH, {"kind": "internal", "message": "unexpected exception"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" in banner.classes
 
 
 @pytest.mark.asyncio

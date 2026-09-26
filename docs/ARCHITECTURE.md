@@ -111,7 +111,8 @@ FINALIZE — write output/patch.diff, output/report.md
 Every step is capped by:
 - `tool_output_char_cap` (8 000 chars) per tool call
 - `wall_clock_seconds` (30 min) for the whole run
-- A loop detector that halts if the last N LLM outputs are identical
+- A loop detector that halts if the same tool+args appears 3 times in a row,
+  or if an A/B/A/B alternation is detected — after three strikes the phase ends
 
 ---
 
@@ -210,7 +211,7 @@ consumer (e.g. a webhook sink) is a one-liner.
 | Repo clone fails (network / auth) | Non-zero git exit code | Emit `error` event; skip to FINALIZE with empty patch |
 | Tool call times out | `ExecResult.timed_out` flag | Return `ToolResult(ok=False, output="timed out")` to LLM; agent retries or skips |
 | Patch makes tests worse | VERIFY step count > N | `sandbox.rollback()` to last checkpoint; re-enter PATCH |
-| Loop detected (identical LLM outputs) | Hamming distance check on last 3 responses | Break loop; advance to next phase |
+| Loop detected | Same tool+args 3× in a row, or A/B/A/B alternation; three strikes | Emit `error{kind="loop"}` (yellow); repeated call not run; third strike ends phase |
 | Token budget exhausted | `max_tokens_total` counter | Flush FINALIZE immediately with whatever patch exists |
 | Wall-clock limit | `time.time()` check at each step | Same as token budget |
 | TUI receives unknown event type | `try/except` in `_handle_event` | Silently ignored; TUI never crashes |
@@ -260,13 +261,22 @@ a run by maintaining a sliding window of messages.
 └─────────────────────────────────────────────────────┘
 ```
 
-Key properties:
+Compaction happens on every `build_messages` call, in this fixed order:
 
-- **File:line references are never compressed** — the summariser preserves
-  every `path:lineno` token verbatim so the agent never hallucinates locations.
-- **Pruning is triggered** when `estimated_tokens > max_tokens_total × 0.8`.
-- **Summarisation is a separate short LLM call** that emits an
-  `error{kind="context"}` event (benign — yellow notice in TUI only).
+1. **Truncate on entry.** Tool results longer than `tool_output_char_cap` keep head + tail with
+   `[N lines omitted]` between them. Only tool messages are truncated; assistant text is never cut.
+2. **Prune stale observations.** A tool result from a step older than `context_keep_steps` becomes
+   one summary line (e.g. `[output pruned] read_file(…) → ok: <first line>`). Permanent.
+3. **Fold oldest turns** once the estimate passes `context_summarize_threshold × max_context_tokens`
+   (default: 0.75 × 32 000 = 24 000 tokens). The newest 2 units, all pinned messages, and the
+   current phase's kickoff are never folded. Folding aims for ~50 % of the budget.
+
+**Never dropped:** the issue brief (issue text, comments, repo profile), the repo map (can be
+trimmed but not removed), the latest diff, the phase kickoff, and the system prompt.
+
+**Config keys:** `max_context_tokens` (32 000), `context_keep_steps` (6),
+`context_summarize_threshold` (0.75), `tool_output_char_cap` (8 000).
+
 
 ### Recovery strategies
 
@@ -276,15 +286,16 @@ run terminates with a patch even under adverse conditions:
 | Condition | Detection | Recovery |
 |-----------|-----------|----------|
 | Failed `edit_file` str_replace | `ToolResult.ok == False` | Emit `error{kind="edit"}` (yellow); retry with closest-match hint |
-| Identical LLM output × 3 | Hamming distance on last 3 completions | Emit `error{kind="loop"}` (yellow); advance to next phase |
+| Loop detected | Same tool+args 3× in a row, or A/B/A/B alternation (three strikes per phase) | Emit `error{kind="loop"}` (yellow); call not run; phase advances on third strike |
 | Patch makes tests worse | VERIFY step count > N | `sandbox.rollback()` to checkpoint; emit `error{kind="rollback"}` (yellow); re-enter PATCH |
-| Tool call timed out | `ExecResult.timed_out` | Emit `error{kind="timeout_retry"}` (yellow); LLM retries |
+| Tool call timed out | `ExecResult.timed_out` | Emit `error{kind="timeout"}` (yellow); model gets advice to run something narrower |
 | Token budget exhausted | `max_tokens_total` counter | Emit `error{kind="budget"}` (fatal); flush FINALIZE immediately |
 | Hard wall-clock limit | `time.time()` at each step | Same as token budget |
 | GitHub API 403/429 | HTTP status check in `fetch_issue` | Retry with backoff; fall back to `--repo + --issue-text` |
 
-Benign/recovery error kinds (`edit`, `loop`, `rollback`, `retry`, `truncate`,
-`context`, `timeout_retry`) appear as **yellow notices** in the TUI log only.
+Benign/recovery error kinds (`loop`, `edit`, `invalid_call`, `no_tool_call`, `test_failure`,
+`timeout`, `tool`, `deps`, `sandbox`, `context`, `rollback`, `config`, `io`, `finalize`,
+and phase names like `ingest`/`patch`) appear as **yellow notices** in the TUI log only.
 Fatal kinds trigger the **red ErrorBanner**.  The run always continues and
 always produces `output/patch.diff` and `output/report.md`.
 

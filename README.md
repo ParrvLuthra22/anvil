@@ -52,14 +52,33 @@ key in `config.yaml`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `model` | `gemini-2.0-flash` | Model name passed to the OpenAI-compatible chat-completions endpoint |
-| `base_url` | `https://generativelanguage.googleapis.com/v1beta/openai/` | Provider base URL |
+| `base_url` | Gemini endpoint | Provider base URL |
 | `temperature` | `0` | Sampling temperature — 0 = deterministic output |
-| `max_steps_per_phase` | `25` | LLM steps allowed before the orchestrator advances to the next phase |
+| `tool_mode` | `auto` | How tools are offered: `native` (provider tool-calling API) \| `text` (describe in prompt) \| `auto` (try native, fall back to text) |
+| `llm_max_attempts` | `5` | Total tries per LLM request, including the first |
+| `llm_timeout_seconds` | `120` | Per-request read/write timeout |
+| `llm_connect_timeout_seconds` | `10` | TCP connect timeout |
+| `llm_backoff_base_seconds` | `1.0` | Base for exponential backoff on 429/5xx/network errors |
+| `llm_backoff_max_seconds` | `60` | Cap on any single retry wait (including Retry-After header) |
+| `max_steps_per_phase` | `25` | LLM steps allowed per phase before the orchestrator advances |
 | `max_total_steps` | `120` | Hard cap on total LLM steps across all phases |
 | `max_tokens_total` | `1 500 000` | Token budget for the whole run; hitting it forces graceful FINALIZE |
 | `wall_clock_seconds` | `1800` | 30-minute wall-clock limit; hitting it forces graceful FINALIZE |
-| `tool_output_char_cap` | `8000` | Maximum characters of any single tool / shell output fed back to the model |
-| `sandbox` | `auto` | Sandbox backend: `auto` (Docker if available, else worktree) \| `worktree` \| `docker` |
+| `tool_output_char_cap` | `8000` | Max characters of any single tool/shell output; longer output keeps head + tail with `[N lines omitted]` |
+| `max_context_tokens` | `32000` | Estimated token budget for the prompt (chars ÷ 4); leave headroom for tool schemas |
+| `context_keep_steps` | `6` | Tool output from earlier steps is replaced by a one-line summary after this many steps |
+| `context_summarize_threshold` | `0.75` | Fraction of `max_context_tokens` that triggers folding old turns into a digest (one extra LLM call) |
+| `max_patch_attempts` | `3` | Failed PATCH/VERIFY attempts before rolling back to the pre-PATCH checkpoint |
+| `max_rollbacks` | `2` | Maximum rollbacks before the run reports low confidence and stops retrying |
+| `install_dependencies` | `true` | Install repo dependencies after profiling (Python: into `.anvil_venv/`); set `false` to skip |
+| `command_timeout_seconds` | `120` | Timeout for commands the harness itself runs (repro checks etc.) |
+| `output_dir` | `output` | Directory where `patch.diff`, `report.md`, and `trace.jsonl` are written |
+| `cost_per_million_prompt_tokens` | `0` | Optional cost reporting (USD per million prompt tokens); 0 = free tier / unknown |
+| `cost_per_million_completion_tokens` | `0` | Optional cost reporting (USD per million completion tokens) |
+| `sandbox` | `worktree` | Sandbox backend: `worktree` (default) \| `docker` (opt-in, no network in containers) \| `auto` |
+
+> **Future work** (not yet implemented): Docker sandbox containers, parallel benchmark workers,
+> per-model tokenizer, secrets scrubbing from sandbox environment beyond the fixed list.
 
 ### Environment overrides (never put these in config.yaml)
 
