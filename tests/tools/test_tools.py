@@ -237,6 +237,43 @@ class TestRunCmdTool:
     def test_schema_required_cmd(self):
         assert "cmd" in RunCmdTool().parameters["required"]
 
+    def test_sudo_blocked(self, sandbox):
+        result = RunCmdTool().run({"cmd": "sudo apt install x"}, sandbox)
+        assert not result.ok
+        assert "sudo" in result.output
+        assert "rejected" in result.output.lower()
+
+    def test_cd_parent_blocked(self, sandbox):
+        result = RunCmdTool().run({"cmd": "cd .. && rm -rf *"}, sandbox)
+        assert not result.ok
+        assert "cd .." in result.output
+        assert "rejected" in result.output.lower()
+
+    def test_absolute_write_blocked(self, sandbox):
+        result = RunCmdTool().run({"cmd": "echo 'x' > /tmp/x"}, sandbox)
+        assert not result.ok
+        assert "absolute paths" in result.output
+        assert "rejected" in result.output.lower()
+        
+        result2 = RunCmdTool().run({"cmd": "cat x >> /etc/hosts"}, sandbox)
+        assert not result2.ok
+
+    def test_pip_install_without_venv_blocked(self, sandbox):
+        # sandbox doesn't have .anvil_venv by default in this fixture
+        result = RunCmdTool().run({"cmd": "pip install requests"}, sandbox)
+        assert not result.ok
+        assert "pip install" in result.output
+        assert "virtual environment" in result.output
+        
+    def test_pip_install_with_venv_allowed(self, sandbox):
+        # Fake a venv
+        (sandbox.root / ".anvil_venv").mkdir()
+        # It will actually run the command now. We expect it to try running pip install
+        # which will fail because the mock venv is empty, so exit code won't be 0,
+        # but the rejection message shouldn't be there.
+        result = RunCmdTool().run({"cmd": "pip install requests"}, sandbox)
+        assert "Command rejected" not in result.output
+
 
 # ---------------------------------------------------------------------------
 # RunTestsTool
