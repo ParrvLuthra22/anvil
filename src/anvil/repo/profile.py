@@ -77,18 +77,23 @@ def _detect_python(root: Path) -> tuple[str | None, str | None, str | None]:
         install_cmd = (install_cmd or "") + f" && pip install -r {req_test.name}"
 
     # Test framework — prefer pytest, fallback to unittest
+    # Detection order: explicit config in pyproject > requirements > default pytest
     framework = "pytest"
     test_cmd = "pytest"
+
     if has_pyproject:
         text = _read_text(pyproject)
         if "pytest" in text:
             framework, test_cmd = "pytest", "pytest"
         elif "unittest" in text:
-            framework, test_cmd = "unittest", "python -m unittest discover"
+            # Task 1: use python3 (not bare python) so it works on modern systems
+            framework = "unittest"
+            test_cmd = "python3 -m unittest discover"
     elif req:
         text = _read_text(req)
         if "pytest" not in text:
-            framework, test_cmd = "unittest", "python -m unittest discover"
+            framework = "unittest"
+            test_cmd = "python3 -m unittest discover"
 
     return install_cmd, test_cmd, framework
 
@@ -312,19 +317,31 @@ def _walk_tree(
             char_budget[0] -= len(line) + 1
 
 
-def repo_map(root: Path, max_chars: int = 6000) -> str:
+def repo_map(root: Path, max_chars: int = 6000, label: str | None = None) -> str:
     """Return a compact file tree with top-level symbols, truncated to *max_chars*.
 
     Priority directories (src/, lib/, pkg/, cmd/, ...) are rendered first so the
     most relevant code appears before the budget is exhausted.
+
+    Args:
+        root:      The repository root directory.
+        max_chars: Character budget for the map.
+        label:     Header label to use instead of the directory name.  Pass
+                   ``"owner/repo"`` (from :class:`~anvil.repo.ingest.IssueRef`)
+                   so the map header is always informative.  Defaults to a
+                   neutral ``"repo"`` to avoid leaking sandbox temp-dir paths.
     """
-    lines: list[str] = [f"# repo: {root.name}", ""]
-    char_budget = [max_chars - len(f"# repo: {root.name}\n\n")]
+    # Task 2: never expose the clone dir name; use the caller-supplied label or
+    # a neutral fallback so paths like /tmp/anvil_smoke_xxx/requests don't appear.
+    header_label = label if label else "repo"
+    header = f"# repo: {header_label}"
+    lines: list[str] = [header, ""]
+    char_budget = [max_chars - len(header) - 2]
 
     try:
         top_entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name))
     except PermissionError:
-        return f"# repo: {root.name}\n(permission denied reading root)"
+        return f"{header}\n(permission denied reading root)"
 
     # Priority dirs first
     for entry in top_entries:

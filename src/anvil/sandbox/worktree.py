@@ -82,6 +82,22 @@ def _sanitized_env() -> dict[str, str]:
     return env
 
 
+def _git_env() -> dict[str, str]:
+    """Return the environment for git subprocesses.
+
+    Inherits the sanitized environment and always sets a minimal git identity so
+    that ``git stash create`` and any commit we make work on machines where
+    ``user.name`` / ``user.email`` are not configured globally.
+    """
+    env = _sanitized_env()
+    # Only set these if not already defined — respect the developer's identity.
+    env.setdefault("GIT_AUTHOR_NAME", "anvil-agent")
+    env.setdefault("GIT_AUTHOR_EMAIL", "anvil@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", "anvil-agent")
+    env.setdefault("GIT_COMMITTER_EMAIL", "anvil@localhost")
+    return env
+
+
 def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a git command and return the CompletedProcess (check=False)."""
     return subprocess.run(
@@ -91,6 +107,7 @@ def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.Comple
         text=True,
         stdin=subprocess.DEVNULL,
         timeout=timeout,
+        env=_git_env(),
     )
 
 
@@ -100,6 +117,7 @@ def _require_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.Co
     if result.returncode != 0:
         raise GitError(["git"] + args, result.returncode, result.stderr)
     return result
+
 
 
 # ---------------------------------------------------------------------------

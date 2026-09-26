@@ -12,7 +12,8 @@ On any failure it returns a :class:`DepsResult` — it never raises.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from anvil.repo.profile import RepoProfile
@@ -22,6 +23,9 @@ log = logging.getLogger(__name__)
 
 _INSTALL_TIMEOUT = 300   # 5 minutes maximum for any install command
 _VENV_DIR = ".anvil_venv"  # relative to sandbox root; separate from the harness venv
+
+# Interpreter candidates probed in order (newest first).
+_PYTHON_CANDIDATES = ["python3.12", "python3.11", "python3.10", "python3"]
 
 
 @dataclass
@@ -80,23 +84,126 @@ def _ensure_deps_inner(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
 
 
 # ---------------------------------------------------------------------------
-# Language-specific helpers
+# Python interpreter selection (Task 3)
 # ---------------------------------------------------------------------------
 
+def _parse_requires_python(sandbox: Sandbox) -> tuple[int, int] | None:
+    """Parse requires-python from pyproject.toml or setup.cfg in the sandbox root.
+
+    Returns the *minimum* (major, minor) tuple, or None if no constraint found.
+    Defaults to (3, 9) when a Python project exists but no constraint is stated.
+    """
+    # pyproject.toml: requires-python = ">=3.10"
+    pyproject = sandbox.root / "pyproject.toml"
+    if pyproject.exists():
+        text = pyproject.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'requires-python\s*=\s*["\']([^"\'\']+)["\']', text)
+        if m:
+            spec = m.group(1)
+            ver_m = re.search(r'(\d+)\.(\d+)', spec)
+            if ver_m:
+                return int(ver_m.group(1)), int(ver_m.group(2))
+        # pyproject exists → it's a Python project; default minimum
+        return 3, 9
+
+    # setup.cfg: python_requires = >=3.10
+    setup_cfg = sandbox.root / "setup.cfg"
+    if setup_cfg.exists():
+        text = setup_cfg.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'python_requires\s*=\s*([^\n]+)', text)
+        if m:
+            spec = m.group(1).strip()
+            ver_m = re.search(r'(\d+)\.(\d+)', spec)
+            if ver_m:
+                return int(ver_m.group(1)), int(ver_m.group(2))
+        return 3, 9
+
+    return None  # no Python metadata found
+
+
+def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
+    """Return the first interpreter that satisfies requires-python and can create a venv.
+
+    Probes ``python3.12``, ``python3.11``, ``python3.10``, then ``python3`` in order.
+    For each candidate:
+    1. Check it is on PATH (``command -v``).
+    2. Verify its version satisfies ``requires-python`` (if declared).
+    3. Verify it can create a venv (``-m venv --help``).
+
+    Returns:
+        The interpreter name (e.g. ``"python3.11"``), or ``None`` if none qualifies.
+    """
+    min_ver = _parse_requires_python(sandbox)
+
+    for interp in _PYTHON_CANDIDATES:
+        # 1. Is it on PATH?
+        probe = sandbox.exec(f"command -v {interp}", timeout=5)
+        if probe.exit_code != 0:
+            continue
+
+        # 2. Check version if constraint exists
+        if min_ver is not None:
+            ver_result = sandbox.exec(
+                f'{interp} -c "import sys; print(sys.version_info.major, sys.version_info.minor)"',
+                timeout=5,
+            )
+            if ver_result.exit_code == 0:
+                parts = ver_result.stdout.strip().split()
+                if len(parts) == 2:
+                    try:
+                        maj, mn = int(parts[0]), int(parts[1])
+                        if (maj, mn) < min_ver:
+                            log.debug(
+                                "Skipping %s (version %d.%d < required %d.%d)",
+                                interp, maj, mn, *min_ver,
+                            )
+                            continue
+                    except ValueError:
+                        pass
+
+        # 3. Can it create a venv?
+        venv_probe = sandbox.exec(f"{interp} -m venv --help", timeout=10)
+        if venv_probe.exit_code != 0:
+            log.debug("Skipping %s — cannot create venv", interp)
+            continue
+
+        log.info("Selected Python interpreter: %s", interp)
+        return interp
+
+    return None
+
+
 def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
-    """Create an isolated venv and install Python dependencies into it."""
+    """Create an isolated venv using the best available interpreter and install deps."""
     venv_path = _VENV_DIR
     venv_python = f"{venv_path}/bin/python"
     venv_pip = f"{venv_path}/bin/pip"
 
+    # Task 3: pick the right interpreter
+    interp = _pick_python_interpreter(sandbox)
+    if interp is None:
+        min_ver = _parse_requires_python(sandbox)
+        reason = (
+            f"requires Python >= {min_ver[0]}.{min_ver[1]}" if min_ver
+            else "requires Python"
+        )
+        return DepsResult(
+            ok=False,
+            report=(
+                f"No suitable Python interpreter found ({reason}). "
+                f"Tried: {', '.join(_PYTHON_CANDIDATES)}."
+            ),
+            skipped=True,
+        )
+
     # Step 1: Create the venv
-    log.info("Creating isolated Python venv at %s/%s", sandbox.root, venv_path)
-    create_result = sandbox.exec(f"python3 -m venv {venv_path}", timeout=60)
+    log.info("Creating isolated Python venv at %s/%s using %s", sandbox.root, venv_path, interp)
+    create_result = sandbox.exec(f"{interp} -m venv {venv_path}", timeout=60)
     if create_result.exit_code != 0 or create_result.timed_out:
         return DepsResult(
             ok=False,
             report=(
-                f"Failed to create Python venv.\n"
+                f"Failed to create Python venv with {interp!r}.\n"
                 f"stdout: {create_result.stdout[:500]}\n"
                 f"stderr: {create_result.stderr[:500]}"
             ),
@@ -107,6 +214,7 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
 
     # Step 3: Run the install command using the venv's pip
     install_cmd = profile.install_cmd
+    assert install_cmd is not None
     install_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
 
     log.info("Running Python install: %s", install_cmd)
@@ -145,7 +253,7 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
 
     return DepsResult(
         ok=True,
-        report=f"Python deps installed into {venv_path}/.",
+        report=f"Python deps installed into {venv_path}/ using {interp}.",
         venv_python=venv_python,
     )
 
