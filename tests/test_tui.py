@@ -214,12 +214,17 @@ def test_is_fatal_false_for_all_benign_kinds():
         "loop", "edit", "invalid_call", "no_tool_call", "test_failure",
         "timeout", "tool", "deps", "sandbox", "context", "rollback",
         "config", "io", "finalize",
-        # phase names used as kind
-        "ingest", "profile", "understand", "localize", "reproduce",
-        "patch", "verify", "review",
     ]
     for kind in benign:
         assert _is_fatal(kind) is False, f"Expected {kind!r} to be non-fatal"
+
+def test_is_fatal_for_phase_names():
+    """Phase names used as error kinds are fatal and show red banner."""
+    from anvil.tui.app import _is_fatal
+    phases = ["ingest", "profile", "understand", "localize", "reproduce", "patch", "verify", "review"]
+    for phase in phases:
+        assert _is_fatal(phase) is True, f"Expected {phase!r} to be fatal"
+
 
 
 def test_is_fatal_false_is_case_insensitive():
@@ -503,3 +508,73 @@ def test_fake_event_stream_has_tool_calls():
 # Import Label for type annotation in test
 # ===========================================================================
 from textual.widgets import Label  # noqa: E402 — must be after pytest imports
+
+
+# ===========================================================================
+# Ref input, ref in header, and already_fixed banner tests
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_tui_has_ref_input():
+    """TUI start form includes an optional commit/ref input field."""
+    from textual.widgets import Input
+    app = _make_app()
+    async with app.run_test(size=(120, 40)):
+        ref_input = app.query_one("#ref-input", Input)
+        assert ref_input is not None
+        assert "optional" in (ref_input.placeholder or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_tui_shows_ref_in_header():
+    """Checked-out ref is displayed in the TUI header (app.sub_title)."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)):
+        ev = _ev("message", Phase.INGEST, {
+            "role": "system",
+            "text": "Checked out v1.2: tag",
+            "ref": "v1.2",
+            "reason": "tag",
+            "already_fixed": False,
+        })
+        app._handle_event(ev)
+        assert "v1.2" in app.sub_title
+
+
+@pytest.mark.asyncio
+async def test_tui_shows_already_fixed_banner():
+    """A warning banner is displayed when the issue is reported as already fixed."""
+    from anvil.tui.app import AlreadyFixedBanner
+    app = _make_app()
+    async with app.run_test(size=(120, 40)):
+        banner = app.query_one("#already-fixed-banner", AlreadyFixedBanner)
+        assert "visible" not in banner.classes
+
+        ev = _ev("message", Phase.INGEST, {
+            "role": "system",
+            "text": "Checked out main: default branch.",
+            "ref": None,
+            "already_fixed": True,
+            "reason": "already fixed upstream",
+        })
+        app._handle_event(ev)
+        assert "visible" in banner.classes
+
+
+@pytest.mark.asyncio
+async def test_tui_fallback_bar_shown_on_fetch_failure():
+    """When ingest fetch fails (403/404/rate-limit), the paste-the-issue fallback bar appears."""
+    from textual.widgets import TextArea
+    app = _make_app()
+    async with app.run_test(size=(120, 40)):
+        fallback_bar = app.query_one("#fallback-bar")
+        assert "-visible" not in fallback_bar.classes
+
+        ev = _ev("error", Phase.INGEST, {
+            "kind": "ingest",
+            "message": "IssueFetchError: Could not fetch the issue from GitHub: rate-limited 403",
+        })
+        app._handle_event(ev)
+        assert "-visible" in fallback_bar.classes
+        text_area = app.query_one("#issue-text-area", TextArea)
+        assert text_area is not None

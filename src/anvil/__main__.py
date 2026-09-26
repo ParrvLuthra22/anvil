@@ -104,6 +104,11 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Path to config.yaml (default: repo-root config.yaml)",
     )
+    parser.add_argument(
+        "--ref",
+        metavar="REF",
+        help="Git commit or branch to check out (default: repo's default branch)",
+    )
 
     return parser
 
@@ -147,34 +152,9 @@ def _output_paths() -> tuple[Path, Path, Path]:
 # ---------------------------------------------------------------------------
 
 def _make_event_bus():
-    """Return a thread-safe concrete EventBus (subclasses anvil.events.EventBus)."""
-    import threading
-
-    from anvil.events import AgentEvent, EventBus
-
-    class _Bus(EventBus):
-        """Thread-safe fan-out bus.  emit() may be called from any thread."""
-
-        def __init__(self) -> None:
-            self._queues: list[asyncio.Queue] = []
-            self._lock = threading.Lock()
-
-        def emit(self, event: AgentEvent) -> None:
-            with self._lock:
-                queues = list(self._queues)
-            for q in queues:
-                try:
-                    q.put_nowait(event)
-                except Exception:
-                    pass
-
-        def subscribe(self) -> asyncio.Queue:
-            q: asyncio.Queue = asyncio.Queue()
-            with self._lock:
-                self._queues.append(q)
-            return q
-
-    return _Bus()
+    """Return a thread-safe concrete EventBus."""
+    from anvil.events import EventBus
+    return EventBus()
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +260,14 @@ def _run_tui(args: argparse.Namespace, config: dict) -> None:
     bus = _make_event_bus()
     _, _, trace_path = _output_paths()
 
-    def _on_start(url: str) -> None:
+    def _on_start(url: str, ref: str | None = None, manual_issue_text: str | None = None) -> None:
         _wire_recorder(bus, trace_path)
         try:
             from anvil.agent.orchestrator import run_harness
 
             repo_url = getattr(args, "repo", None)
-            issue_text = getattr(args, "issue_text", None)
+            issue_text = manual_issue_text or getattr(args, "issue_text", None)
+            git_ref = ref or getattr(args, "ref", None)
 
             async def _run() -> None:
                 loop = asyncio.get_event_loop()
@@ -298,13 +279,13 @@ def _run_tui(args: argparse.Namespace, config: dict) -> None:
                         bus,
                         repo_url=repo_url,
                         issue_text=issue_text,
+                        git_ref=git_ref,
                     ),
                 )
 
             asyncio.get_event_loop().create_task(_run())
-        except NotImplementedError:
-            # Orchestrator not yet implemented → fall back to demo stream
-            asyncio.get_event_loop().create_task(_emit_fake_stream(url, bus))
+        except Exception as e:
+            print(f"Error starting harness: {e}", file=sys.stderr)
 
     app = AnvilApp(
         bus=bus,
@@ -393,15 +374,11 @@ def _run_headless(args: argparse.Namespace, config: dict) -> None:
                     bus,
                     repo_url=repo_url or None,
                     issue_text=issue_text or None,
+                    git_ref=getattr(args, "ref", None),
                 ),
             )
-        except NotImplementedError:
-            print(
-                "\nERROR: The agent orchestrator is not yet implemented.\n"
-                "  The real pipeline will be available once Parrv's orchestrator\n"
-                "  is merged.  For now, use --demo to see the TUI flow.\n",
-                file=sys.stderr,
-            )
+        except Exception as e:
+            print(f"Error starting harness: {e}", file=sys.stderr)
             sys.exit(1)
         await record_task
 

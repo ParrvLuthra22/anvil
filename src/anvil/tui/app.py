@@ -44,6 +44,7 @@ from textual.widgets import (
     Label,
     RichLog,
     Static,
+    TextArea,
 )
 
 from anvil.events import AgentEvent, EventBus, Phase
@@ -112,9 +113,6 @@ _BENIGN_ERROR_KINDS: frozenset[str] = frozenset({
     "loop", "edit", "invalid_call", "no_tool_call", "test_failure",
     "timeout", "tool", "deps", "sandbox", "context", "rollback",
     "config", "io", "finalize",
-    # Phase names used as kind when an unexpected exception occurs mid-phase:
-    "ingest", "profile", "understand", "localize", "reproduce",
-    "patch", "verify", "review",
 })
 
 
@@ -425,6 +423,33 @@ class ResultBanner(Widget):
             pass
 
 
+class AlreadyFixedBanner(Widget):
+    """Shows a warning when the issue is already fixed on the checked-out branch."""
+
+    DEFAULT_CSS = """
+    AlreadyFixedBanner {
+        height: 3;
+        border: solid $warning;
+        padding: 0 2;
+        background: $warning-darken-3;
+        display: none;
+    }
+    AlreadyFixedBanner.visible { display: block; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("[bold yellow]⚠ WARNING[/bold yellow] The issue appears to already be fixed on the checked-out branch.", id="already-fixed-msg")
+
+    def show(self, reason: str | None = None) -> None:
+        if reason:
+            try:
+                self.query_one("#already-fixed-msg", Label).update(
+                    f"[bold yellow]⚠ WARNING[/bold yellow] {reason}"
+                )
+            except Exception:
+                pass
+        self.add_class("visible")
+
 # ---------------------------------------------------------------------------
 # Replay status bar
 # ---------------------------------------------------------------------------
@@ -492,10 +517,34 @@ class AnvilApp(App):
         content-align: left middle;
     }
     #issue-input {
-        width: 1fr;
+        width: 2fr;
         border: none;
     }
-    #start-btn { width: 10; margin: 0 1; }
+    #ref-input {
+        width: 1fr;
+        border: none;
+        margin-left: 1;
+    }
+    #start-btn { width: 14; margin: 0 1; }
+
+    /* ── Fallback bar ── */
+    #fallback-bar {
+        height: auto;
+        max-height: 10;
+        background: $primary-darken-3;
+        padding: 0 1;
+        border-bottom: solid $primary-darken-1;
+        display: none;
+    }
+    #fallback-bar.-visible {
+        display: block;
+    }
+    #issue-text-area {
+        width: 1fr;
+        height: auto;
+        min-height: 3;
+    }
+    #fallback-start-btn { width: 24; margin: 0 1; }
 
     /* ── Body ── */
     #body { height: 1fr; }
@@ -573,7 +622,19 @@ class AnvilApp(App):
                 placeholder="GitHub issue URL…",
                 id="issue-input",
             )
+            yield Input(
+                placeholder="Commit / Branch (optional)",
+                id="ref-input",
+            )
             yield Button("▶  Start", id="start-btn", variant="primary")
+
+        # Fallback bar (hidden by default)
+        with Horizontal(id="fallback-bar"):
+            yield TextArea(
+                placeholder="Paste the issue text…",
+                id="issue-text-area",
+            )
+            yield Button("▶  Start with issue text", id="fallback-start-btn", variant="primary")
 
         # Replay status bar (hidden unless in replay mode)
         yield ReplayBar(id="replay-bar")
@@ -587,6 +648,9 @@ class AnvilApp(App):
 
         # Error banner (appears on error events)
         yield ErrorBanner(id="error-banner")
+
+        # Already fixed banner (appears when already_fixed is reported)
+        yield AlreadyFixedBanner(id="already-fixed-banner")
 
         # Diff preview pane
         yield DiffPane(id="diff-pane")
@@ -651,6 +715,17 @@ class AnvilApp(App):
                 icon   = "🤖" if role == "assistant" else "👤"
                 log.write(f"[{colour}]{icon} [{role}][/{colour}] {_clip(text)}")
 
+                # Check if this message announces a checkout
+                git_ref = data.get("ref") or data.get("git_ref")
+                if git_ref:
+                    self.sub_title = f"Ref: {git_ref}"
+                elif text.startswith("Checked out the default branch"):
+                    self.sub_title = "Ref: default branch"
+
+                if data.get("already_fixed"):
+                    reason = data.get("reason") or "The issue appears to already be fixed on the checked-out branch."
+                    self.query_one("#already-fixed-banner", AlreadyFixedBanner).show(reason)
+
             elif ev_type == "tool_call":
                 tool = str(data.get("tool", "?"))
                 args = data.get("args", {})
@@ -684,6 +759,10 @@ class AnvilApp(App):
                     # Fatal: red log entry + sticky red banner
                     log.write(f"[bold red]⚠ ERROR[/bold red] [{kind}] {_clip(msg)}")
                     self.query_one("#error-banner", ErrorBanner).show_error(kind, msg)
+                    if kind == "ingest":
+                        msg_lower = msg.lower()
+                        if "403" in msg_lower or "404" in msg_lower or "rate" in msg_lower or "fetch" in msg_lower or "issue" in msg_lower:
+                            self.query_one("#fallback-bar").add_class("-visible")
                 else:
                     # Benign/recovery: yellow notice in log only, no banner
                     log.write(f"[yellow]⚠ notice[/yellow] [{kind}] {_clip(msg)}")
@@ -691,6 +770,11 @@ class AnvilApp(App):
             elif ev_type == "done":
                 stepper.mark_all_done()
                 self.query_one("#result-banner", ResultBanner).show(data)
+                
+                if data.get("already_fixed"):
+                    reason = data.get("reason") or "The issue appears to already be fixed on the checked-out branch."
+                    self.query_one("#already-fixed-banner", AlreadyFixedBanner).show(reason)
+                    
                 # Load patch into diff pane if it exists on disk
                 patch_path = str(data.get("patch_path", ""))
                 if patch_path and os.path.exists(patch_path):
@@ -722,6 +806,12 @@ class AnvilApp(App):
             self._current_phase = phase
             stepper.mark_active(phase)
             log.write(f"\n[bold cyan]━━ {phase.value.upper()} ━━[/bold cyan]")
+            
+            # Check for checked-out ref
+            git_ref = data.get("ref") or data.get("git_ref")
+            if git_ref:
+                self.sub_title = f"Ref: {git_ref}"
+
             # Clear the error banner when a new phase starts (run recovered)
             self.query_one("#error-banner", ErrorBanner).clear()
         except Exception:
@@ -732,22 +822,34 @@ class AnvilApp(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start-btn":
             url = self.query_one("#issue-input", Input).value.strip()
+            ref = self.query_one("#ref-input", Input).value.strip()
             if url:
-                self._do_start(url)
+                self._do_start(url, ref=ref)
+        elif event.button.id == "fallback-start-btn":
+            url = self.query_one("#issue-input", Input).value.strip()
+            ref = self.query_one("#ref-input", Input).value.strip()
+            text = self.query_one("#issue-text-area", TextArea).text.strip()
+            if url and text:
+                self._started = False
+                self._do_start(url, ref=ref, issue_text=text)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "issue-input":
-            url = event.value.strip()
+        if event.input.id in ("issue-input", "ref-input"):
+            url = self.query_one("#issue-input", Input).value.strip()
+            ref = self.query_one("#ref-input", Input).value.strip()
             if url:
-                self._do_start(url)
+                self._do_start(url, ref=ref)
 
-    def _do_start(self, url: str) -> None:
+    def _do_start(self, url: str, ref: str | None = None, issue_text: str | None = None) -> None:
         """Trigger the harness for *url* (idempotent)."""
         if self._started:
             return
         self._started = True
         try:
             self.query_one("#issue-input", Input).value = url
+            if ref:
+                self.query_one("#ref-input", Input).value = ref
+            self.query_one("#fallback-bar").remove_class("-visible")
         except Exception:
             pass
         try:
@@ -759,7 +861,7 @@ class AnvilApp(App):
         if self._replay and self._replay_events:
             self._start_replay_task()
         elif self._on_start:
-            self._on_start(url)
+            self._on_start(url, ref=ref, manual_issue_text=issue_text)
 
     # ── Replay engine ─────────────────────────────────────────────────────────
 
@@ -832,12 +934,18 @@ class AnvilApp(App):
         """Reset the UI to its initial state."""
         self._started = False
         self._current_phase = None
+        self.sub_title = ""
         try:
             self.query_one("#event-log",    RichLog).clear()
             self.query_one("#phase-stepper", PhaseStepper).reset()
             self.query_one("#metrics-panel", MetricsPanel).reset()
             self.query_one("#error-banner",  ErrorBanner).clear()
             self.query_one("#result-banner", ResultBanner).remove_class("visible")
+            self.query_one("#already-fixed-banner", AlreadyFixedBanner).remove_class("visible")
+            self.query_one("#fallback-bar").remove_class("-visible")
+            self.query_one("#start-btn", Button).disabled = False
+            self.query_one("#issue-input", Input).disabled = False
+            self.query_one("#ref-input", Input).disabled = False
         except Exception:
             pass
 

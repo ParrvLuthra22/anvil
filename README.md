@@ -4,6 +4,8 @@
 > navigates the code, writes a failing reproduction, patches it, verifies the
 > fix, self-reviews the diff, and writes a final report — all autonomously,
 > using only a text LLM and a curated set of engineering tools.
+>
+> **Language support:** Implemented, verified on Python only.
 
 ---
 
@@ -53,7 +55,11 @@ key in `config.yaml`:
 |-----|---------|-------------|
 | `model` | `gemini-2.0-flash` | Model name passed to the OpenAI-compatible chat-completions endpoint |
 | `base_url` | Gemini endpoint | Provider base URL |
+| `model_profile` | `auto` | Model defaults profile: `auto` \| `default` \| `deepseek` \| `deepseek-reasoning` \| `qwen` \| `qwen-reasoning` |
 | `temperature` | `0` | Sampling temperature — 0 = deterministic output |
+| `max_output_tokens` | profile default | Cap on tokens per LLM reply (`null` = provider default) |
+| `strip_reasoning` | `true` | Strip `<think>...</think>` and `reasoning_content` blocks from replies |
+| `llm_extra_params` | `{}` | Extra dictionary of provider-specific parameters sent with every request body |
 | `tool_mode` | `auto` | How tools are offered: `native` (provider tool-calling API) \| `text` (describe in prompt) \| `auto` (try native, fall back to text) |
 | `llm_max_attempts` | `5` | Total tries per LLM request, including the first |
 | `llm_timeout_seconds` | `120` | Per-request read/write timeout |
@@ -75,9 +81,9 @@ key in `config.yaml`:
 | `output_dir` | `output` | Directory where `patch.diff`, `report.md`, and `trace.jsonl` are written |
 | `cost_per_million_prompt_tokens` | `0` | Optional cost reporting (USD per million prompt tokens); 0 = free tier / unknown |
 | `cost_per_million_completion_tokens` | `0` | Optional cost reporting (USD per million completion tokens) |
-| `sandbox` | `worktree` | Sandbox backend: `worktree` (default) \| `docker` (opt-in, no network in containers) \| `auto` |
+| `sandbox` | `worktree` | Sandbox backend: `worktree` (default) \| `docker` (opt-in and experimental, no network in containers) \| `auto` |
 
-> **Future work** (not yet implemented): Docker sandbox containers, parallel benchmark workers,
+> **Future work** (not yet implemented): Stable Docker sandbox containers, parallel benchmark workers,
 > per-model tokenizer, secrets scrubbing from sandbox environment beyond the fixed list.
 
 ### Environment overrides (never put these in config.yaml)
@@ -147,7 +153,9 @@ All tests are offline — no network, no real LLM, no API key required.
 
 ---
 
-## Benchmarks
+## Benchmarks (Experimental)
+
+> **Status:** Experimental, with no published numbers yet (`bench/results.md` says "no results yet").
 
 ```bash
 AI_API_KEY=<key> make bench
@@ -156,9 +164,6 @@ AI_API_KEY=<key> make bench
 Runs each issue in `bench/issues.yaml` headlessly and writes results to
 `bench/results.md`.  Issues are verified by Akshat from `candidates.yaml`
 before being added — no fabricated entries.
-
-> **No results yet** — `bench/issues.yaml` will be populated once the real
-> pipeline is operational and Akshat's verified candidates are confirmed.
 
 ---
 
@@ -225,7 +230,7 @@ Key choices at a glance:
 
 - **Phase state machine** — explicit phases give the LLM a focused prompt and a bounded budget per sub-task; they also make the TUI legible.
 - **Reproduce-first** — writing a failing test before patching prevents placebo patches and gives a binary pass/fail signal for verification.
-- **Worktree sandbox** — `git worktree` isolates every run without Docker overhead; Docker is auto-detected and used if available.
+- **Worktree sandbox** — `git worktree` isolates every run without Docker overhead; Docker sandbox is opt-in and experimental.
 - **Event bus** — decouples the agent from the TUI and the trace recorder; replay is free.
 - **JSONL trace** — append-only, crash-safe, streamable; one line per event.
 

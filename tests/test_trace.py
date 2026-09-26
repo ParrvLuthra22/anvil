@@ -184,3 +184,59 @@ def test_empty_file(tmp_path: Path):
     trace.write_text("")
     loaded = list(TraceRecorder.load(trace))
     assert loaded == []
+
+
+# ---------------------------------------------------------------------------
+# Live trace: queue drain flushes to disk mid-run
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_live_trace_readable_mid_run(tmp_path: Path):
+    import asyncio
+    from anvil.events import EventBus
+
+    bus = EventBus()
+    trace = tmp_path / "live_trace.jsonl"
+    rec = TraceRecorder(trace)
+    q = bus.subscribe()
+
+    async def _drain():
+        while True:
+            ev = await q.get()
+            rec.record(ev)
+            if ev.type == "done":
+                break
+        rec.close()
+
+    drain_task = asyncio.create_task(_drain())
+
+    # Emit first event
+    bus.emit(_make_event("phase", Phase.INGEST))
+    await asyncio.sleep(0.02)
+
+    # Read mid-run: first line must be present and valid
+    lines_mid = trace.read_text().strip().splitlines()
+    assert len(lines_mid) == 1, "Trace file should have 1 line mid-run"
+
+    # Emit second event
+    bus.emit(_make_event("message", Phase.INGEST))
+    await asyncio.sleep(0.02)
+
+    lines_mid2 = trace.read_text().strip().splitlines()
+    assert len(lines_mid2) == 2, "Trace file should have 2 lines mid-run"
+
+    # Finish run
+    bus.emit(_make_event("done", None, {"resolved_confidence": 1.0}))
+    await drain_task
+
+    loaded = list(TraceRecorder.load(trace))
+    assert len(loaded) == 3
+
+
+def test_main_make_event_bus_returns_events_event_bus():
+    """_make_event_bus() in __main__.py returns anvil.events.EventBus."""
+    from anvil.__main__ import _make_event_bus
+    from anvil.events import EventBus
+
+    bus = _make_event_bus()
+    assert isinstance(bus, EventBus)

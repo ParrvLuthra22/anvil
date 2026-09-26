@@ -1,0 +1,45 @@
+{"ts": 1790448913.599875, "type": "phase", "phase": "ingest", "data": {"name": "ingest"}}
+{"ts": 1790448913.899875, "type": "message", "phase": "ingest", "data": {"role": "assistant", "text": "[INGEST] Analysing… This is a simulated step 1 of 9."}}
+{"ts": 1790448914.099875, "type": "llm_usage", "phase": "ingest", "data": {"prompt_tokens": 800, "completion_tokens": 200, "total_tokens": 1000, "cost_estimate": 0.00015}}
+{"ts": 1790448914.1998749, "type": "tool_call", "phase": "ingest", "data": {"tool": "fetch_issue", "args": {"url": "https://github.com/example/repo/issues/1"}}}
+{"ts": 1790448914.599875, "type": "tool_result", "phase": "ingest", "data": {"tool": "fetch_issue", "ok": true, "output_preview": "Issue #1: KeyError when x is None — body: 42 chars"}}
+{"ts": 1790448915.099875, "type": "phase", "phase": "profile", "data": {"name": "profile"}}
+{"ts": 1790448915.399875, "type": "message", "phase": "profile", "data": {"role": "assistant", "text": "[PROFILE] Analysing… This is a simulated step 2 of 9."}}
+{"ts": 1790448915.599875, "type": "llm_usage", "phase": "profile", "data": {"prompt_tokens": 920, "completion_tokens": 240, "total_tokens": 1160, "cost_estimate": 0.000174}}
+{"ts": 1790448915.6998749, "type": "tool_call", "phase": "profile", "data": {"tool": "list_dir", "args": {"path": "."}}}
+{"ts": 1790448915.9998748, "type": "tool_result", "phase": "profile", "data": {"tool": "list_dir", "ok": true, "output_preview": "src/  tests/  README.md  pyproject.toml"}}
+{"ts": 1790448916.4998748, "type": "phase", "phase": "understand", "data": {"name": "understand"}}
+{"ts": 1790448916.7998748, "type": "message", "phase": "understand", "data": {"role": "assistant", "text": "[UNDERSTAND] Analysing… This is a simulated step 3 of 9."}}
+{"ts": 1790448916.9998748, "type": "llm_usage", "phase": "understand", "data": {"prompt_tokens": 1040, "completion_tokens": 280, "total_tokens": 1320, "cost_estimate": 0.000198}}
+{"ts": 1790448917.0998747, "type": "tool_call", "phase": "understand", "data": {"tool": "grep", "args": {"pattern": "KeyError", "path": "src/"}}}
+{"ts": 1790448917.4498746, "type": "tool_result", "phase": "understand", "data": {"tool": "grep", "ok": true, "output_preview": "src/lib/core.py:87:  raise KeyError(x)"}}
+{"ts": 1790448917.9498746, "type": "phase", "phase": "localize", "data": {"name": "localize"}}
+{"ts": 1790448918.2498746, "type": "message", "phase": "localize", "data": {"role": "assistant", "text": "[LOCALIZE] Analysing… This is a simulated step 4 of 9."}}
+{"ts": 1790448918.4498746, "type": "llm_usage", "phase": "localize", "data": {"prompt_tokens": 1160, "completion_tokens": 320, "total_tokens": 1480, "cost_estimate": 0.000222}}
+{"ts": 1790448918.5498745, "type": "tool_call", "phase": "localize", "data": {"tool": "read_file", "args": {"path": "src/lib/core.py", "start": 80, "end": 100}}}
+{"ts": 1790448918.8498745, "type": "tool_result", "phase": "localize", "data": {"tool": "read_file", "ok": true, "output_preview": "80: def process(x):\n81:     if x:\n...\n87:         raise KeyError(x)"}}
+{"ts": 1790448919.3498745, "type": "phase", "phase": "reproduce", "data": {"name": "reproduce"}}
+{"ts": 1790448919.6498744, "type": "message", "phase": "reproduce", "data": {"role": "assistant", "text": "[REPRODUCE] Analysing… This is a simulated step 5 of 9."}}
+{"ts": 1790448919.8498745, "type": "llm_usage", "phase": "reproduce", "data": {"prompt_tokens": 1280, "completion_tokens": 360, "total_tokens": 1640, "cost_estimate": 0.000246}}
+{"ts": 1790448919.9498744, "type": "tool_call", "phase": "reproduce", "data": {"tool": "run_cmd", "args": {"cmd": "python -m pytest tests/test_repro.py -x", "timeout": 30}}}
+{"ts": 1790448920.7498744, "type": "tool_result", "phase": "reproduce", "data": {"tool": "run_cmd", "ok": true, "output_preview": "FAILED tests/test_repro.py::test_none_key — KeyError: None"}}
+{"ts": 1790448921.2498744, "type": "phase", "phase": "patch", "data": {"name": "patch"}}
+{"ts": 1790448921.5498743, "type": "message", "phase": "patch", "data": {"role": "assistant", "text": "[PATCH] Analysing… This is a simulated step 6 of 9."}}
+{"ts": 1790448921.7498744, "type": "llm_usage", "phase": "patch", "data": {"prompt_tokens": 1400, "completion_tokens": 400, "total_tokens": 1800, "cost_estimate": 0.00027}}
+{"ts": 1790448921.8498743, "type": "tool_call", "phase": "patch", "data": {"tool": "edit_file", "args": {"path": "src/lib/core.py", "old": "    if x:\n        raise KeyError(x)", "new": "    if x is None:\n        return None"}}}
+{"ts": 1790448922.2498744, "type": "tool_result", "phase": "patch", "data": {"tool": "edit_file", "ok": true, "output_preview": "Patched 2 lines."}}
+{"ts": 1790448922.7498744, "type": "phase", "phase": "verify", "data": {"name": "verify"}}
+{"ts": 1790448923.0498743, "type": "message", "phase": "verify", "data": {"role": "assistant", "text": "[VERIFY] Analysing… This is a simulated step 7 of 9."}}
+{"ts": 1790448923.2498744, "type": "llm_usage", "phase": "verify", "data": {"prompt_tokens": 1520, "completion_tokens": 440, "total_tokens": 1960, "cost_estimate": 0.000294}}
+{"ts": 1790448923.3498743, "type": "tool_call", "phase": "verify", "data": {"tool": "run_tests", "args": {"target": null}}}
+{"ts": 1790448924.5498743, "type": "tool_result", "phase": "verify", "data": {"tool": "run_tests", "ok": true, "output_preview": "5 passed in 1.23s"}}
+{"ts": 1790448925.0498743, "type": "phase", "phase": "review", "data": {"name": "review"}}
+{"ts": 1790448925.3498743, "type": "message", "phase": "review", "data": {"role": "assistant", "text": "[REVIEW] Analysing… This is a simulated step 8 of 9."}}
+{"ts": 1790448925.5498743, "type": "llm_usage", "phase": "review", "data": {"prompt_tokens": 1640, "completion_tokens": 480, "total_tokens": 2120, "cost_estimate": 0.000318}}
+{"ts": 1790448925.6498742, "type": "tool_call", "phase": "review", "data": {"tool": "git_diff", "args": {}}}
+{"ts": 1790448925.9498742, "type": "tool_result", "phase": "review", "data": {"tool": "git_diff", "ok": true, "output_preview": "--- a/src/lib/core.py\n+++ b/src/lib/core.py\n@@ -80,3 +80,3 @@\n-    if x:\n-        raise KeyError(x)\n+    if x is None:\n+        return None"}}
+{"ts": 1790448926.4498742, "type": "phase", "phase": "finalize", "data": {"name": "finalize"}}
+{"ts": 1790448926.749874, "type": "message", "phase": "finalize", "data": {"role": "assistant", "text": "[FINALIZE] Analysing… This is a simulated step 9 of 9."}}
+{"ts": 1790448926.9498742, "type": "llm_usage", "phase": "finalize", "data": {"prompt_tokens": 1760, "completion_tokens": 520, "total_tokens": 2280, "cost_estimate": 0.000342}}
+{"ts": 1790448927.1498742, "type": "message", "phase": "finalize", "data": {"role": "assistant", "text": "Patch verified. Writing output files."}}
+{"ts": 1790448927.6498742, "type": "done", "phase": "finalize", "data": {"resolved_confidence": 0.92, "patch_path": "output/patch.diff", "report_path": "output/report.md", "steps": 9, "tokens": 14760, "seconds": 1790448927.1}}
