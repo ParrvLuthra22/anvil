@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -163,6 +164,22 @@ def test_run_bench_helpers(tmp_path: Path):
     results_file.write_text(json.dumps({"instance_id": "inst_1"}) + "\n", encoding="utf-8")
     completed = _load_completed(results_file)
     assert "inst_1" in completed
+
+
+def test_curated_benchmark_instances_include_checkout_dates_and_oracles():
+    """Curated SWE-bench records retain revisions, date, and official test oracle."""
+    instances = json.loads((Path(__file__).parents[1] / "bench/instances.json").read_text())
+    by_id = {row["instance_id"]: row for row in instances}
+
+    assert {"pallets__flask-4045", "pallets__flask-4992"} <= set(by_id)
+    for instance_id in ("pallets__flask-4045", "pallets__flask-4992"):
+        row = by_id[instance_id]
+        assert len(row["base_commit"]) == 40
+        datetime.fromisoformat(row["base_commit_date"].replace("Z", "+00:00"))
+        assert row["environment_setup_commit"]
+        assert row["test_patch"].startswith("diff --git ")
+        assert row["FAIL_TO_PASS"]
+        assert row["PASS_TO_PASS"]
 
 
 def test_run_bench_does_not_retry_healthy_summary_containing_429(tmp_path: Path):
