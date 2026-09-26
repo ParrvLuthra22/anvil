@@ -426,6 +426,7 @@ class TestEnsureDepsPython:
         assert _VENV_DIR in result.venv_python
         commands = [call.args[0] for call in sb.exec.call_args_list]
         assert any("--exclude-newer 2025-01-01T00:00:00Z --no-build-isolation" in cmd for cmd in commands)
+        assert any("'setuptools<67.5'" in cmd for cmd in commands)
 
     def test_as_of_creates_venv_and_installs_pinned_pytest_without_project_command(self):
         profile = RepoProfile(
@@ -445,7 +446,10 @@ class TestEnsureDepsPython:
         commands = [call.args[0] for call in sb.exec.call_args_list]
         assert any("-m venv .anvil_venv" in cmd for cmd in commands)
         assert not any("pip install -e" in cmd for cmd in commands)
-        assert any("--exclude-newer 2024-12-01T23:59:59.999999Z pytest" in cmd for cmd in commands)
+        assert any(
+            "--exclude-newer 2024-12-01T23:59:59.999999Z --no-build-isolation pytest" in cmd
+            for cmd in commands
+        )
 
     def test_as_of_uses_uv_cutoff_for_project_and_test_framework(self):
         """The requested cutoff reaches every install and stays inside the venv."""
@@ -468,6 +472,7 @@ class TestEnsureDepsPython:
         assert all("--exclude-newer 2024-11-01T20:35:12Z" in cmd for cmd in install_commands)
         assert all("VIRTUAL_ENV=.anvil_venv" in cmd for cmd in install_commands)
         assert all(not cmd.lstrip().startswith("pip install") for cmd in install_commands)
+        assert all("--no-build-isolation" in cmd for cmd in install_commands)
         assert "2024-11-01T20:35:12Z" in result.report
 
     def test_failed_pinned_install_warns_and_never_falls_back_to_unpinned_pip(self, caplog):

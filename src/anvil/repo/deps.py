@@ -352,7 +352,7 @@ def _ensure_python_deps(
     # Step 2: Bootstrap build tools without a cutoff so legacy build backends
     # can be used by the subsequent date-pinned, no-build-isolation install.
     bootstrap = sandbox.exec(
-        f"{venv_pip} install --quiet --upgrade pip uv setuptools wheel",
+        f"{venv_pip} install --quiet --upgrade pip uv 'setuptools<67.5' wheel",
         timeout=60,
     )
     if bootstrap.exit_code != 0 or bootstrap.timed_out:
@@ -423,7 +423,7 @@ def _ensure_python_deps(
                 return _date_pin_failure("uv is unavailable to install the test framework with the requested cutoff.", venv_python)
             cmd_framework = (
                 f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet "
-                f"--exclude-newer {as_of} {test_framework_pkg}"
+                f"--exclude-newer {as_of} --no-build-isolation {test_framework_pkg}"
             )
             
         framework_result = sandbox.exec(cmd_framework, timeout=60)
