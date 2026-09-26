@@ -99,6 +99,16 @@ class EditFileTool:
         except (PermissionError, OSError) as exc:
             return ToolResult(ok=False, output=f"Could not write file: {exc}")
 
+        # Syntax guard
+        err = self._check_syntax(path, updated, sandbox)
+        if err:
+            # Revert
+            sandbox.write_file(path, content)
+            return ToolResult(
+                ok=False,
+                output=f"Edit reverted due to syntax error:\n{err}",
+            )
+
         msg = f"Successfully replaced 1 occurrence in {path!r}."
         if whitespace_only:
             msg += (
@@ -110,6 +120,32 @@ class EditFileTool:
             output=msg,
             meta={"path": path, "match_count": 1, "whitespace_only": whitespace_only},
         )
+
+    @staticmethod
+    def _check_syntax(path: str, content: str, sandbox: Sandbox) -> str | None:
+        """Run a fast syntax check. Return error message on failure, None otherwise."""
+        if path.endswith(".py"):
+            import ast
+            try:
+                ast.parse(content, filename=path)
+            except SyntaxError as e:
+                return f"SyntaxError: {e.msg} at line {e.lineno}, column {e.offset}"
+            return None
+        elif path.endswith((".js", ".ts")):
+            # Quote the path to avoid issues with spaces (though usually not present)
+            res = sandbox.exec(f"node --check '{path}'")
+            # 127 is command not found
+            if res.exit_code == 127 or not res.stderr.strip() and res.exit_code == 0:
+                pass
+            elif res.exit_code != 0:
+                return res.stderr.strip() or res.stdout.strip()
+        elif path.endswith(".go"):
+            res = sandbox.exec(f"gofmt -e '{path}'")
+            if res.exit_code == 127:
+                pass
+            elif res.exit_code != 0:
+                return res.stderr.strip() or res.stdout.strip()
+        return None
 
     @staticmethod
     def _closest_lines(query: str, content: str) -> str:

@@ -205,6 +205,20 @@ class TestEditFileTool:
         assert result.ok
         assert not result.meta.get("whitespace_only")
 
+    def test_syntax_guard_python(self, sandbox):
+        sandbox.write_file("syn.py", "def foo():\n    pass\n")
+        result = EditFileTool().run({"path": "syn.py", "old": "pass", "new": "pass)"}, sandbox)
+        assert not result.ok
+        assert "Edit reverted due to syntax error" in result.output
+        assert "SyntaxError:" in result.output
+        assert sandbox.read_file("syn.py") == "def foo():\n    pass\n"
+
+    def test_syntax_guard_ok(self, sandbox):
+        sandbox.write_file("syn.py", "def foo():\n    pass\n")
+        result = EditFileTool().run({"path": "syn.py", "old": "pass", "new": "return 1"}, sandbox)
+        assert result.ok
+        assert sandbox.read_file("syn.py") == "def foo():\n    return 1\n"
+
 
 # ---------------------------------------------------------------------------
 # RunCmdTool
