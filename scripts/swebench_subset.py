@@ -250,7 +250,8 @@ def gold_check(inst: dict[str, Any], workdir: Path, verbose: bool) -> dict[str, 
 
     if not deps.ok and not deps.skipped:
         sb.close()
-        return fail(f"deps: {deps.report[:200]}", install_seconds=install_s)  # type: ignore[call-arg]
+        return {"ok": False, "error": f"deps: {deps.report[:200]}", "notes": "",
+                "install_seconds": install_s, "venv_python": None, "test_cmd": ""}
 
     venv_python = deps.venv_python
     ftp_cmd = _build_test_cmd(repo, ftp, venv_python)
