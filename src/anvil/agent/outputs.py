@@ -13,6 +13,9 @@ from anvil.agent.state import RunState
 SCRATCH_DIR = ".anvil"
 DEPS_VENV_DIR = ".anvil_venv"  # the repository's dependencies, installed by the harness (see RepoPipeline)
 _HARNESS_DIRS = (SCRATCH_DIR, DEPS_VENV_DIR)
+# repo/deps.py tests each Python in a throwaway venv named .probe_<python> inside the clone; a probe that fails
+# (a distro without python3-venv, a Homebrew Python without ensurepip) can leave a half-made one behind.
+PROBE_DIR_PREFIX = ".probe_"
 # Directories that tools and test runs generate inside a checkout. A sandbox diff lists untracked
 # files, so in a repo without a matching .gitignore they would otherwise end up in the patch.
 ARTEFACT_DIRS = frozenset(
@@ -189,7 +192,7 @@ def _is_excluded(section: list[str]) -> bool:
 
 
 def _is_scratch(path: str) -> bool:
-    return any(path == name or path.startswith(name + "/") for name in _HARNESS_DIRS)
+    return path.startswith(PROBE_DIR_PREFIX) or any(path == name or path.startswith(name + "/") for name in _HARNESS_DIRS)
 
 
 def _is_artefact(path: str) -> bool:

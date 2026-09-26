@@ -147,6 +147,31 @@ def test_edits_left_behind_when_the_phase_ends_without_phase_done_are_reverted_b
     assert "The bug was not reproduced" in run.report and "the harness reverted them" in run.report
 
 
+def test_a_half_made_interpreter_probe_appearing_in_the_tree_is_not_a_source_edit_by_the_model(tmp_path):
+    """The dependency step's probe (.probe_python3_12/) showed up as "the model changed source files"; the guard rolled the
+    tree back, re-prompted, and the patch that was delivered contained the probe's files instead of the fix."""
+
+    def leaving_a_probe(cmd: str, files: dict[str, str]) -> ExecResult:
+        if cmd == REPRO_CMD:
+            files[".probe_python3_12/pyvenv.cfg"] = "home = /opt/homebrew/opt/python@3.12/bin\n"
+            files[".probe_python3_12/bin/python"] = "/opt/homebrew/opt/python@3.12/bin/python3.12"
+        return project_exec(cmd, files)
+
+    fake = FakePipeline(FakeSandbox(project_files(), on_exec=leaving_a_probe))
+    script = (
+        understand() + localize() + write_and_run_repro()
+        + [done("add(2, 3) returns -1: the repro fails", repro_cmd=REPRO_CMD)]
+        + rest()
+    )
+    run = execute(script, tmp_path, pipeline=fake)
+
+    assert not any(e[0] == "rollback" for e in fake.sandbox.events), "nothing the model did needed reverting"
+    assert "changed source files" not in run.report
+    assert "Reproduced before patching: yes" in run.report
+    assert ".probe_" not in run.patch and "+    return a + b" in run.patch
+    assert run.llm.remaining == 0
+
+
 def test_a_reproduce_that_changes_only_files_under_dot_anvil_reverts_nothing(tmp_path):
     fake = pipeline()
     script = understand() + localize() + write_and_run_repro() + [done("fails", repro_cmd=REPRO_CMD)] + rest()

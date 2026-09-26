@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from anvil.agent.outputs import DEPS_VENV_DIR, SCRATCH_DIR
+from anvil.agent.outputs import DEPS_VENV_DIR, PROBE_DIR_PREFIX, SCRATCH_DIR
 from anvil.agent.prepared_sandbox import PreparedSandbox
 from anvil.agent.settings import AgentSettings
 from anvil.agent.text import clip_head
@@ -359,7 +359,7 @@ def _exclude_harness_dirs(root: Path) -> None:
     if not (root / ".git").is_dir():
         return  # not a plain git checkout: never invent a .git directory
     exclude = root / ".git" / "info" / "exclude"
-    wanted = [f"{SCRATCH_DIR}/", f"{DEPS_VENV_DIR}/"]
+    wanted = [f"{SCRATCH_DIR}/", f"{DEPS_VENV_DIR}/", f"{PROBE_DIR_PREFIX}*/"]
     try:
         exclude.parent.mkdir(parents=True, exist_ok=True)
         present = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []

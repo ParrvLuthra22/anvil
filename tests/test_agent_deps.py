@@ -51,6 +51,28 @@ def test_the_dependency_venv_and_the_scratch_dir_are_excluded_from_the_patch():
     assert ".anvil" not in patch
 
 
+def _symlink_section(path: str, target: str) -> str:
+    return f"diff --git a/{path} b/{path}\nnew file mode 120000\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+{target}\n\\ No newline at end of file\n"
+
+
+def test_a_half_made_interpreter_probe_is_not_part_of_the_patch():
+    """Seen on a Mac whose Homebrew python3.12/3.13 cannot make a venv: the probe left .probe_python3_12/ in the clone."""
+    diff = (
+        _symlink_section(".probe_python3_12/bin/python", "/opt/homebrew/opt/python@3.12/bin/python3.12")
+        + _section(".probe_python3_12/pyvenv.cfg", "+home = /opt/homebrew/opt/python@3.12/bin\n")
+        + _section(".probe_python3_13/pyvenv.cfg")
+        + "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n"
+    )
+    patch = filter_diff(diff)
+    assert [c.path for c in changed_files(patch)] == ["calc.py"]
+    assert ".probe_" not in patch
+
+
+def test_only_a_probe_directory_at_the_top_level_is_excluded():
+    diff = _section("src/.probe_notes.md") + _section("docs/.probe_python3_12/x.py") + _section(".probes/x.py")
+    assert [c.path for c in changed_files(filter_diff(diff))] == ["src/.probe_notes.md", "docs/.probe_python3_12/x.py", ".probes/x.py"]
+
+
 def test_only_the_harness_directories_at_the_top_level_are_excluded():
     diff = _section("src/.anvil_venv_notes.md") + _section("docs/anvil_venv/readme.md") + _section(".anvil_venv2/x.py")
     assert [c.path for c in changed_files(filter_diff(diff))] == [
@@ -94,7 +116,16 @@ def test_excluding_is_idempotent_and_keeps_what_was_there(clone):
     exclude.write_text("# mine\n*.log")  # no trailing newline
     _exclude_harness_dirs(clone)
     _exclude_harness_dirs(clone)
-    assert exclude.read_text().splitlines() == ["# mine", "*.log", ".anvil/", ".anvil_venv/"]
+    assert exclude.read_text().splitlines() == ["# mine", "*.log", ".anvil/", ".anvil_venv/", ".probe_*/"]
+
+
+def test_a_probe_the_dependency_step_left_behind_is_ignored_by_git(clone):
+    _exclude_harness_dirs(clone)
+    (clone / ".probe_python3_12" / "bin").mkdir(parents=True)
+    (clone / ".probe_python3_12" / "bin" / "python").symlink_to("/usr/bin/python3")
+    (clone / ".probe_python3_12" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (clone / ".probes.md").write_text("not a probe directory\n")
+    assert _git(clone, "status", "--porcelain").split() == ["??", ".probes.md"]
 
 
 def test_a_directory_that_is_not_a_git_checkout_is_left_alone(tmp_path):
