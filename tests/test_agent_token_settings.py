@@ -13,10 +13,10 @@ def settings(**config) -> AgentSettings:
 
 
 def test_both_features_are_on_by_default_and_in_the_shipped_config():
-    assert settings().token_budgets is True and settings().weak_model_prompts is True and settings().patch_sanity is True
+    assert all(getattr(settings(), flag) is True for flag in ("token_budgets", "weak_model_prompts", "patch_sanity", "nav_tools"))
     shipped = AgentSettings.from_mapping(load_config())
-    assert shipped.token_budgets is True and shipped.weak_model_prompts is True and shipped.patch_sanity is True
-    assert load_config()["features"] == {"token_budgets": True, "weak_model_prompts": True, "patch_sanity": True}
+    assert all(getattr(shipped, flag) is True for flag in ("token_budgets", "weak_model_prompts", "patch_sanity", "nav_tools"))
+    assert load_config()["features"] == {"token_budgets": True, "weak_model_prompts": True, "patch_sanity": True, "nav_tools": True}
 
 
 def test_the_shipped_phase_caps_are_the_agreed_ones():

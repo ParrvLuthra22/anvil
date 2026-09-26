@@ -19,7 +19,7 @@ DEFAULT_READ_FILE_HEAD_LINES = 60
 DEFAULT_TOKEN_SAVING_KEEP_STEPS = 3
 DEFAULT_TOKEN_SAVING_OUTPUT_CAP = 4000
 DEFAULT_REPO_MAP_CHARS = 3000
-_FEATURES = ("token_budgets", "weak_model_prompts", "patch_sanity")
+_FEATURES = ("token_budgets", "weak_model_prompts", "patch_sanity", "nav_tools")
 _LEGACY_OUTPUT_CAP = 8000  # the value used for tool_output_char_cap when it is absent and token_budgets is off
 
 
@@ -48,6 +48,7 @@ class AgentSettings:
     token_budgets: bool = True
     weak_model_prompts: bool = True
     patch_sanity: bool = True
+    nav_tools: bool = True
     read_file_max_lines: int = DEFAULT_READ_FILE_MAX_LINES
     read_file_head_lines: int = DEFAULT_READ_FILE_HEAD_LINES
     repo_map_chars: int = DEFAULT_REPO_MAP_CHARS
@@ -74,6 +75,7 @@ class AgentSettings:
             token_budgets=features["token_budgets"],
             weak_model_prompts=features["weak_model_prompts"],
             patch_sanity=features["patch_sanity"],
+            nav_tools=features["nav_tools"],
             read_file_max_lines=saving["read_file_max_lines"],
             read_file_head_lines=saving["read_file_head_lines"],
             repo_map_chars=saving["repo_map_chars"],

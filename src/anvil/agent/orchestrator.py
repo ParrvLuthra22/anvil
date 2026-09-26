@@ -589,7 +589,7 @@ class Orchestrator:
             raise RuntimeError("the LLM phases cannot run before PROFILE")
         self._enter(phase)
         self._ctx.set_diff(self._patch_text())
-        outcome = self._runner.run(phase_spec(phase, self._settings.weak_model_prompts), kickoff, gate)
+        outcome = self._runner.run(phase_spec(phase, self._settings.weak_model_prompts, self._settings.nav_tools), kickoff, gate)
         if outcome.forced:
             self._state.limit(
                 f"{phase.value.upper()} used its {self._settings.call_cap(phase.value)}-call cap and was closed by the "
@@ -659,7 +659,8 @@ class Orchestrator:
             return
         try:
             outcome = self._runner.run(
-                phase_spec(Phase.FINALIZE, self._settings.weak_model_prompts), finalize_kickoff(self._facts(patch))
+                phase_spec(Phase.FINALIZE, self._settings.weak_model_prompts, self._settings.nav_tools),
+                finalize_kickoff(self._facts(patch)),
             )
         except (BudgetExceeded, RunAborted) as exc:
             self._state.limit(f"The closing summary could not be written: {exc}")
