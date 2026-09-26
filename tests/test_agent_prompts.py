@@ -30,7 +30,7 @@ ALLOWLISTS = {
     Phase.REPRODUCE: {"read_file", "grep", "run_cmd"},
     Phase.PATCH: {"read_file", "grep", "edit_file", "run_cmd", "git_diff"},
     Phase.VERIFY: {"run_tests", "run_cmd", "read_file", "git_diff"},
-    Phase.REVIEW: {"git_diff", "read_file"},
+    Phase.REVIEW: {"git_diff", "read_file", "run_tests"},
     Phase.FINALIZE: set(),
 }
 

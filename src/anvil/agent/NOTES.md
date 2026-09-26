@@ -99,6 +99,9 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 - A checkpoint result that is empty, `None` or starts with `error` is a failed checkpoint (a limitation is recorded and
   no rollback will be attempted). If a sandbox's checkpoint empties the working tree (a `git stash` does), the edited files
   are written back through the Sandbox interface; if that is impossible the checkpoint is undone and reported as failed.
+- REVIEW reads and may run tests but cannot edit: its tools are `git_diff`, `read_file` and `run_tests` (not `run_cmd`, not
+  `edit_file`). `run_tests` is there because a real model spent its REVIEW calls on it and was refused; it changes nothing in the
+  repository.
 - REVIEW may ask for changes with `give_up`. That triggers exactly one rework round (checkpoint `before-rework`), never a
   rethink, and it is not re-reviewed. If the rework fails verification the reviewed patch is restored.
 

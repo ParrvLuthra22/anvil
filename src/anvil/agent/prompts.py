@@ -70,8 +70,9 @@ The harness has already re-run the repro; its result is in the message below. No
 Call phase_done(summary) if the repro and the relevant tests pass. Otherwise call give_up(reason), where reason is the essential failing output (test names and the key assertion or traceback lines, at most 30 lines) plus your diagnosis."""
 
 _REVIEW = """\
-Phase: REVIEW. Review your own patch as a strict maintainer would. Tools: git_diff, read_file.
+Phase: REVIEW. Review your own patch as a strict maintainer would. Tools: git_diff, read_file, run_tests.
 Read the full diff and check: does it fix the root cause rather than a symptom? Is it minimal, with no debug output, stray files or unrelated edits? Does it handle the edge cases the issue implies (empty or None input, other call sites of the changed code)? Does it match the style of the surrounding code?
+You cannot edit anything in this phase. Use run_tests only to check a doubt (for example that a test really exercises the changed code); it does not change the repository.
 Call phase_done(summary) to approve. If something must change, call give_up(reason) listing exactly what to change; the harness then sends you back to PATCH once."""
 
 _FINALIZE = """\
@@ -125,8 +126,9 @@ phase_done(summary) if the repro and the relevant tests pass. Otherwise give_up(
 Example call: run_tests(targets=["tests/test_calc.py"])"""
 
 _WEAK_REVIEW = """\
-Phase: REVIEW. Review the patch as a strict maintainer. Tools: git_diff, read_file.
+Phase: REVIEW. Review the patch as a strict maintainer. Tools: git_diff, read_file, run_tests.
 Check: it fixes the root cause; it is minimal, with no debug output or stray files; edge cases (empty or None input, other callers); the style around it. Check the type and the message of any new error: the most specific built-in exception (ValueError, TypeError), never assert for input validation, a clear message that names the bad value, and the same convention as the other errors in that module (read_file the nearby code to see how it reports similar ones).
+You cannot edit in this phase; run_tests only checks a doubt and changes nothing.
 phase_done(summary) approves. give_up(reason) asks for changes: list exactly what to change (you get one rework).
 Example call: git_diff()"""
 
@@ -166,7 +168,7 @@ PHASE_SPECS: dict[Phase, PhaseSpec] = {
         _spec(Phase.REPRODUCE, _REPRODUCE, "read_file", "grep", "run_cmd", WRITE_REPRO),
         _spec(Phase.PATCH, _PATCH, "read_file", "grep", "edit_file", "run_cmd", "git_diff"),
         _spec(Phase.VERIFY, _VERIFY, "run_tests", "run_cmd", "read_file", "git_diff"),
-        _spec(Phase.REVIEW, _REVIEW, "git_diff", "read_file"),
+        _spec(Phase.REVIEW, _REVIEW, "git_diff", "read_file", "run_tests"),
         _spec(Phase.FINALIZE, _FINALIZE),
     )
 }
@@ -180,7 +182,7 @@ WEAK_PHASE_SPECS: dict[Phase, PhaseSpec] = {
         _spec(Phase.REPRODUCE, _WEAK_REPRODUCE, "read_file", "grep", "run_cmd", WRITE_REPRO, base=_WEAK_BASE),
         _spec(Phase.PATCH, _WEAK_PATCH, "read_file", "grep", "edit_file", "run_cmd", "git_diff", base=_WEAK_BASE),
         _spec(Phase.VERIFY, _WEAK_VERIFY, "run_tests", "run_cmd", "read_file", "git_diff", base=_WEAK_BASE),
-        _spec(Phase.REVIEW, _WEAK_REVIEW, "git_diff", "read_file", base=_WEAK_BASE),
+        _spec(Phase.REVIEW, _WEAK_REVIEW, "git_diff", "read_file", "run_tests", base=_WEAK_BASE),
         _spec(Phase.FINALIZE, _WEAK_FINALIZE, base=_WEAK_BASE),
     )
 }

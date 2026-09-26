@@ -199,7 +199,7 @@ def test_each_phase_only_saw_its_own_system_prompt_and_tools(tmp_path):
     assert seen["UNDERSTAND"] == {"phase_done", "give_up"}
     assert seen["LOCALIZE"] == {"list_dir", "grep", "read_file", "phase_done", "give_up"}
     assert seen["PATCH"] == {"read_file", "grep", "edit_file", "run_cmd", "git_diff", "phase_done", "give_up"}
-    assert seen["REVIEW"] == {"git_diff", "read_file", "phase_done", "give_up"}
+    assert seen["REVIEW"] == {"git_diff", "read_file", "run_tests", "phase_done", "give_up"}
 
 
 def test_the_issue_reaches_the_model_as_a_pinned_untrusted_brief(tmp_path):
