@@ -118,7 +118,7 @@ test:
 	@$(VPY) -m pytest -q
 
 # ---------------------------------------------------------------------------
-# bench — run the benchmark suite against issues.yaml
+# bench — run the benchmark suite against instances.json
 # The key is already in the environment; we NEVER re-expand it in the recipe.
 # ---------------------------------------------------------------------------
 bench:
@@ -128,6 +128,8 @@ bench:
 	  echo "ERROR: AI_API_KEY is not set."; exit 1; \
 	fi
 	@$(VPY) bench/run_bench.py
+	@$(VPY) bench/score.py
+	@$(VPY) bench/analyze.py
 
 # ---------------------------------------------------------------------------
 # clean — remove caches, build artefacts, and run outputs

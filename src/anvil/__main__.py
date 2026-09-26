@@ -139,7 +139,7 @@ def _ensure_api_key() -> str:
 
 def _output_paths() -> tuple[Path, Path, Path]:
     """Ensure output/ exists and return (patch, report, trace) paths."""
-    out = Path("output")
+    out = Path(os.environ.get("ANVIL_OUTPUT_DIR", "output"))
     out.mkdir(parents=True, exist_ok=True)
     return out / "patch.diff", out / "report.md", out / "trace.jsonl"
 
@@ -322,6 +322,29 @@ def _run_headless(args: argparse.Namespace, config: dict) -> None:
     # Use repo_url as a display URL if GitHub issue URL not given
     display_url = issue_url or repo_url
 
+    if repo_url and (repo_url.startswith("file://") or Path(repo_url).exists()):
+        import anvil.agent.pipeline
+        import anvil.repo.ingest
+        import shutil
+        import subprocess
+
+        local_path = repo_url[7:] if repo_url.startswith("file://") else repo_url
+        local_p = Path(local_path).resolve()
+
+        # Patch pipeline to allow file:// URLs or local paths for test fixtures
+        anvil.agent.pipeline._owner_and_repo = lambda u: ("local", local_p.name or "fixture")
+        
+        def _mock_clone(ref, dest, git_ref=None):
+            shutil.copytree(str(local_p), dest, dirs_exist_ok=True)
+            if git_ref:
+                subprocess.run(["git", "checkout", git_ref], cwd=dest, check=True, capture_output=True)
+            return dest
+            
+        anvil.agent.pipeline.clone_repo = _mock_clone
+
+    if "ANVIL_OUTPUT_DIR" in os.environ:
+        config["output_dir"] = os.environ["ANVIL_OUTPUT_DIR"]
+
     bus = _make_event_bus()
     patch_path, report_path, trace_path = _output_paths()
     print(f"ANVIL — headless run for: {display_url}")
@@ -439,6 +462,9 @@ def main() -> None:
         config = load_config(config_path)
     except Exception:
         config = {}
+
+    if "ANVIL_OUTPUT_DIR" in os.environ:
+        config["output_dir"] = os.environ["ANVIL_OUTPUT_DIR"]
 
     if args.subcommand == "replay":
         _run_replay(args)

@@ -1,0 +1,11 @@
+[
+  {
+    "instance_id": "test_fixture_001",
+    "repo": "bench/fixture/repo",
+    "base_commit": "b3c47eefba055ef51ae335b09809ea43a105f8c7",
+    "problem_statement": "The `is_true` function in `main.py` should return `True` instead of `False`.",
+    "test_patch": "--- a/test_main.py\n+++ b/test_main.py\n@@ -1,2 +1,2 @@\n from main import is_true\n-def test_is_true(): assert is_true() == False\n+def test_is_true(): assert is_true() == True",
+    "FAIL_TO_PASS": ["test_main.py::test_is_true"],
+    "PASS_TO_PASS": []
+  }
+]

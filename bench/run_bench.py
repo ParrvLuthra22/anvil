@@ -1,246 +1,197 @@
 #!/usr/bin/env python3
-"""ANVIL benchmark runner.
-
-Reads ``bench/issues.yaml``, runs each issue headlessly via the same pipeline
-as ``python -m anvil --headless``, and prints a summary table.
-
-Usage::
-
-    AI_API_KEY=... python bench/run_bench.py
-    AI_API_KEY=... python bench/run_bench.py --issues bench/my_issues.yaml
-    AI_API_KEY=... python bench/run_bench.py --timeout 600
-
-Results are written to ``bench/results.md``.
-"""
+"""ANVIL benchmark runner."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
-import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
-# Ensure the project src is importable when run directly
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT / "src"))
-
-import yaml  # noqa: E402 (must come after sys.path tweak)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BenchIssue:
-    url: str
-    description: str = ""
-    test_cmd: str | None = None
+def _load_instances(path: Path) -> list[dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-@dataclass
-class BenchResult:
-    issue: BenchIssue
-    resolved: bool = False
-    steps: int = 0
-    tokens: int = 0
-    seconds: float = 0.0
-    error: str = ""
+def _load_completed(results_file: Path) -> set[str]:
+    completed = set()
+    if results_file.exists():
+        with open(results_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    if "instance_id" in data:
+                        completed.add(data["instance_id"])
+                except Exception:
+                    pass
+    return completed
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
+async def _run_instance(
+    instance: dict,
+    timeout: int,
+    label: str,
+    results_file: Path,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    instance_id = instance["instance_id"]
+    async with semaphore:
+        run_dir = _REPO_ROOT / "bench" / "runs" / instance_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-def _load_issues(path: Path) -> list[BenchIssue]:
-    """Parse the YAML issue list."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    issues: list[BenchIssue] = []
-    for entry in raw.get("issues", []):
-        issues.append(
-            BenchIssue(
-                url=entry["url"],
-                description=entry.get("description", entry["url"]),
-                test_cmd=entry.get("test_cmd"),
+        env = {
+            **os.environ,
+            "ANVIL_OUTPUT_DIR": str(run_dir.resolve()),
+            "PYTHONPATH": f"{_REPO_ROOT / 'src'}:{os.environ.get('PYTHONPATH', '')}".rstrip(":"),
+        }
+        if "AI_API_KEY" not in env:
+            env["AI_API_KEY"] = "mock"
+
+        repo = instance["repo"]
+        if repo.startswith("file://"):
+            local_p = Path(repo[7:]).resolve()
+            repo = f"file://{local_p}"
+        elif Path(repo).exists():
+            repo = f"file://{Path(repo).resolve()}"
+        elif (_REPO_ROOT / repo).exists():
+            repo = f"file://{(_REPO_ROOT / repo).resolve()}"
+        elif not repo.startswith("http") and "/" in repo:
+            repo = f"https://github.com/{repo}"
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "anvil",
+            "--headless",
+            "--repo",
+            repo,
+            "--ref",
+            instance["base_commit"],
+            "--issue-text",
+            instance["problem_statement"],
+        ]
+
+        while True:
+            print(f"Running {instance_id}...")
+            start = time.time()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(_REPO_ROOT),
             )
-        )
-    return issues
 
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                out = stdout.decode(errors="replace")
+                err = stderr.decode(errors="replace")
 
-def _run_one(issue: BenchIssue, timeout: int) -> BenchResult:
-    """Run one issue headlessly in a subprocess; parse the done event from trace."""
-    result = BenchResult(issue=issue)
-    run_dir = Path("output") / f"bench_{int(time.time())}_{issue.url.split('/')[-1]}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = run_dir / "trace.jsonl"
+                # Check for rate limit
+                if (
+                    "429" in out
+                    or "429" in err
+                    or "rate limit" in out.lower()
+                    or "rate limit" in err.lower()
+                ):
+                    print(f"Rate limit hit for {instance_id}. Sleeping 60s and retrying...")
+                    await asyncio.sleep(60)
+                    continue
 
-    env = {**os.environ, "ANVIL_OUTPUT_DIR": str(run_dir)}
-    cmd = [
-        sys.executable, "-m", "anvil",
-        "--issue", issue.url,
-        "--headless",
-    ]
+                error = ""
+                if proc.returncode != 0:
+                    error = (err or out)[:200]
+                break
 
-    start = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            env=env,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            cwd=str(_ROOT),
-        )
-        result.seconds = round(time.time() - start, 1)
-        if proc.returncode != 0:
-            result.error = (proc.stderr or proc.stdout or "non-zero exit")[:200]
-            return result
-    except subprocess.TimeoutExpired:
-        result.seconds = timeout
-        result.error = f"timeout after {timeout}s"
-        return result
-    except Exception as exc:
-        result.seconds = round(time.time() - start, 1)
-        result.error = str(exc)[:200]
-        return result
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                error = f"timeout after {timeout}s"
+                break
+            except Exception as e:
+                error = str(e)[:200]
+                break
 
-    # Parse trace for done event
-    default_trace = Path("output") / "trace.jsonl"
-    for tp in [trace_path, default_trace]:
-        if tp.exists():
+        duration = round(time.time() - start, 1)
+
+        # Parse trace for done event to get tokens/steps
+        trace_path = run_dir / "trace.jsonl"
+        steps = 0
+        tokens = 0
+        if trace_path.exists():
             try:
                 from anvil.trace.recorder import TraceRecorder
-                for ev in TraceRecorder.load(tp):
+
+                for ev in TraceRecorder.load(trace_path):
                     if ev.type == "llm_usage":
-                        result.tokens += ev.data.get("total_tokens", 0)
+                        tokens += ev.data.get("total_tokens", 0)
                     elif ev.type == "done":
-                        result.steps = ev.data.get("steps", 0)
-                        result.tokens = ev.data.get("tokens", result.tokens)
-                        result.seconds = ev.data.get("seconds", result.seconds)
-                        conf = ev.data.get("resolved_confidence", 0)
-                        result.resolved = conf >= 0.6
-                break
+                        steps = ev.data.get("steps", steps)
+                        tokens = ev.data.get("tokens", tokens)
             except Exception:
                 pass
 
-    # Optionally run the caller-supplied test command to verify
-    if issue.test_cmd and not result.error:
-        try:
-            check = subprocess.run(
-                issue.test_cmd,
-                shell=True,
-                timeout=120,
-                capture_output=True,
-                cwd=str(_ROOT),
-            )
-            result.resolved = check.returncode == 0
-        except Exception:
-            pass
+        result = {
+            "instance_id": instance_id,
+            "label": label,
+            "patch_path": str(run_dir / "patch.diff"),
+            "report_path": str(run_dir / "report.md"),
+            "trace_path": str(trace_path),
+            "duration": duration,
+            "error": error,
+            "steps": steps,
+            "tokens": tokens,
+        }
 
-    return result
+        with open(results_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result) + "\n")
 
-
-# ---------------------------------------------------------------------------
-# Table rendering
-# ---------------------------------------------------------------------------
-
-def _render_table(results: list[BenchResult]) -> str:
-    rows = []
-    rows.append("| # | Issue | Description | Resolved | Steps | Tokens | Time (s) |")
-    rows.append("|---|-------|-------------|----------|-------|--------|----------|")
-    for i, r in enumerate(results, 1):
-        resolved = "✓ Yes" if r.resolved else ("✗ No" if not r.error else f"⚠ {r.error[:40]}")
-        short_url = r.issue.url.split("github.com/")[-1]
-        rows.append(
-            f"| {i} | [{short_url}]({r.issue.url}) "
-            f"| {r.issue.description[:50]} "
-            f"| {resolved} "
-            f"| {r.steps} "
-            f"| {r.tokens:,} "
-            f"| {r.seconds} |"
-        )
-    return "\n".join(rows)
+        print(f"Finished {instance_id} in {duration}s. Error: {error}")
 
 
-def _print_table(results: list[BenchResult]) -> None:
-    cols = ["#", "Description", "Resolved", "Steps", "Tokens", "Time(s)"]
-    widths = [3, 50, 10, 6, 9, 8]
-    header = "  ".join(c.ljust(w) for c, w in zip(cols, widths))
-    sep = "  ".join("-" * w for w in widths)
-    print("\n" + header)
-    print(sep)
-    for i, r in enumerate(results, 1):
-        resolved = "YES" if r.resolved else ("NO" if not r.error else f"ERR")
-        print(
-            "  ".join(
-                str(v).ljust(w)
-                for v, w in zip(
-                    [i, r.issue.description[:50], resolved, r.steps, f"{r.tokens:,}", r.seconds],
-                    widths,
-                )
-            )
-        )
-    passed = sum(1 for r in results if r.resolved)
-    print(f"\nResolved: {passed}/{len(results)}\n")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="ANVIL benchmark runner")
-    parser.add_argument(
-        "--issues",
-        type=Path,
-        default=Path("bench/issues.yaml"),
-        help="Path to the YAML issue list (default: bench/issues.yaml)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=900,
-        metavar="SECONDS",
-        help="Per-issue wall-clock timeout in seconds (default: 900)",
-    )
+    parser.add_argument("--instances", type=Path, default=Path("bench/instances.json"))
+    parser.add_argument("--results", type=Path, default=Path("bench/results.jsonl"))
+    parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--only", type=str)
+    parser.add_argument("--label", type=str, default="default")
     args = parser.parse_args()
 
-    if not os.environ.get("AI_API_KEY"):
-        print("ERROR: AI_API_KEY is not set.", file=sys.stderr)
-        sys.exit(1)
+    results_file = args.results
+    results_file.parent.mkdir(parents=True, exist_ok=True)
 
-    issues = _load_issues(args.issues)
-    if not issues:
-        print("No issues found in", args.issues, file=sys.stderr)
-        sys.exit(1)
+    instances = _load_instances(args.instances)
+    if args.only:
+        instances = [i for i in instances if i["instance_id"] == args.only]
 
-    print(f"Running {len(issues)} benchmark issue(s) with timeout={args.timeout}s each…\n")
-    results: list[BenchResult] = []
-    for issue in issues:
-        print(f"  → {issue.description or issue.url}")
-        r = _run_one(issue, args.timeout)
-        results.append(r)
-        status = "✓" if r.resolved else "✗"
-        print(f"    {status}  steps={r.steps}  tokens={r.tokens:,}  time={r.seconds}s")
+    completed = _load_completed(results_file)
+    to_run = [i for i in instances if i["instance_id"] not in completed]
 
-    _print_table(results)
+    if args.limit:
+        to_run = to_run[: args.limit]
 
-    # Write markdown results
-    out = Path("bench/results.md")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    md_content = (
-        f"# ANVIL Benchmark Results\n\n"
-        f"Generated: {timestamp}\n\n"
-        f"{_render_table(results)}\n"
-    )
-    out.write_text(md_content, encoding="utf-8")
-    print(f"Results written to {out}")
+    print(f"Running {len(to_run)} instances ({len(completed)} completed skipped)")
+
+    semaphore = asyncio.Semaphore(args.jobs)
+    tasks = [
+        _run_instance(inst, args.timeout, args.label, results_file, semaphore)
+        for inst in to_run
+    ]
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
