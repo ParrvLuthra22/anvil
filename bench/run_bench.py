@@ -12,6 +12,23 @@ import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_RETRYABLE_TRACE_ERRORS = {"rate_limit", "llm_error"}
+
+
+def _should_retry_rate_limit(returncode: int, trace_path: Path) -> bool:
+    """Retry only failed runs whose trace records a transient LLM error."""
+    if returncode == 0 or not trace_path.exists():
+        return False
+    try:
+        from anvil.trace.recorder import TraceRecorder
+
+        return any(
+            event.type == "error"
+            and str((event.data or {}).get("kind", "")).lower() in _RETRYABLE_TRACE_ERRORS
+            for event in TraceRecorder.load(trace_path)
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _load_instances(path: Path) -> list[dict]:
@@ -82,6 +99,8 @@ async def _run_instance(
         while True:
             print(f"Running {instance_id}...")
             start = time.time()
+            trace_path = run_dir / "trace.jsonl"
+            trace_path.unlink(missing_ok=True)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,
@@ -95,13 +114,7 @@ async def _run_instance(
                 out = stdout.decode(errors="replace")
                 err = stderr.decode(errors="replace")
 
-                # Check for rate limit
-                if (
-                    "429" in out
-                    or "429" in err
-                    or "rate limit" in out.lower()
-                    or "rate limit" in err.lower()
-                ):
+                if _should_retry_rate_limit(proc.returncode, trace_path):
                     print(f"Rate limit hit for {instance_id}. Sleeping 60s and retrying...")
                     await asyncio.sleep(60)
                     continue
