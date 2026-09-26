@@ -9,7 +9,7 @@ in VERIFY it reports a failed verification, in REVIEW it requests changes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 from anvil.agent.text import clip_head
@@ -186,9 +186,24 @@ WEAK_PHASE_SPECS: dict[Phase, PhaseSpec] = {
 }
 
 
-def phase_spec(phase: Phase, weak_model_prompts: bool) -> PhaseSpec:
-    """``phase``'s spec: the short prompts with ``features.weak_model_prompts`` on, the original ones with it off."""
-    return (WEAK_PHASE_SPECS if weak_model_prompts else PHASE_SPECS)[phase]
+NAV_TOOLS = ("outline", "find_symbol")  # find_references is deliberately not among them: its output is long
+_NAV_PHASES = frozenset({Phase.LOCALIZE, Phase.PATCH})
+_NAV_NOTE = (
+    "\nAlso available: outline(path) lists the classes and functions of a file with their line numbers, and "
+    "find_symbol(name) finds where one is defined. Use them to pick a line range before you read."
+)
+
+
+def phase_spec(phase: Phase, weak_model_prompts: bool, nav_tools: bool = False) -> PhaseSpec:
+    """``phase``'s spec: the short prompts with ``features.weak_model_prompts`` on, the original ones with it off.
+
+    With ``features.nav_tools`` on, LOCALIZE and PATCH (and only they) also get the ``outline`` and ``find_symbol``
+    tools, with a line in the prompt saying what they are for. A tool the registry does not have is simply not offered.
+    """
+    spec = (WEAK_PHASE_SPECS if weak_model_prompts else PHASE_SPECS)[phase]
+    if nav_tools and phase in _NAV_PHASES:
+        return replace(spec, tools=spec.tools + NAV_TOOLS, system_prompt=spec.system_prompt + _NAV_NOTE)
+    return spec
 
 
 _CLOSING = {
