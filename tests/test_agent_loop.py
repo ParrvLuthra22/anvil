@@ -4,8 +4,9 @@ import pytest
 
 from anvil.agent.budget import Budget, BudgetExceeded
 from anvil.agent.emitter import Emitter
-from anvil.agent.loop import MAX_SILENT_REPLIES, NUDGE, PhaseRunner, PhaseStatus, RunAborted
+from anvil.agent.loop import PhaseRunner, PhaseStatus, RunAborted
 from anvil.agent.prompts import PHASE_SPECS
+from anvil.agent.recovery import MAX_SILENT_REPLIES, NUDGE
 from anvil.agent.settings import AgentSettings
 from anvil.context import ContextManager
 from anvil.events import EventBus, Phase
@@ -160,7 +161,7 @@ def test_registry_tool_records_exclude_control_tools_and_keep_meta():
     h = Harness([reply(call("run_cmd", cmd="pytest")), done()])
     outcome = h.run(PATCH)
     (record,) = outcome.records
-    assert record.tool == "run_cmd" and record.ok is False and record.meta == {"exit_code": 1}
+    assert record.tool == "run_cmd" and record.ok is False and record.meta == {"exit_code": 1, "timed_out": False}
 
 
 # ---- several calls in one reply -------------------------------------------------------------
@@ -174,7 +175,7 @@ def test_calls_after_phase_done_are_skipped_but_still_answered():
 
 
 def test_several_ordinary_calls_in_one_reply_all_run():
-    h = Harness([reply(call("grep", pattern="add"), call("list_dir")), done()])
+    h = Harness([reply(call("grep", pattern="add"), call("list_dir", path=".")), done()])
     outcome = h.run()
     assert [r.tool for r in outcome.records] == ["grep", "list_dir"]
 
@@ -215,7 +216,7 @@ def test_a_model_that_never_uses_tools_stalls_the_phase():
 
 
 def test_the_silent_reply_counter_resets_after_a_tool_call():
-    script = [reply(text="a"), reply(text="b"), reply(call("grep", pattern="x")), reply(text="c"), reply(text="d"), done()]
+    script = [reply(text="a"), reply(call("grep", pattern="x")), reply(text="b"), reply(call("grep", pattern="y")), done()]
     assert Harness(script).run().done
 
 

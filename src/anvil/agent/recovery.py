@@ -49,7 +49,8 @@ NUDGE = (
 
 _CLOSEST_LINES = 3
 _CLOSEST_CUTOFF = 0.5
-_MAX_SCANNED_LINES = 20_000
+_MAX_SCANNED_LINES = 10_000
+_MAX_BLOCK_LINES = 8
 _LINE_CHARS = 200
 _DIGEST_LINES = 10
 
@@ -174,10 +175,12 @@ def invalid_arguments_reply(name: str, detail: str, parameters: Mapping[str, Any
     return reply + "\nCall it again with valid arguments, or use a different tool."
 
 
-def unknown_tool_reply(name: str, phase: Phase, offered: Mapping[str, Mapping[str, Any]]) -> str:
-    """The reply to a call of a tool that does not exist or is not allowed in ``phase``."""
+def unknown_tool_reply(
+    name: str, phase: Phase, offered: Mapping[str, Mapping[str, Any]], *, exists: bool = False
+) -> str:
+    """The reply to a call of a tool that does not exist (or, if ``exists``, is not allowed in ``phase``)."""
     reply = f"Tool '{name}' is not available in the {phase.value} phase."
-    close = difflib.get_close_matches(name, list(offered), n=1, cutoff=0.5)
+    close = [] if exists else difflib.get_close_matches(name, list(offered), n=1, cutoff=0.5)
     if close:
         reply += f" Did you mean '{close[0]}'?\n{describe_schema(close[0], offered[close[0]])}"
     listing = ", ".join(signature(tool, parameters) for tool, parameters in offered.items())
@@ -242,18 +245,43 @@ def failure_digest(output: str, limit: int = _DIGEST_LINES) -> list[str]:
 
 
 def closest_lines(content: str, old: str, limit: int = _CLOSEST_LINES) -> list[tuple[int, str]]:
-    """The lines of ``content`` most like the first non-blank line of ``old``, as (line number, text).
+    """The part of ``content`` most like ``old``, as (line number, text) pairs with their real indentation.
 
-    Comparison ignores leading and trailing whitespace, since indentation is the usual reason an
-    edit does not match.
+    A multi-line ``old`` is matched as a block: the run of file lines whose text (ignoring leading and
+    trailing whitespace) agrees with the most lines of ``old``, since indentation is the usual reason an
+    edit does not match. Otherwise, or if no block agrees on at least two lines, the ``limit`` file lines
+    most similar to the first line of ``old`` are returned, best first.
     """
-    query = next((line.strip() for line in old.splitlines() if line.strip()), "")
-    if not query:
+    wanted = [line.strip() for line in old.splitlines() if line.strip()]
+    if not wanted:
         return []
+    lines = content.splitlines()[:_MAX_SCANNED_LINES]
+    if len(wanted) > 1:
+        block = _best_block(lines, wanted)
+        if block:
+            return block
+    return _similar_lines(lines, wanted[0], limit)
+
+
+def _best_block(lines: list[str], wanted: list[str]) -> list[tuple[int, str]]:
+    """The run of non-blank file lines agreeing with the most of ``wanted``; empty if fewer than two agree."""
+    present = [(number, line) for number, line in enumerate(lines, 1) if line.strip()]
+    stripped = [line.strip() for _, line in present]
+    best_score, best_start = 0, 0
+    for start in range(len(present)):
+        score = sum(1 for a, b in zip(wanted, stripped[start : start + len(wanted)]) if a == b)
+        if score > best_score:
+            best_score, best_start = score, start
+    if best_score < 2:
+        return []
+    return present[best_start : best_start + min(len(wanted), _MAX_BLOCK_LINES)]
+
+
+def _similar_lines(lines: list[str], query: str, limit: int) -> list[tuple[int, str]]:
     matcher = difflib.SequenceMatcher(autojunk=False)
     matcher.set_seq2(query)
     scored: list[tuple[float, int, str]] = []
-    for number, line in enumerate(content.splitlines()[:_MAX_SCANNED_LINES], 1):
+    for number, line in enumerate(lines, 1):
         text = line.strip()
         if not text:
             continue
@@ -286,11 +314,17 @@ def edit_failure_feedback(args: Mapping[str, Any], output: str, sandbox: Sandbox
         if matches:
             shown = "\n".join(f"  {number}: {clip_head(line, _LINE_CHARS)}" for number, line in matches)
             parts.append(f"Closest matching lines in {path}:\n{shown}")
-            first = next(line.strip() for line in old.splitlines() if line.strip())
-            if any(line.strip() == first and line not in old for _, line in matches):
-                parts.append("A line with the same text exists, but its whitespace differs: copy the indentation exactly.")
+            if _differs_only_in_whitespace(old, matches):
+                parts.append("The same text exists, but its whitespace differs: copy the indentation exactly.")
     parts.append(_EDIT_REMINDER)
     return "\n".join(parts)
+
+
+def _differs_only_in_whitespace(old: str, matches: list[tuple[int, str]]) -> bool:
+    """Whether some matched line has the text of a line of ``old`` but not its exact whitespace."""
+    given = old.splitlines()
+    texts = {line.strip() for line in given if line.strip()}
+    return any(line.strip() in texts and line not in given for _, line in matches)
 
 
 @dataclass(frozen=True)
@@ -362,10 +396,10 @@ class PhaseGuard:
         """Publish a recovery action as an ``error`` event."""
         self._emitter.error(error_class.value, message)
 
-    def unknown_tool(self, name: str) -> str:
-        """Reply for a tool that is not offered in this phase."""
+    def unknown_tool(self, name: str, *, exists: bool = False) -> str:
+        """Reply for a tool that is not offered in this phase (``exists``: it is a real tool, just not allowed here)."""
         self.announce(ErrorClass.INVALID_CALL, f"{name} is not available in the {self._phase.value} phase; sent the tool list")
-        return unknown_tool_reply(name, self._phase, self._tools)
+        return unknown_tool_reply(name, self._phase, self._tools, exists=exists)
 
     def invalid_arguments(self, name: str, detail: str) -> str:
         """Reply for a call whose arguments could not be used; carries the tool's schema."""

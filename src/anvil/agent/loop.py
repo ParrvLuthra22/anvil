@@ -3,9 +3,13 @@
 One ``PhaseRunner.run`` call is one phase: it feeds the model the phase prompt and
 history, executes the tools it asks for (only those on the phase's allowlist),
 and returns as soon as the model ends the phase with ``phase_done`` or
-``give_up``, runs out of steps, or stops using tools. It never raises for
-model or tool misbehaviour; only the global budget and an unusable LLM stop a run
-(``BudgetExceeded`` and ``RunAborted``).
+``give_up``, runs out of steps, stops using tools, or gets stuck in a loop. It never
+raises for model or tool misbehaviour; only the global budget and an unusable LLM
+stop a run (``BudgetExceeded`` and ``RunAborted``).
+
+Misbehaviour is handled by ``anvil.agent.recovery``: a ``PhaseGuard`` vets each call
+(unknown tool, bad arguments, repeats) and reviews each result (failed edit, failing
+tests, timeout), announcing every intervention as an ``error`` event.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any, Callable
 from anvil.agent.budget import Budget
 from anvil.agent.emitter import Emitter
 from anvil.agent.prompts import GIVE_UP, PHASE_DONE, PhaseSpec, control_tools
+from anvil.agent.recovery import ErrorClass, PhaseGuard, llm_failure_advice
 from anvil.agent.settings import AgentSettings
 from anvil.agent.text import clip_head
 from anvil.agent.usage import record_usage
@@ -25,14 +30,10 @@ from anvil.context import ContextManager
 from anvil.llm.client import LLMClient, LLMResponse
 from anvil.llm.errors import LLMError
 from anvil.sandbox.base import Sandbox
+from anvil.tools.base import Tool
 from anvil.tools.registry import ToolRegistry
 
 TEXT_ONLY_STEP_CAP = 3
-MAX_SILENT_REPLIES = 2
-NUDGE = (
-    "Reply with a tool call. Call phase_done(summary) if this phase's objective is met, "
-    "or give_up(reason) if it cannot be met."
-)
 
 # A gate inspects the arguments of an attempted ``phase_done``. It returns None to
 # accept, or a message that is sent back to the model (the phase then continues).
@@ -50,6 +51,7 @@ class PhaseStatus(str, Enum):
     GAVE_UP = "gave_up"
     STEP_LIMIT = "step_limit"
     STALLED = "stalled"
+    LOOPED = "looped"
 
 
 @dataclass
@@ -119,8 +121,8 @@ class PhaseRunner:
         self._ctx.begin_phase(kickoff)
         self._emitter.message("user", kickoff)
         schemas = self._schemas(spec)
+        guard = PhaseGuard(self._emitter, spec.phase, _parameters_by_name(schemas))
         records: list[ToolRecord] = []
-        silent_replies = 0
         steps = self._settings.max_steps_per_phase
         if spec.text_only:
             steps = min(steps, TEXT_ONLY_STEP_CAP)
@@ -132,15 +134,15 @@ class PhaseRunner:
             if not calls:
                 if spec.text_only:
                     return PhaseOutcome(PhaseStatus.DONE, response.text.strip(), records=records)
-                silent_replies += 1
-                if silent_replies > MAX_SILENT_REPLIES:
+                nudge = guard.silent_reply()
+                if nudge is None:
                     reason = f"the model stopped calling tools: {clip_head(response.text.strip(), 300)}"
                     return PhaseOutcome(PhaseStatus.STALLED, reason, records=records)
-                self._ctx.add_message("user", NUDGE)
-                self._emitter.message("user", NUDGE)
+                self._ctx.add_message("user", nudge)
+                self._emitter.message("user", nudge)
                 continue
-            silent_replies = 0
-            outcome = self._execute(spec, calls, gate, records)
+            guard.tool_used()
+            outcome = self._execute(spec, calls, gate, records, guard)
             if outcome is not None:
                 return outcome
         return PhaseOutcome(PhaseStatus.STEP_LIMIT, f"phase step limit ({steps}) reached", records=records)
@@ -156,8 +158,9 @@ class PhaseRunner:
         try:
             response = self._llm.chat(self._ctx.build_messages(spec.system_prompt), schemas)
         except LLMError as exc:
-            self._emitter.error("llm", str(exc))
-            raise RunAborted(f"LLM call failed: {exc}") from exc
+            advice = llm_failure_advice(exc)
+            self._emitter.error(ErrorClass.LLM_ERROR.value, f"{exc} {advice}")
+            raise RunAborted(f"LLM call failed: {exc} {advice}") from exc
         record_usage(response, self._budget, self._emitter, self._settings)
         return response
 
@@ -189,7 +192,7 @@ class PhaseRunner:
     # ---- tool execution ---------------------------------------------------------------------
 
     def _execute(
-        self, spec: PhaseSpec, calls: list[_Call], gate: Gate | None, records: list[ToolRecord]
+        self, spec: PhaseSpec, calls: list[_Call], gate: Gate | None, records: list[ToolRecord], guard: PhaseGuard
     ) -> PhaseOutcome | None:
         """Run the calls of one reply in order; return the outcome if one of them ended the phase."""
         outcome: PhaseOutcome | None = None
@@ -198,14 +201,22 @@ class PhaseRunner:
                 self._ctx.add_message("tool", "Skipped: the phase already ended.", tool_call_id=call.id)
                 continue
             self._emitter.tool_call(call.name, call.args)
-            outcome = self._execute_one(spec, call, gate, records)
+            outcome = self._execute_one(spec, call, gate, records, guard)
         return outcome
 
     def _execute_one(
-        self, spec: PhaseSpec, call: _Call, gate: Gate | None, records: list[ToolRecord]
+        self, spec: PhaseSpec, call: _Call, gate: Gate | None, records: list[ToolRecord], guard: PhaseGuard
     ) -> PhaseOutcome | None:
+        control = call.name in (PHASE_DONE, GIVE_UP)
+        if not control:
+            verdict = guard.repeated(call.name, call.args)
+            if verdict is not None:
+                self._reply(call, False, verdict.reply)
+                if verdict.exhausted:
+                    return PhaseOutcome(PhaseStatus.LOOPED, verdict.reason, records=records)
+                return None
         if call.error:
-            self._reply(call, False, f"Invalid arguments for '{call.name}': {call.error}")
+            self._reply(call, False, guard.invalid_arguments(call.name, call.error))
             return None
         if call.name == PHASE_DONE:
             rejection = gate(call.args) if gate else None
@@ -218,27 +229,41 @@ class PhaseRunner:
             self._reply(call, True, "Understood.")
             return PhaseOutcome(PhaseStatus.GAVE_UP, str(call.args.get("reason", "")).strip(), call.args, records)
 
-        ok, output, meta = self._run_tool(spec, call)
+        tool, refusal = self._resolve(spec, call, guard)
+        if tool is None:
+            self._reply(call, False, refusal)
+            return None
+        ok, output, meta, crashed = self._run_tool(tool, call, guard)
         records.append(ToolRecord(call.name, call.args, ok, output, meta))
+        if not crashed:
+            output = guard.review(call.name, call.args, ok, output, meta, self._sandbox)
         self._reply(call, ok, output)
         return None
 
-    def _run_tool(self, spec: PhaseSpec, call: _Call) -> tuple[bool, str, dict]:
-        if call.name not in spec.tools:
-            offered = ", ".join([*spec.tools, PHASE_DONE, GIVE_UP])
-            message = f"Tool '{call.name}' is not available in the {spec.phase.value} phase. Use one of: {offered}."
-            return False, message, {}
+    def _resolve(self, spec: PhaseSpec, call: _Call, guard: PhaseGuard) -> tuple[Tool | None, str]:
+        """The tool to run for ``call``, or ``None`` and the reply explaining why it cannot run."""
         try:
             tool = self._registry.get(call.name)
         except LookupError:
-            return False, f"Unknown tool '{call.name}'.", {}
+            tool = None
+        if call.name not in spec.tools:
+            return None, guard.unknown_tool(call.name, exists=tool is not None)
+        if tool is None:
+            return None, f"Unknown tool '{call.name}'."
+        problem = guard.check_arguments(call.name, call.args)
+        if problem:
+            return None, problem
+        return tool, ""
+
+    def _run_tool(self, tool: Tool, call: _Call, guard: PhaseGuard) -> tuple[bool, str, dict, bool]:
+        """Run ``tool``; returns ok, output, meta and whether it crashed (a crash is not the tool's own verdict)."""
         try:
             result = tool.run(call.args, self._sandbox)
         except Exception as exc:  # noqa: BLE001 - a crashing tool must not end the run
             message = f"{type(exc).__name__}: {exc}"
-            self._emitter.error("tool", f"{call.name} crashed: {message}")
-            return False, f"Tool '{call.name}' crashed ({message}). Try a different approach.", {}
-        return result.ok, result.output, dict(result.meta)
+            guard.announce(ErrorClass.TOOL_ERROR, f"{call.name} crashed: {message}")
+            return False, f"Tool '{call.name}' crashed ({message}). Try a different approach.", {}, True
+        return result.ok, result.output, dict(result.meta), False
 
     def _reply(self, call: _Call, ok: bool, output: str) -> None:
         """Answer a tool call in both the history and the event stream."""
@@ -248,4 +273,9 @@ class PhaseRunner:
 
 def _schema_name(schema: dict) -> str:
     return str(schema.get("function", schema).get("name", ""))
+
+
+def _parameters_by_name(schemas: list[dict]) -> dict[str, dict]:
+    """Each offered tool's JSON-Schema parameters, by tool name."""
+    return {_schema_name(s): dict(s.get("function", s).get("parameters") or {}) for s in schemas}
 

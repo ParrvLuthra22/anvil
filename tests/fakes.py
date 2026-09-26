@@ -141,30 +141,46 @@ def _edit_file(args: dict, sb: FakeSandbox) -> ToolResult:
     return ToolResult(True, f"Replaced 1 occurrence in {path!r}.", {"path": path})
 
 
+def _command_result(result: ExecResult, timeout: int = 120) -> ToolResult:
+    """The shape of the real run_cmd / run_tests results, including how a timeout is reported."""
+    output = result.stdout + result.stderr
+    if result.timed_out:
+        output += f"\n[TIMED OUT after {timeout}s]"
+    ok = result.exit_code == 0 and not result.timed_out
+    return ToolResult(ok, output, {"exit_code": result.exit_code, "timed_out": result.timed_out})
+
+
 def _run_cmd(args: dict, sb: FakeSandbox) -> ToolResult:
-    result = sb.exec(str(args.get("cmd", "")))
-    return ToolResult(result.exit_code == 0, result.stdout + result.stderr, {"exit_code": result.exit_code})
+    return _command_result(sb.exec(str(args.get("cmd", ""))))
 
 
 def _run_tests(args: dict, sb: FakeSandbox) -> ToolResult:
-    result = sb.exec(f"pytest {args.get('target', '')}".strip())
-    return ToolResult(result.exit_code == 0, result.stdout + result.stderr, {"exit_code": result.exit_code})
+    return _command_result(sb.exec(f"pytest {args.get('target', '')}".strip()))
 
 
 def _git_diff(args: dict, sb: FakeSandbox) -> ToolResult:
     return ToolResult(True, sb.diff() or "(no changes)")
 
 
+def schema(required: list[str], **properties: str) -> dict:
+    """A JSON-Schema parameters object; keyword arguments map property names to their JSON types."""
+    return {
+        "type": "object",
+        "properties": {name: {"type": kind} for name, kind in properties.items()},
+        "required": required,
+    }
+
+
 def default_tools() -> list[FakeTool]:
-    """The seven contract tools, implemented over the FakeSandbox."""
+    """The seven contract tools, implemented over the FakeSandbox, with the real tools' argument schemas."""
     return [
-        FakeTool("list_dir", _list_dir),
-        FakeTool("grep", _grep),
-        FakeTool("read_file", _read_file),
-        FakeTool("edit_file", _edit_file),
-        FakeTool("run_cmd", _run_cmd),
-        FakeTool("run_tests", _run_tests),
-        FakeTool("git_diff", _git_diff),
+        FakeTool("list_dir", _list_dir, parameters=schema(["path"], path="string")),
+        FakeTool("grep", _grep, parameters=schema(["pattern"], pattern="string", path="string", file_pattern="string")),
+        FakeTool("read_file", _read_file, parameters=schema(["path"], path="string", start="integer", end="integer")),
+        FakeTool("edit_file", _edit_file, parameters=schema(["path", "old", "new"], path="string", old="string", new="string")),
+        FakeTool("run_cmd", _run_cmd, parameters=schema(["cmd"], cmd="string", timeout="integer")),
+        FakeTool("run_tests", _run_tests, parameters=schema([], target="string", timeout="integer")),
+        FakeTool("git_diff", _git_diff, parameters=schema([])),
     ]
 
 

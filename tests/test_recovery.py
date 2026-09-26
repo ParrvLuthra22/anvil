@@ -121,6 +121,31 @@ def test_indentation_only_mismatches_are_called_out():
     assert "whitespace differs" in feedback and "  2:         return a - b" in feedback
 
 
+def test_a_multi_line_edit_is_matched_as_a_block_showing_the_real_indentation():
+    content = "import os\n\nclass Calc:\n    def add(self, a, b):\n        total = a - b\n        return total\n\n    def other(self):\n        pass\n"
+    old = "def add(self, a, b):\n    total = a - b\n    return total"
+    assert closest_lines(content, old) == [
+        (4, "    def add(self, a, b):"),
+        (5, "        total = a - b"),
+        (6, "        return total"),
+    ]
+    feedback = edit_failure_feedback({"path": "calc.py", "old": old}, "String not found.", sandbox_with(content))
+    assert "  5:         total = a - b" in feedback and "whitespace differs" in feedback
+
+
+def test_a_block_that_agrees_on_fewer_than_two_lines_falls_back_to_similar_lines():
+    content = "def add(a, b):\n    return a - b\n"
+    matches = closest_lines(content, "def add(x, y):\nreturn x + y")
+    assert matches and matches[0][0] == 1
+
+
+def test_a_correctly_indented_block_with_a_typo_gets_no_whitespace_hint():
+    content = "def add(a, b):\n    return a - b\n"
+    old = "def add(a, b):\n    return a - c"
+    feedback = edit_failure_feedback({"path": "calc.py", "old": old}, "String not found.", sandbox_with(content))
+    assert "Closest matching lines" in feedback and "whitespace differs" not in feedback
+
+
 def test_lines_the_tool_already_listed_are_not_repeated():
     output = "String not found in 'calc.py'.\nClosest existing lines (for reference):\n    def add(self, a, b):"
     feedback = edit_failure_feedback({"path": "calc.py", "old": "def add(x):"}, output, sandbox_with(SOURCE))
