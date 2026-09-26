@@ -120,7 +120,8 @@ class TestEnsureDepsNoCmd:
             install_cmd=None, test_cmd="pytest", test_framework="pytest",
         )
         sb = MagicMock()
-        result = ensure_deps(sb, profile, as_of="2025-01-01")
+        # Without as_of, no install_cmd → immediately skip
+        result = ensure_deps(sb, profile)
         assert result.ok
         assert result.skipped
         sb.exec.assert_not_called()
@@ -286,7 +287,7 @@ class TestEnsureDepsPython:
                 _exec_result(0),   # pytest install
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _python_profile())
         assert result.ok
         assert result.venv_python is not None
         assert _VENV_DIR in result.venv_python
@@ -305,12 +306,12 @@ class TestEnsureDepsPython:
                 _exec_result(0),  # install pytest with cutoff
             ]
         )
-        result = ensure_deps(sb, profile, as_of="2021-05-13")
+        result = ensure_deps(sb, profile, as_of="2024-12-01")
         assert result.ok, result.report
         commands = [call.args[0] for call in sb.exec.call_args_list]
         assert any("-m venv .anvil_venv" in cmd for cmd in commands)
         assert not any("pip install -e" in cmd for cmd in commands)
-        assert any("--exclude-newer 2021-05-13T23:59:59.999999Z pytest" in cmd for cmd in commands)
+        assert any("--exclude-newer 2024-12-01T23:59:59.999999Z pytest" in cmd for cmd in commands)
 
     def test_as_of_uses_uv_cutoff_for_project_and_test_framework(self):
         """The requested cutoff reaches every install and stays inside the venv."""
@@ -325,15 +326,15 @@ class TestEnsureDepsPython:
             ]
         )
 
-        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13T20:35:12Z")
+        result = ensure_deps(sb, _python_profile(), as_of="2024-11-01T20:35:12Z")
         assert result.ok, result.report
         commands = [call.args[0] for call in sb.exec.call_args_list]
         install_commands = [cmd for cmd in commands if "uv pip install" in cmd and "--exclude-newer" in cmd]
         assert len(install_commands) == 2
-        assert all("--exclude-newer 2021-05-13T20:35:12Z" in cmd for cmd in install_commands)
+        assert all("--exclude-newer 2024-11-01T20:35:12Z" in cmd for cmd in install_commands)
         assert all("--python .anvil_venv/bin/python" in cmd for cmd in install_commands)
         assert all(not cmd.lstrip().startswith("pip install") for cmd in install_commands)
-        assert "2021-05-13T20:35:12Z" in result.report
+        assert "2024-11-01T20:35:12Z" in result.report
 
     def test_no_interpreter_found_skips(self):
         """Task 3: all candidates fail → skipped with clear reason."""
@@ -362,7 +363,7 @@ class TestEnsureDepsPython:
                 _exec_result(1, stderr="No module named 'setuptools'"),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert "failed" in result.report.lower()
         assert result.venv_python is not None
@@ -375,7 +376,7 @@ class TestEnsureDepsPython:
                 _exec_result(-1, timed_out=True),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert "timed out" in result.report.lower()
 
@@ -389,7 +390,7 @@ class TestEnsureDepsPython:
                 _exec_result(0),
             ]
         )
-        ensure_deps(sb, _python_profile("pip install -r requirements.txt"), as_of="2025-01-01")
+        ensure_deps(sb, _python_profile("pip install -r requirements.txt"))
         assert any(".anvil_venv/bin/pip install" in str(c) for c in sb.exec.call_args_list)
 
     def test_venv_timeout_is_handled(self):
@@ -412,7 +413,7 @@ class TestEnsureDepsPython:
                 _exec_result(0),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _python_profile())
         assert result.ok
         assert "python" in result.report.lower()
 
@@ -427,13 +428,13 @@ class TestEnsureDepsJS:
             _exec_result(0),   # command -v npm
             _exec_result(0, stdout="added 100 packages"),
         ])
-        result = ensure_deps(sb, _js_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _js_profile())
         assert result.ok
         assert result.venv_python is None
 
     def test_js_npm_not_found_skips_cleanly(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _js_profile(), as_of="2025-01-01")
+        result = ensure_deps(sb, _js_profile())
         assert not result.ok
         assert result.skipped
         assert "npm" in result.report.lower()
