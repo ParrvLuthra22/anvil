@@ -23,7 +23,7 @@ def _run_rg(sandbox: Sandbox, pattern: str, is_regex: bool = True) -> ToolResult
         cmd.append(str(sandbox.root))
     else:
         # grep fallback
-        cmd = ["grep", "-rn"]
+        cmd = ["grep", "-rn", "--exclude-dir=.git", "--exclude-dir=.anvil_venv"]
         if not is_regex:
             cmd.append("-F")
         else:
