@@ -135,6 +135,7 @@ class PhaseRunner:
         self._forced = False
 
         for step in range(steps):
+            # ``step`` is how many calls have been made. A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls.
             if cap is not None and step == cap:
                 schemas = self._force_close(spec, cap)
             response = self._ask(spec, schemas)

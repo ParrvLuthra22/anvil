@@ -75,8 +75,8 @@ token_saving:
   context_keep_steps: 3
   tool_output_char_cap: 4000
   repo_map_chars: 3000          # size of the repository map in every prompt (the map itself defaults to 6000)
-  # Model calls a phase may make before the harness makes it close with phase_done (the call after the cap is the
-  # closing one). Order of the phases is UNDERSTAND, LOCALIZE, REPRODUCE, PATCH (per attempt), VERIFY, REVIEW.
+  # Call caps per phase. A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls.
+  # Order of the phases is UNDERSTAND, LOCALIZE, REPRODUCE, PATCH (per attempt), VERIFY, REVIEW.
   phase_calls: {understand: 1, localize: 8, reproduce: 10, patch: 15, verify: 8, review: 3}
 
 # Context window management: the prompt is kept under max_context_tokens (estimated at
