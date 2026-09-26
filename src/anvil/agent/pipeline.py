@@ -55,7 +55,7 @@ class Checkout:
     ref: str | None
     """The branch, tag or commit checked out; ``None`` is the repository's default branch."""
     reason: str
-    """One line saying where the ref came from, or why the default branch was used."""
+    """One line saying where the ref came from, or why the default branch was used (``ref`` is ``None``)."""
     already_fixed: bool = False
     """The fix for the issue is already merged, so a checkout of the default branch may not contain the bug."""
 
@@ -165,10 +165,10 @@ class RepoPipeline:
         if explicit:
             return Checkout(explicit, "the ref you asked for (git_ref)")
         if issue.number <= 0:
-            return Checkout(None, f"{_DEFAULT_BRANCH} (the issue text was supplied, so there is no issue to look up)")
+            return Checkout(None, "the issue text was supplied, so there is no issue to look up the base revision of")
         resolver = self._base_ref_resolver or _default_base_ref_resolver()
         if resolver is None:
-            return Checkout(None, f"{_DEFAULT_BRANCH} (anvil.repo.ingest.resolve_base_ref is not available)")
+            return Checkout(None, "anvil.repo.ingest.resolve_base_ref is not available")
         try:
             return _as_checkout(resolver(issue))
         except Exception as exc:  # noqa: BLE001 - a resolver that fails must not stop the run
@@ -177,7 +177,7 @@ class RepoPipeline:
                 f"Could not work out which revision the issue was reported against ({type(exc).__name__}: {exc}); "
                 f"using the {_DEFAULT_BRANCH}.",
             )
-            return Checkout(None, f"{_DEFAULT_BRANCH} (resolve_base_ref failed: {type(exc).__name__})")
+            return Checkout(None, f"resolve_base_ref failed: {type(exc).__name__}")
 
     def _clone(self, issue: IssueRef, dest: Path, choice: Checkout) -> tuple[Path, Checkout]:
         """Clone at ``choice.ref``; if that ref cannot be checked out, clone the default branch and say so."""
@@ -189,9 +189,7 @@ class RepoPipeline:
             why = clip_head(" ".join(str(exc).split()), _REPORT_CHARS)
             self._notify("warning", f"Could not check out {choice.ref!r} ({why}); cloning the {_DEFAULT_BRANCH} instead.")
             shutil.rmtree(dest, ignore_errors=True)
-            fallback = Checkout(
-                None, f"{_DEFAULT_BRANCH} (checking out {choice.ref!r} failed: {why})", choice.already_fixed
-            )
+            fallback = Checkout(None, f"checking out {choice.ref!r} failed: {why}", choice.already_fixed)
             return Path(clone_repo(issue, dest)), fallback
 
     @staticmethod
@@ -290,7 +288,7 @@ def _as_checkout(found: Any) -> Checkout:
     ref = str(ref).strip() if ref else None
     if ref:
         return Checkout(ref, reason or "the revision the issue was reported against (resolve_base_ref)", already_fixed)
-    return Checkout(None, reason or f"{_DEFAULT_BRANCH} (no base revision was found for the issue)", already_fixed)
+    return Checkout(None, reason or "no base revision was found for the issue", already_fixed)
 
 
 def _supplied_issue(issue_url: str, repo_url: str | None, text: str) -> IssueRef:

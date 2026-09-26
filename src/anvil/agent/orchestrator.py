@@ -31,7 +31,7 @@ from anvil.agent.budget import Budget, BudgetExceeded
 from anvil.agent.emitter import Emitter
 from anvil.agent.loop import Gate, PhaseOutcome, PhaseRunner, PhaseStatus, RunAborted
 from anvil.agent.outputs import SCRATCH_DIR, changed_files, filter_diff, render_report, write_outputs
-from anvil.agent.pipeline import Ingested, Pipeline, RepoPipeline, Workspace
+from anvil.agent.pipeline import Checkout, Ingested, Pipeline, RepoPipeline, Workspace
 from anvil.agent.prompts import (
     PHASE_SPECS,
     environment_note,
@@ -83,6 +83,7 @@ def run_harness(
     pipeline: Pipeline | None = None,
     repo_url: str | None = None,
     issue_text: str | None = None,
+    git_ref: str | None = None,
 ) -> None:
     """Run the full phase cycle for ``issue_url``, emitting events on ``bus``.
 
@@ -90,11 +91,15 @@ def run_harness(
     ``llm`` and ``pipeline`` default to the real OpenAI-compatible client and the
     real ``RepoPipeline``; tests pass fakes. ``issue_text`` (with ``repo_url``, or an ``issue_url``
     that names the repository) is the fallback for when GitHub cannot be asked for the issue: it is
-    used as the issue body and nothing is fetched. Whatever happens, ``output/patch.diff`` and
+    used as the issue body and nothing is fetched. ``git_ref`` is the branch, tag or commit to check out;
+    without it the revision the issue was reported against is looked up, and failing that the default
+    branch is used (a ``message`` event says which, and why). Whatever happens, ``output/patch.diff`` and
     ``output/report.md`` are written and a ``done`` event is emitted. Nothing is raised
     to the caller, except that Ctrl-C still propagates once those outputs exist.
     """
-    Orchestrator(issue_url, config, bus, llm=llm, pipeline=pipeline, repo_url=repo_url, issue_text=issue_text).run()
+    Orchestrator(
+        issue_url, config, bus, llm=llm, pipeline=pipeline, repo_url=repo_url, issue_text=issue_text, git_ref=git_ref
+    ).run()
 
 
 # Phases that end with text the model wrote itself; only those can be replaced by their summary.
@@ -120,11 +125,13 @@ class Orchestrator:
         pipeline: Pipeline | None = None,
         repo_url: str | None = None,
         issue_text: str | None = None,
+        git_ref: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._repo_url = repo_url
         self._issue_text = issue_text
+        self._git_ref = git_ref
         self._settings_error = ""
         try:
             self._settings = AgentSettings.from_mapping(config)
@@ -204,7 +211,7 @@ class Orchestrator:
     def _ingest(self) -> Ingested:
         self._enter(Phase.INGEST)
         ingested = self._pipeline.ingest(
-            self._state.issue_url, repo_url=self._repo_url, issue_text=self._issue_text
+            self._state.issue_url, repo_url=self._repo_url, issue_text=self._issue_text, git_ref=self._git_ref
         )
         issue = self._state.issue = ingested.issue
         repo = f"{issue.owner}/{issue.repo}"
@@ -212,8 +219,27 @@ class Orchestrator:
             self._emitter.message("system", f"Using the issue text you supplied and cloned {repo}.")
         else:
             self._emitter.message("system", f"Fetched issue #{issue.number} ({issue.title}) and cloned {repo}.")
+        self._announce_checkout(ingested.checkout)
         return ingested
 
+    def _announce_checkout(self, checkout: Checkout | None) -> None:
+        """Say which revision was checked out; warn in the report when it probably already has the fix."""
+        if checkout is None:
+            return
+        where = checkout.ref or "the default branch"
+        self._emitter.message(
+            "system",
+            f"Checked out {where}: {checkout.reason}.",
+            ref=checkout.ref,
+            reason=checkout.reason,
+            already_fixed=checkout.already_fixed,
+        )
+        if checkout.already_fixed and checkout.ref is None:
+            self._state.warn(
+                "The fix for this issue is already merged upstream, and no earlier revision of the repository could "
+                f"be found ({checkout.reason}). The code checked out is the default branch, which probably no longer "
+                "contains the bug: it may not reproduce, and a patch may be unnecessary or meaningless."
+            )
     def _profile(self, ingested: Ingested) -> None:
         self._enter(Phase.PROFILE)
         workspace = self._pipeline.profile(ingested)
@@ -522,6 +548,8 @@ class Orchestrator:
             f"- Review: {state.review}",
             f"- Files changed: {', '.join(f.path for f in changed_files(patch)) or 'none'}",
         ]
+        if state.warnings:
+            lines.append("- Warnings: " + "; ".join(state.warnings))
         if state.limitations:
             lines.append("- Known limitations: " + "; ".join(state.limitations))
         return "\n".join(lines)

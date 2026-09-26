@@ -42,12 +42,18 @@ class RunState:
     patch_attempts: int = 0
     rollbacks: int = 0
     limitations: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # things a reader of the report must not miss
     halted: str = ""  # why the run was cut short (budget, aborted, error, interrupted), if it was
 
     def limit(self, note: str) -> None:
         """Record a known limitation for the report (duplicates are ignored)."""
         if note not in self.limitations:
             self.limitations.append(note)
+
+    def warn(self, note: str) -> None:
+        """Record a warning that ``report.md`` shows before everything else (duplicates are ignored)."""
+        if note not in self.warnings:
+            self.warnings.append(note)
 
     def confidence(self, has_patch: bool) -> str:
         """``"none"`` | ``"low"`` | ``"medium"`` | ``"high"``.

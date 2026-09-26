@@ -74,7 +74,7 @@ def write_outputs(output_dir: Path, patch: str, report: str) -> tuple[Path, Path
 
 
 def render_report(state: RunState, patch: str, *, steps: int, tokens: int, seconds: float) -> str:
-    """Render ``report.md``: issue summary, files changed, confidence, tests, budget, limitations."""
+    """Render ``report.md``: warnings, issue summary, files changed, confidence, tests, budget, limitations."""
     files = changed_files(patch)
     confidence = state.confidence(bool(files))
     issue = state.issue
@@ -83,7 +83,10 @@ def render_report(state: RunState, patch: str, *, steps: int, tokens: int, secon
         number = f"#{issue.number}" if issue.number else ""
         title = f"{issue.title or 'untitled'} ({issue.owner}/{issue.repo}{number})"
 
-    out = ["# ANVIL report", "", "## Issue", "", f"- Issue: {title}", f"- URL: {state.issue_url}"]
+    out = ["# ANVIL report"]
+    if state.warnings:
+        out += ["", "## Warnings", ""] + [f"- **WARNING:** {note}" for note in state.warnings]
+    out += ["", "## Issue", "", f"- Issue: {title}", f"- URL: {state.issue_url}"]
     out += ["", state.understanding.strip() or "_No issue summary was produced._"]
 
     out += ["", "## Outcome", ""]

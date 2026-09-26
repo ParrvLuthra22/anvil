@@ -14,6 +14,7 @@ import pytest
 from anvil.agent.pipeline import RepoPipeline
 from anvil.sandbox import make_sandbox
 from tests import real_repo as rr
+from tests.offline import no_base_ref_lookup  # noqa: F401 (autouse: no GitHub lookup)
 
 
 @pytest.fixture

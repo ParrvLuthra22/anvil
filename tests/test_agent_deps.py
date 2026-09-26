@@ -27,6 +27,7 @@ from anvil.repo.profile import RepoProfile
 from tests import real_repo as rr
 from tests.fakes import FakePipeline, RecordingLLM
 from tests.test_orchestrator import execute, happy
+from tests.offline import no_base_ref_lookup  # noqa: F401 (autouse: no GitHub lookup)
 
 PY = RepoProfile(["python"], "python", "pip install -e .", "pytest", "pytest")
 

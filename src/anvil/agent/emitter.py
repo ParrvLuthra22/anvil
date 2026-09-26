@@ -32,9 +32,12 @@ class Emitter:
         self.phase = phase
         self._emit("phase", {"name": phase.value})
 
-    def message(self, role: str, text: str) -> None:
-        """Publish a conversation message (long text is truncated for the event only)."""
-        self._emit("message", {"role": role, "text": _clip(text, MESSAGE_EVENT_CHARS)})
+    def message(self, role: str, text: str, **extra: object) -> None:
+        """Publish a conversation message (long text is truncated for the event only).
+
+        ``extra`` adds machine-readable fields beside ``role`` and ``text``; consumers that only know those two ignore them.
+        """
+        self._emit("message", {"role": role, "text": _clip(text, MESSAGE_EVENT_CHARS), **extra})
 
     def tool_call(self, tool: str, args: dict) -> None:
         """Publish that ``tool`` is about to run with ``args``."""

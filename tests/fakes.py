@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from anvil.agent.pipeline import Ingested, Workspace
+from anvil.agent.pipeline import Checkout, Ingested, Workspace
 from anvil.llm.client import LLMResponse
 from anvil.repo.ingest import IssueRef
 from anvil.repo.profile import RepoProfile
@@ -341,20 +341,29 @@ class FakePipeline:
         *,
         fail_ingest: Exception | None = None,
         fail_profile: Exception | None = None,
+        checkout: Checkout | None = None,
     ) -> None:
         self.sandbox = sandbox or project_sandbox()
         self.registry = registry or FakeRegistry()
         self.fail_ingest, self.fail_profile = fail_ingest, fail_profile
         self.ingest_calls: list[dict] = []
+        self.checkout = checkout
 
-    def ingest(self, issue_url: str, *, repo_url: str | None = None, issue_text: str | None = None) -> Ingested:
-        self.ingest_calls.append({"issue_url": issue_url, "repo_url": repo_url, "issue_text": issue_text})
+    def ingest(
+        self,
+        issue_url: str,
+        *,
+        repo_url: str | None = None,
+        issue_text: str | None = None,
+        git_ref: str | None = None,
+    ) -> Ingested:
+        self.ingest_calls.append({"issue_url": issue_url, "repo_url": repo_url, "issue_text": issue_text, "git_ref": git_ref})
         if self.fail_ingest:
             raise self.fail_ingest
         issue = project_issue()
         if issue_text:
             issue.body = issue_text
-        return Ingested(issue, self.sandbox.root)
+        return Ingested(issue, self.sandbox.root, self.checkout)
 
     def profile(self, ingested: Ingested) -> Workspace:
         if self.fail_profile:

@@ -11,6 +11,7 @@ from anvil.agent.prepared_sandbox import PreparedSandbox
 from anvil.agent.pipeline import Ingested, RepoPipeline
 from anvil.repo.ingest import IssueRef
 from anvil.repo.profile import RepoProfile
+from tests.offline import no_base_ref_lookup  # noqa: F401 (autouse: no GitHub lookup)
 
 URL = "https://github.com/acme/calc/issues/7"
 

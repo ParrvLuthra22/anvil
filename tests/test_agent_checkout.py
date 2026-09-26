@@ -143,7 +143,7 @@ def test_a_resolver_that_finds_nothing_leaves_the_default_branch(tmp_path, git):
     ingested = ingest(tmp_path, Resolver(None))
     assert git.calls[0][1] == {}, "the default branch is a plain clone: no git_ref argument at all"
     assert ingested.checkout.ref is None and ingested.checkout.already_fixed is False
-    assert "default branch" in ingested.checkout.reason and "no base revision" in ingested.checkout.reason
+    assert ingested.checkout.reason == "no base revision was found for the issue"
 
 
 @pytest.mark.parametrize("empty", ["", "  ", {"ref": ""}, Found(ref=None)])
@@ -204,7 +204,7 @@ def test_a_ref_that_cannot_be_cloned_is_replaced_by_the_default_branch(tmp_path,
     assert git.refs == ["deadbeef", None]
     assert git.calls[0][0] == git.calls[1][0], "the retry reuses the directory: the half-made clone was removed first"
     assert ingested.checkout.ref is None and ingested.checkout.already_fixed is True, "the default branch has the fix"
-    assert "checking out 'deadbeef' failed" in ingested.checkout.reason and "not found" in ingested.checkout.reason
+    assert ingested.checkout.reason.startswith("checking out 'deadbeef' failed") and "not found" in ingested.checkout.reason
     assert [level for level, _ in notes] == ["warning"] and "deadbeef" in notes[0][1]
 
 
@@ -225,3 +225,98 @@ def test_the_root_returned_is_the_one_of_the_clone_that_worked(tmp_path, git):
     git.refuse = {"deadbeef"}
     ingested = ingest(tmp_path, Resolver(Found("deadbeef")))
     assert ingested.repo_root == git.calls[1][0].resolve() / "repo"
+
+
+# ---- through the orchestrator --------------------------------------------------------------------------------
+
+
+def run_with(tmp_path, checkout=None, git_ref=None):
+    """A whole scripted run on a fake pipeline that reports ``checkout``; returns (pipeline, events, report, llm)."""
+    from anvil.agent.orchestrator import run_harness
+    from anvil.events import EventBus
+    from tests.fakes import ISSUE_URL, FakePipeline, RecordingLLM
+    from tests.test_orchestrator import happy
+
+    out = tmp_path / "out"
+    bus, pipeline, llm = EventBus(), FakePipeline(checkout=checkout), RecordingLLM(happy())
+    queue = bus.subscribe()
+    run_harness(ISSUE_URL, {"output_dir": str(out)}, bus, llm=llm, pipeline=pipeline, git_ref=git_ref)
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return pipeline, events, (out / "report.md").read_text(encoding="utf-8"), llm
+
+
+def checkout_events(events):
+    return [e for e in events if e.type == "message" and e.data["text"].startswith("Checked out")]
+
+
+def test_run_harness_takes_git_ref_as_a_keyword_only_argument_defaulting_to_none():
+    import inspect
+
+    from anvil.agent.orchestrator import run_harness
+
+    parameter = inspect.signature(run_harness).parameters["git_ref"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is None
+
+
+def test_git_ref_reaches_the_pipeline(tmp_path):
+    pipeline, *_ = run_with(tmp_path, git_ref="v1.2")
+    assert pipeline.ingest_calls[0]["git_ref"] == "v1.2"
+
+
+def test_without_git_ref_the_pipeline_is_told_none(tmp_path):
+    pipeline, *_ = run_with(tmp_path)
+    assert pipeline.ingest_calls[0]["git_ref"] is None
+
+
+def test_the_checkout_is_announced_with_ref_reason_and_already_fixed(tmp_path):
+    _, events, *_ = run_with(tmp_path, Checkout("9fdbf06", "parent of the fix's merge commit", already_fixed=True))
+    (event,) = checkout_events(events)
+    assert event.phase.value == "ingest"
+    assert event.data == {
+        "role": "system",
+        "text": "Checked out 9fdbf06: parent of the fix's merge commit.",
+        "ref": "9fdbf06",
+        "reason": "parent of the fix's merge commit",
+        "already_fixed": True,
+    }
+
+
+def test_the_default_branch_is_announced_as_such_with_a_null_ref(tmp_path):
+    _, events, *_ = run_with(tmp_path, Checkout(None, "no base revision was found for the issue"))
+    (event,) = checkout_events(events)
+    assert event.data["text"] == "Checked out the default branch: no base revision was found for the issue."
+    assert event.data["ref"] is None and event.data["already_fixed"] is False
+
+
+def test_a_pipeline_that_reports_no_checkout_announces_nothing(tmp_path):
+    _, events, report, _ = run_with(tmp_path, None)
+    assert checkout_events(events) == [] and "## Warnings" not in report
+
+
+def test_already_fixed_without_a_base_ref_puts_a_clear_warning_first_in_the_report(tmp_path):
+    checkout = Checkout(None, "fixed by PR #12 but its base commit is unknown", already_fixed=True)
+    _, _, report, llm = run_with(tmp_path, checkout)
+    assert report.index("## Warnings") < report.index("## Issue") < report.index("## Outcome")
+    warning = report.split("## Warnings")[1].split("## Issue")[0]
+    assert "**WARNING:**" in warning and "already merged upstream" in warning
+    assert "fixed by PR #12 but its base commit is unknown" in warning and "default branch" in warning
+    finalize_prompt = llm.calls[-1][0][-1]["content"]
+    assert "Warnings:" in finalize_prompt, "the closing summary is written knowing the checkout may not contain the bug"
+
+
+def test_already_fixed_but_checked_out_at_the_base_ref_needs_no_warning(tmp_path):
+    _, _, report, _ = run_with(tmp_path, Checkout("9fdbf06", "parent of the fix", already_fixed=True))
+    assert "## Warnings" not in report and "WARNING" not in report
+
+
+def test_no_base_ref_without_already_fixed_needs_no_warning(tmp_path):
+    _, _, report, _ = run_with(tmp_path, Checkout(None, "no base revision was found for the issue"))
+    assert "## Warnings" not in report
+
+
+def test_a_failed_checkout_of_an_already_fixed_issue_still_warns(tmp_path):
+    """The pipeline falls back to the default branch (ref None), which contains the fix."""
+    _, _, report, _ = run_with(tmp_path, Checkout(None, "checking out 'deadbeef' failed: not found", already_fixed=True))
+    assert "**WARNING:**" in report and "checking out 'deadbeef' failed" in report

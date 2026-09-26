@@ -94,10 +94,20 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 
 ## 3. Related behaviour the docs should get right
 
-- `run_harness(issue_url, config, bus, *, llm=None, pipeline=None, repo_url=None, issue_text=None)`. With `issue_text` the
+- `run_harness(issue_url, config, bus, *, llm=None, pipeline=None, repo_url=None, issue_text=None, git_ref=None)`. With `issue_text` the
   GitHub API is not asked; the repository comes from `repo_url` (or `issue_url`). A failed fetch (rate limit, 404,
   network) ends the run with an `ingest` error and no LLM call; it does not pass GitHub's error note to the model. Mapping the
   CLI flags (`--repo`, `--issue-text`) onto these parameters is the entry point's job.
+- **Which revision is checked out** (`RepoPipeline.ingest`, in this order): the `git_ref` passed to `run_harness`; else the
+  ref that `anvil.repo.ingest.resolve_base_ref(issue_ref)` finds for the issue (imported defensively: if the function is not
+  there, or raises, or the run has no issue number because the issue text was supplied, it is skipped); else the repository's
+  default branch. The resolver may return `None`, a ref string, or an object or mapping with `ref`, `reason` and
+  `already_fixed`. If the chosen ref cannot be cloned, a warning is emitted and the default branch is cloned instead.
+  `git clone --branch` takes branches and tags only, so a commit SHA always takes this fallback until `clone_repo` learns to fetch one.
+  A `message` event from the ingest phase says what happened (`Checked out <ref or the default branch>: <reason>.`), with the
+  fields `ref` (`None` for the default branch), `reason` and `already_fixed` beside `role` and `text`. When `already_fixed` is
+  true and the checkout ended up on the default branch, the code probably already contains the fix: `report.md` then starts
+  with a `## Warnings` section saying so, and the closing summary is written with the warning in its facts.
 - All paths handed to the sandbox are absolute, so a relative `output_dir` (the default `output`) works.
 - After profiling, `anvil.repo.deps.ensure_deps` installs the repository's dependencies (Python: a venv in `.anvil_venv`,
   put first on PATH for every command) unless `install_dependencies: false`. If it is missing or fails, a `deps` warning
@@ -114,3 +124,4 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 - Scrubbing secrets from the environment of model-run commands beyond the sandbox's fixed list of API-key variables.
 - A wall-clock check in the middle of a tool call.
 - Any model other than through an OpenAI-compatible chat-completions endpoint.
+- Checking out a commit SHA (see the revision paragraph above), and the command-line flag for `git_ref` (the entry point's job).

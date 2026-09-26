@@ -17,6 +17,7 @@ from anvil.repo import ingest as ingest_module
 from anvil.repo.ingest import IssueRef
 from tests import real_repo as rr
 from tests.fakes import FakePipeline, RecordingLLM
+from tests.offline import no_base_ref_lookup  # noqa: F401 (autouse: no GitHub lookup)
 from tests.test_orchestrator import execute, finalize, happy
 
 ISSUE = "https://github.com/acme/calc/issues/7"
@@ -217,7 +218,7 @@ def test_the_orchestrator_passes_issue_text_and_repo_url_to_ingest_and_says_so(t
         ISSUE, {"output_dir": str(tmp_path / "out")}, bus, llm=RecordingLLM(happy()), pipeline=pipeline,
         repo_url=REPO, issue_text="add() is wrong",
     )
-    assert pipeline.ingest_calls == [{"issue_url": ISSUE, "repo_url": REPO, "issue_text": "add() is wrong"}]
+    assert pipeline.ingest_calls == [{"issue_url": ISSUE, "repo_url": REPO, "issue_text": "add() is wrong", "git_ref": None}]
     events = []
     while not queue.empty():
         events.append(queue.get_nowait())
