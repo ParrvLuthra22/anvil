@@ -312,8 +312,19 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"git init timed out for {dest}")
 
+    fetch_ref = git_ref
+    checkout_ref = "FETCH_HEAD"
+    if git_ref.endswith("^"):
+        fetch_ref = git_ref[:-1]
+        checkout_ref = "FETCH_HEAD^"
+    elif git_ref.endswith("~1"):
+        fetch_ref = git_ref[:-2]
+        checkout_ref = "FETCH_HEAD~1"
+
     def _fetch(depth: int) -> subprocess.CompletedProcess:
-        fetch_args = ["git", "fetch", "--filter=blob:none", f"--depth={depth}", clone_url, git_ref]
+        # Note: when we need a parent commit, we might need a depth of 2 so we get the parent too
+        actual_depth = depth + 1 if fetch_ref != git_ref else depth
+        fetch_args = ["git", "fetch", "--filter=blob:none", f"--depth={actual_depth}", clone_url, fetch_ref]
         try:
             return subprocess.run(
                 fetch_args, cwd=dest, capture_output=True, text=True,
@@ -321,7 +332,7 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(
-                f"git fetch --depth={depth} timed out for {clone_url} ref={git_ref!r}"
+                f"git fetch --depth={actual_depth} timed out for {clone_url} ref={fetch_ref!r}"
             )
 
     # Step 1: shallow fetch
@@ -333,7 +344,7 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     if res.returncode != 0:
         # Step 3: clear error — let the caller fall back to HEAD
         raise RuntimeError(
-            f"git fetch failed for {clone_url} ref={git_ref!r} "
+            f"git fetch failed for {clone_url} ref={fetch_ref!r} "
             f"(both --depth=1 and --depth=50 failed).\n"
             f"Caller should fall back to HEAD.\n"
             f"stderr: {res.stderr[:500]}"
@@ -342,46 +353,17 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     # Checkout the fetched commit
     try:
         co = subprocess.run(
-            ["git", "checkout", "FETCH_HEAD"],
+            ["git", "checkout", checkout_ref],
             cwd=dest, capture_output=True, text=True,
             timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"git checkout FETCH_HEAD timed out for {git_ref!r}")
+        raise RuntimeError(f"git checkout {checkout_ref} timed out for {git_ref!r}")
 
     if co.returncode != 0:
         raise RuntimeError(
-            f"git checkout FETCH_HEAD failed for {git_ref!r}:\n"
+            f"git checkout {checkout_ref} failed for {git_ref!r}:\n"
             f"stderr: {co.stderr[:500]}"
         )
 
-    return dest
-        
-    # If git_ref is provided, init an empty repo and fetch that specific ref
-    subprocess.run(["git", "init", str(dest)], check=True, capture_output=True)
-    
-    # Try shallow fetch first
-    fetch_cmd = ["git", "fetch", "--depth", "1", clone_url, git_ref]
-    res = subprocess.run(fetch_cmd, cwd=dest, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
-    
-    if res.returncode != 0:
-        # Fall back to a deeper fetch
-        fetch_cmd = ["git", "fetch", "--deepen", "100", clone_url, git_ref]
-        res = subprocess.run(fetch_cmd, cwd=dest, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
-        
-    if res.returncode != 0:
-        # If it still fails, we might just be failing to fetch a raw SHA directly if the server forbids it.
-        # Let's try a full clone and checkout.
-        import shutil
-        shutil.rmtree(dest)
-        subprocess.run(["git", "clone", clone_url, str(dest)], check=True, capture_output=True, env=env, timeout=_CLONE_TIMEOUT)
-        res = subprocess.run(["git", "checkout", git_ref], cwd=dest, capture_output=True, text=True, env=env, timeout=_CLONE_TIMEOUT)
-        if res.returncode != 0:
-            raise RuntimeError(f"git checkout {git_ref} failed:\nstderr: {res.stderr[:500]}")
-        return dest
-        
-    checkout_res = subprocess.run(["git", "checkout", "FETCH_HEAD"], cwd=dest, capture_output=True, text=True, env=env, timeout=_CLONE_TIMEOUT)
-    if checkout_res.returncode != 0:
-        raise RuntimeError(f"git checkout FETCH_HEAD failed for {git_ref}:\nstderr: {checkout_res.stderr[:500]}")
-    
     return dest
