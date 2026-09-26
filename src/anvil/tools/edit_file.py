@@ -90,16 +90,25 @@ class EditFileTool:
             )
 
         # Exactly one match — apply
+        # Warn if old and new are identical when stripped (whitespace-only diff)
+        whitespace_only = (old.strip() == new.strip() and old != new)
+
         updated = content.replace(old, new, 1)
         try:
             sandbox.write_file(path, updated)
         except (PermissionError, OSError) as exc:
             return ToolResult(ok=False, output=f"Could not write file: {exc}")
 
+        msg = f"Successfully replaced 1 occurrence in {path!r}."
+        if whitespace_only:
+            msg += (
+                " ⚠ Warning: old and new differ only in whitespace — "
+                "verify this is the intended change."
+            )
         return ToolResult(
             ok=True,
-            output=f"Successfully replaced 1 occurrence in {path!r}.",
-            meta={"path": path, "match_count": 1},
+            output=msg,
+            meta={"path": path, "match_count": 1, "whitespace_only": whitespace_only},
         )
 
     @staticmethod

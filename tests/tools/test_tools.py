@@ -191,6 +191,20 @@ class TestEditFileTool:
     def test_schema_required_fields(self):
         assert set(EditFileTool().parameters["required"]) == {"path", "old", "new"}
 
+    def test_whitespace_only_warns(self, sandbox):
+        """Replacing 'x = 1' with 'x = 1  ' (trailing space) should warn."""
+        sandbox.write_file("ws.py", "x = 1\n")
+        result = EditFileTool().run({"path": "ws.py", "old": "x = 1", "new": "x = 1  "}, sandbox)
+        assert result.ok
+        assert result.meta.get("whitespace_only") is True
+        assert "whitespace" in result.output.lower()
+
+    def test_non_whitespace_no_warn(self, sandbox):
+        sandbox.write_file("real.py", "x = 1\n")
+        result = EditFileTool().run({"path": "real.py", "old": "x = 1", "new": "x = 99"}, sandbox)
+        assert result.ok
+        assert not result.meta.get("whitespace_only")
+
 
 # ---------------------------------------------------------------------------
 # RunCmdTool
@@ -246,10 +260,8 @@ class TestRunTestsTool:
 
     def test_no_profile_no_manifest_fails(self, sandbox, tmp_path):
         """Without a profile and without any manifest, should fail gracefully."""
-        # Use an empty temp sandbox (no manifests)
         empty_repo = tmp_path / "empty_repo"
         _init_git_repo(empty_repo)
-        # Remove all manifests (there are none in the dummy repo)
         empty_work = tmp_path / "empty_work"
         sb2 = WorktreeSandbox(repo_root=empty_repo, work_dir=empty_work)
         try:
@@ -258,18 +270,54 @@ class TestRunTestsTool:
         finally:
             sb2.close()
 
-    def test_failure_summary_extraction(self):
+    def test_failure_summary_pytest_names(self):
         output = (
-            "test_foo.py FAILED\nAssertionError: expected 1 got 2\n"
-            "PASSED test_bar\nERROR test_baz\n"
+            "FAILED tests/test_foo.py::test_bar - AssertionError: expected 1 got 2\n"
+            "FAILED tests/test_baz.py::TestClass::test_method\n"
+            "PASSED tests/test_ok.py::test_good\n"
         )
         summary = _extract_failure_summary(output)
-        assert "FAILED" in summary
-        assert "AssertionError" in summary
-        assert "PASSED" not in summary
+        assert "test_bar" in summary or "test_foo" in summary
+        assert "test_method" in summary or "test_baz" in summary
+        assert "test_good" not in summary
+
+    def test_failure_summary_go_pattern(self):
+        output = "--- FAIL: TestFoo (0.01s)\n--- FAIL: TestBar/SubTest (0.00s)\nPASS\n"
+        summary = _extract_failure_summary(output)
+        assert "TestFoo" in summary or "TestBar" in summary
+
+    def test_failure_summary_assertion_extracted(self):
+        output = "FAILED test_x.py::test_y\nAssertionError: 1 != 2\n"
+        summary = _extract_failure_summary(output)
+        assert "1 != 2" in summary or "AssertionError" in summary
+
+    def test_output_never_exceeds_char_cap(self, sandbox):
+        """run_tests output must be capped at char_cap characters."""
+        # Mock a sandbox that returns huge output
+        from unittest.mock import MagicMock
+        from anvil.sandbox.base import ExecResult
+        mock_sb = MagicMock()
+        mock_sb.root = sandbox.root
+        mock_sb.exec.return_value = ExecResult(
+            exit_code=0, stdout="X" * 20000, stderr="", timed_out=False, duration=0.1
+        )
+        cap = 1000
+        result = RunTestsTool(profile=_pytest_profile(), char_cap=cap).run({}, mock_sb)
+        assert len(result.output) <= cap + 100  # small tolerance for markers
+
+    def test_target_appended_to_cmd(self, sandbox):
+        from unittest.mock import MagicMock
+        from anvil.sandbox.base import ExecResult
+        mock_sb = MagicMock()
+        mock_sb.root = sandbox.root
+        mock_sb.exec.return_value = ExecResult(0, "", "", False, 0.1)
+        RunTestsTool(profile=_pytest_profile()).run({"target": "tests/test_foo.py"}, mock_sb)
+        cmd_used = mock_sb.exec.call_args[0][0]
+        assert "tests/test_foo.py" in cmd_used
 
     def test_schema_no_required(self):
         assert RunTestsTool().parameters["required"] == []
+
 
 
 # ---------------------------------------------------------------------------

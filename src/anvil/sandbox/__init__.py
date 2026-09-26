@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def make_sandbox(config: dict, repo_root: Path, profile=None):
@@ -13,7 +16,8 @@ def make_sandbox(config: dict, repo_root: Path, profile=None):
     * ``"worktree"`` → :class:`~anvil.sandbox.worktree.WorktreeSandbox` always.
     * ``"docker"``   → :class:`~anvil.sandbox.docker.DockerSandbox` always
       (caller must ensure Docker is available).
-    * ``"auto"``     → Docker if ``docker info`` succeeds; else WorktreeSandbox.
+    * ``"auto"``     → Docker if ``docker info`` succeeds; else WorktreeSandbox
+      with a log.info message explaining the fallback.
 
     Args:
         config:    Dict with at least ``sandbox`` (str) and optionally
@@ -38,9 +42,11 @@ def make_sandbox(config: dict, repo_root: Path, profile=None):
     primary_language = (profile.primary_language if profile else "python")
 
     if backend == "worktree":
+        log.info("Sandbox: using worktree backend (forced by config).")
         return WorktreeSandbox(repo_root=repo_root, work_dir=work_dir, char_cap=char_cap)
 
     if backend == "docker":
+        log.info("Sandbox: using Docker backend (forced by config), image language=%s.", primary_language)
         return DockerSandbox(
             repo_root=repo_root,
             work_dir=work_dir,
@@ -51,6 +57,7 @@ def make_sandbox(config: dict, repo_root: Path, profile=None):
 
     # "auto"
     if _docker_available():
+        log.info("Sandbox: auto-selected Docker backend (docker info succeeded).")
         return DockerSandbox(
             repo_root=repo_root,
             work_dir=work_dir,
@@ -59,4 +66,8 @@ def make_sandbox(config: dict, repo_root: Path, profile=None):
             char_cap=char_cap,
         )
 
+    log.info(
+        "Sandbox: Docker not available (docker info failed). "
+        "Falling back to WorktreeSandbox — no containerisation."
+    )
     return WorktreeSandbox(repo_root=repo_root, work_dir=work_dir, char_cap=char_cap)
