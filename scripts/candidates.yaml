@@ -1,119 +1,36 @@
-- url: https://github.com/pallets/click/issues/2523
-  fix_pr: https://github.com/pallets/click/pull/2524
-  language: python
-  note: "click: BaseCommand.make_context ignores obj kwarg"
-  verified: true
-  detected_lang: python
-  detected_test_cmd: pytest
-  deps_ok: true
-  deps_report: "Python deps installed into .anvil_venv/ using python3.12."
-  test_cmd: "pytest -x -q --no-header --tb=short"
-  test_exit: 0
-  test_stdout_tail: |
-    .................................................. [ 98%]
-    ..................................                 [100%]
-    2240 passed, 25 skipped, 31000 deselected, 1 xfailed in 2.96s
-
 - url: https://github.com/pallets/click/issues/3822
   fix_pr: https://github.com/pallets/click/pull/3858
   language: python
-  note: "click: Make click.Path generic on path_type"
+  note: 'click: Make click.Path generic on path_type'
   verified: true
   detected_lang: python
   detected_test_cmd: pytest
   deps_ok: true
-  deps_report: "Python deps installed into .anvil_venv/ using python3.12."
-  test_cmd: "pytest -x -q --no-header --tb=short"
+  deps_report: Python deps installed into .anvil_venv/ using python3.13.
   test_exit: 0
-  test_stdout_tail: |
-    .................................................. [ 98%]
-    ..................................                 [100%]
-    2240 passed, 25 skipped, 31000 deselected, 1 xfailed in 3.01s
+  test_time_s: 4
+  test_stdout_tail: '.................................................. [ 96%]
 
+    ....................................................................     [100%]
+
+    2058 passed, 25 skipped, 31000 deselected, 1 xfailed in 3.06s
+
+    '
 - url: https://github.com/pallets/click/issues/2869
   fix_pr: https://github.com/pallets/click/pull/3781
   language: python
-  note: "click: Add support of pathlib.Path to edit"
+  note: 'click: Add support of pathlib.Path to edit'
   verified: true
   detected_lang: python
   detected_test_cmd: pytest
   deps_ok: true
-  deps_report: "Python deps installed into .anvil_venv/ using python3.12."
-  test_cmd: "pytest -x -q --no-header --tb=short"
+  deps_report: Python deps installed into .anvil_venv/ using python3.13.
   test_exit: 0
-  test_stdout_tail: |
-    .................................................. [ 98%]
-    ..................................                 [100%]
-    2240 passed, 25 skipped, 31000 deselected, 1 xfailed in 2.95s
+  test_time_s: 3
+  test_stdout_tail: '.................................................. [ 96%]
 
-- url: https://github.com/expressjs/express/issues/5591
-  fix_pr: https://github.com/expressjs/express/pull/5592
-  language: javascript
-  note: "express: res.json() ignores replacer function"
-  verified: true
-  detected_lang: javascript
-  detected_test_cmd: npm test
-  deps_ok: true
-  deps_report: "Dependencies installed. (npm install)"
-  test_cmd: "npm test"
-  test_exit: 0
-  test_stdout_tail: |
-      with a valid api key
-        ✔ should respond user repos json
-        ✔ should 404 with unknown user
-    when requesting an invalid route
-      ✔ should respond with 404 json
-    1261 passing (1s)
+    ......................................................................   [100%]
 
-- url: https://github.com/chalk/chalk/issues/601
-  fix_pr: https://github.com/chalk/chalk/pull/602
-  language: typescript
-  note: "chalk: custom chalk instance ignores level"
-  verified: true
-  detected_lang: typescript
-  detected_test_cmd: npm test
-  deps_ok: true
-  deps_report: "Dependencies installed. (npm install)"
-  test_cmd: "npm test"
-  test_exit: 0
-  test_stdout_tail: |
-    230 passing (2s)
+    1988 passed, 25 skipped, 31000 deselected, 1 xfailed in 2.73s
 
-- url: https://github.com/cli/go-gh/issues/90
-  fix_pr: https://github.com/cli/go-gh/pull/91
-  language: go
-  note: "go-gh: TablePrinter missing trailing newline"
-  verified: false
-  detected_lang: go
-  detected_test_cmd: go test ./...
-  deps_ok: false
-  deps_report: "go toolchain not found on PATH \u2014 skipping Go dependency download."
-  test_cmd: "go test ./..."
-  test_exit: 127
-  test_stdout_tail: "/bin/sh: go: command not found"
-
-- url: https://github.com/spf13/cobra/issues/1820
-  fix_pr: https://github.com/spf13/cobra/pull/1821
-  language: go
-  note: "cobra: required flag validation skipped for persistent flags"
-  verified: false
-  detected_lang: go
-  detected_test_cmd: go test ./...
-  deps_ok: false
-  deps_report: "go toolchain not found on PATH \u2014 skipping Go dependency download."
-  test_cmd: "go test ./..."
-  test_exit: 127
-  test_stdout_tail: "/bin/sh: go: command not found"
-
-- url: https://github.com/dtolnay/anyhow/issues/316
-  fix_pr: https://github.com/dtolnay/anyhow/pull/317
-  language: rust
-  note: "anyhow: downcast_ref fails for boxed errors"
-  verified: false
-  detected_lang: rust
-  detected_test_cmd: cargo test
-  deps_ok: false
-  deps_report: "cargo not found on PATH \u2014 skipping Rust dependency fetch."
-  test_cmd: "cargo test"
-  test_exit: 127
-  test_stdout_tail: "/bin/sh: cargo: command not found"
+    '
