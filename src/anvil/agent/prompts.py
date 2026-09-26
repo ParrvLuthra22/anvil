@@ -345,8 +345,9 @@ def patch_kickoff(
     """Kickoff for one PATCH attempt.
 
     ``kind`` is ``"first"``, ``"retry"`` (verification failed; edits still applied),
-    ``"rethink"`` (tree rolled back; try a different hypothesis) or ``"rework"``
-    (the reviewer asked for changes; the patch is still applied).
+    ``"rethink"`` (tree rolled back; try a different hypothesis), ``"rework"``
+    (the reviewer asked for changes; the patch is still applied) or ``"sanity"``
+    (the finished patch was empty or did not apply: one last attempt).
     """
     parts = [f"This is patch attempt {attempt}."]
     if repro_cmd:
@@ -372,6 +373,12 @@ def patch_kickoff(
         parts.append(
             f"A reviewer asked for changes to your current patch (still applied):\n{feedback}\n"
             "Address them and keep the repro passing."
+        )
+    elif kind == "sanity":
+        parts.append(
+            f"Your patch was checked before delivery and cannot be handed in as it is:\n{feedback}\n"
+            "Fix exactly that: change the source files, never the tests, so that the patch is not empty and applies "
+            "cleanly to the original code. This is your last attempt."
         )
     return phase_kickoff(Phase.PATCH, "\n\n".join(parts))
 

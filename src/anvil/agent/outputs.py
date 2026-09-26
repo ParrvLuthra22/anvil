@@ -48,6 +48,15 @@ def filter_diff(diff: str) -> str:
     return patch if not patch or patch.endswith("\n") else patch + "\n"
 
 
+def split_patch(patch: str) -> list[tuple[str, str]]:
+    """The file sections of ``patch`` as ``(path, text)`` in order; the path is the new one (the old one for a deletion)."""
+    sections = []
+    for section in _sections(patch):
+        old, new = _paths(section)
+        sections.append((new if new != _DEV_NULL else old, "".join(section)))
+    return sections
+
+
 def changed_files(patch: str) -> list[FileChange]:
     """List the files a patch changes, in order, with +/- line counts."""
     changes = []
@@ -98,6 +107,8 @@ def render_report(
     out.append(f"- Reproduced before patching: {f'yes (`{state.repro_cmd}`)' if state.repro_confirmed else 'no'}")
     out.append(f"- Verified after patching: {'yes' if state.verified else 'no'}")
     out.append(f"- Review: {state.review}")
+    if state.sanity:
+        out.append(f"- Patch sanity: {state.sanity}")
 
     out += ["", "## Files changed", ""]
     out += [f"- `{f.path}` (+{f.added} / -{f.removed})" for f in files] or ["- None: no patch was produced."]

@@ -350,7 +350,7 @@ def test_when_recovery_is_exhausted_the_last_attempt_is_kept_unverified_at_low_c
 
 def test_a_model_that_cannot_patch_ends_with_an_empty_patch_and_a_report(tmp_path):
     run = execute(understand() + localize() + reproduce() + [give_up("no idea")], tmp_path,
-                  max_patch_attempts=1, max_rollbacks=0)
+                  max_patch_attempts=1, max_rollbacks=0, features={"patch_sanity": False})  # without the forced-fix retry
     assert run.patch == ""
     assert run.done.data["resolved_confidence"] == 0.0
     assert "None: no patch was produced." in run.report

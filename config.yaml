@@ -60,6 +60,10 @@ features:
   # Extra PATCH and REVIEW rules for models that are careless about conventions: raise the most specific built-in
   # exception with a clear message (never assert), follow how the module reports similar errors, keep changes minimal.
   weak_model_prompts: true
+  # Before FINALIZE, check the patch itself: it must not be empty, must apply (git apply --check) in a scratch worktree
+  # at the base commit, and must not edit test files unless the issue is about tests (those changes are taken out of it).
+  # An empty or non-applying patch gets ONE forced-fix retry with the reason in the prompt; the outcome is in report.md.
+  patch_sanity: true
 
 # Numbers for features.token_budgets. The two below only ever tighten context_keep_steps and tool_output_char_cap above.
 token_saving:
