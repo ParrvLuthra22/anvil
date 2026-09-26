@@ -8,6 +8,7 @@ import pytest
 
 from bench.score import _score_instance
 from bench.run_bench import _load_completed, _load_instances
+from bench.run_bench import _should_retry_rate_limit
 from tests.mock_llm import MockLLM
 from anvil.agent.orchestrator import run_harness
 from anvil.events import EventBus
@@ -162,6 +163,39 @@ def test_run_bench_helpers(tmp_path: Path):
     results_file.write_text(json.dumps({"instance_id": "inst_1"}) + "\n", encoding="utf-8")
     completed = _load_completed(results_file)
     assert "inst_1" in completed
+
+
+def test_run_bench_does_not_retry_healthy_summary_containing_429(tmp_path: Path):
+    """Token totals may contain 429; healthy process exit must never retry."""
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"ts":1,"type":"done","phase":"finalize","data":{"tokens":142930}}\n',
+        encoding="utf-8",
+    )
+    summary = "Finished instance in 4.2s. Error: \ntokens=142930"
+
+    assert "429" in summary
+    assert _should_retry_rate_limit(0, trace) is False
+
+
+def test_run_bench_retries_failed_run_with_trace_error(tmp_path: Path):
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"ts":1,"type":"error","phase":null,"data":{"kind":"llm_error","message":"limited"}}\n',
+        encoding="utf-8",
+    )
+
+    assert _should_retry_rate_limit(1, trace) is True
+
+
+def test_run_bench_does_not_retry_failed_run_without_trace_error(tmp_path: Path):
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"ts":1,"type":"error","phase":null,"data":{"kind":"internal","message":"failed"}}\n',
+        encoding="utf-8",
+    )
+
+    assert _should_retry_rate_limit(1, trace) is False
 
 
 def test_mock_llm_and_fake_fixture_integration(tmp_path: Path):
