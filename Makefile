@@ -1,17 +1,31 @@
 # ANVIL — Makefile
 # Targets: setup | run | test | clean | bench | demo
-# Never write AI_API_KEY to disk.
+#
+# SECURITY: AI_API_KEY is NEVER echoed or expanded in any recipe line.
+# It is already present in the environment; we just verify it is non-empty
+# before launching the process.  Recipe lines that invoke the venv Python
+# do NOT re-assign the variable on the command line.
 
 # ---------------------------------------------------------------------------
 # Toolchain detection
-# Prefer newer Pythons first; any >= 3.11 is acceptable.
+# Prefer 3.11, then 3.12, then 3.13, then python3.
+# For each candidate, PROBE it by actually creating a temp venv and importing
+# pyexpat (which fails on stripped/broken builds), before committing.
 # ---------------------------------------------------------------------------
 PYTHON ?= $(shell \
-  for p in python3.13 python3.12 python3.11 python3 python; do \
-    cmd=$$(command -v $$p 2>/dev/null) && \
-    $$cmd -c 'import sys; sys.exit(0 if sys.version_info>=(3,11) else 1)' 2>/dev/null && \
-    echo $$cmd && break; \
-  done)
+  TMPDIR=$$(mktemp -d 2>/dev/null || echo /tmp/anvil-probe-$$$$); \
+  CHOSEN=""; \
+  for p in python3.11 python3.12 python3.13 python3 python; do \
+    cmd=$$(command -v $$p 2>/dev/null) || continue; \
+    $$cmd -c 'import sys; sys.exit(0 if sys.version_info>=(3,11) else 1)' \
+      2>/dev/null || continue; \
+    $$cmd -m venv "$$TMPDIR/probe" >/dev/null 2>&1 || continue; \
+    "$$TMPDIR/probe/bin/python" -c 'import pyexpat' 2>/dev/null || continue; \
+    CHOSEN=$$cmd; \
+    break; \
+  done; \
+  rm -rf "$$TMPDIR" 2>/dev/null; \
+  echo "$$CHOSEN")
 
 VENV   := .venv
 VPY    := $(VENV)/bin/python
@@ -29,10 +43,11 @@ setup:
 	@# ── Python version guard ────────────────────────────────────────────
 	@test -n "$(PYTHON)" || { \
 	  echo ""; \
-	  echo "ERROR: Python 3.11+ not found on PATH."; \
-	  echo "  Install Python 3.11, 3.12, or 3.13 and ensure it is on PATH."; \
-	  echo "  macOS: brew install python@3.12"; \
-	  echo "  Linux: sudo apt install python3.12"; \
+	  echo "ERROR: No working Python 3.11+ found on PATH."; \
+	  echo "  Tried: python3.11, python3.12, python3.13, python3, python"; \
+	  echo "  Each candidate must pass: version>=3.11 AND 'import pyexpat'"; \
+	  echo "  macOS: brew install python@3.11"; \
+	  echo "  Linux: sudo apt install python3.11 python3.11-venv"; \
 	  echo ""; \
 	  exit 1; }
 	@echo "==> Using Python: $(PYTHON) ($$($(PYTHON) --version))"
@@ -65,9 +80,10 @@ setup:
 
 # ---------------------------------------------------------------------------
 # run — launch the TUI harness (requires AI_API_KEY in the environment)
+# The key is already in the environment; we NEVER re-expand it in the recipe.
 # ---------------------------------------------------------------------------
 run:
-	@if [ -z "$(AI_API_KEY)" ]; then \
+	@if [ -z "$$AI_API_KEY" ]; then \
 	  echo ""; \
 	  echo "  ┌──────────────────────────────────────────────────────────┐"; \
 	  echo "  │  ERROR: AI_API_KEY is not set.                           │"; \
@@ -82,7 +98,7 @@ run:
 	fi
 	@test -f "$(VPY)" || { \
 	  echo "ERROR: virtual environment not found. Run: make setup"; exit 1; }
-	AI_API_KEY=$(AI_API_KEY) $(VPY) -m anvil \
+	@$(VPY) -m anvil \
 	  $(if $(ISSUE),--issue $(ISSUE))
 
 # ---------------------------------------------------------------------------
@@ -91,26 +107,27 @@ run:
 demo:
 	@test -f "$(VPY)" || { \
 	  echo "ERROR: virtual environment not found. Run: make setup"; exit 1; }
-	$(VPY) -m anvil --demo
+	@$(VPY) -m anvil --demo
 
 # ---------------------------------------------------------------------------
 # test — run the full pytest suite (offline, no API key required)
 # ---------------------------------------------------------------------------
 test:
 	@test -f "$(VPY)" || { \
-	  echo "ERROR: virtual environment not found. Run: make setup"; exit 1; }
-	$(VPY) -m pytest -q
+	  echo "ERROR: virtual environment not found. Run: make setup\"; exit 1; }
+	@$(VPY) -m pytest -q
 
 # ---------------------------------------------------------------------------
 # bench — run the benchmark suite against issues.yaml
+# The key is already in the environment; we NEVER re-expand it in the recipe.
 # ---------------------------------------------------------------------------
 bench:
 	@test -f "$(VPY)" || { \
 	  echo "ERROR: virtual environment not found. Run: make setup"; exit 1; }
-	@if [ -z "$(AI_API_KEY)" ]; then \
+	@if [ -z "$$AI_API_KEY" ]; then \
 	  echo "ERROR: AI_API_KEY is not set."; exit 1; \
 	fi
-	AI_API_KEY=$(AI_API_KEY) $(VPY) bench/run_bench.py
+	@$(VPY) bench/run_bench.py
 
 # ---------------------------------------------------------------------------
 # clean — remove caches, build artefacts, and run outputs

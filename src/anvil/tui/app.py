@@ -86,12 +86,32 @@ _PHASE_CSS: dict[str, str] = {
 # Max chars per log line — prevents the RichLog from choking on huge tool output
 _MAX_LINE = 400
 
+# ---------------------------------------------------------------------------
+# Error severity
+# ---------------------------------------------------------------------------
+# Benign/recovery kinds: show as a yellow notice in the log only.
+# All other kinds are treated as fatal: they also raise the red ErrorBanner.
+_BENIGN_ERROR_KINDS: frozenset[str] = frozenset({
+    "edit",        # failed str_replace — agent will retry
+    "loop",        # loop-detector triggered — agent advances phase
+    "rollback",    # sandbox rollback to checkpoint
+    "retry",       # generic transient retry
+    "truncate",    # output was truncated (tool_output_char_cap)
+    "context",     # context pruning / summarisation step
+    "timeout_retry",  # command timed out but will be retried
+})
+
 
 def _clip(text: str, limit: int = _MAX_LINE) -> str:
     """Truncate *text* to *limit* chars with an ellipsis."""
     if len(text) <= limit:
         return text
     return text[:limit] + " [dim]…[/dim]"
+
+
+def _is_fatal(kind: str) -> bool:
+    """Return True if *kind* should raise the red ErrorBanner."""
+    return kind.lower() not in _BENIGN_ERROR_KINDS
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +661,13 @@ class AnvilApp(App):
             elif ev_type == "error":
                 kind = str(data.get("kind", "error"))
                 msg  = str(data.get("message", ""))
-                log.write(f"[bold red]⚠ ERROR[/bold red] [{kind}] {_clip(msg)}")
-                self.query_one("#error-banner", ErrorBanner).show_error(kind, msg)
+                if _is_fatal(kind):
+                    # Fatal: red log entry + sticky red banner
+                    log.write(f"[bold red]⚠ ERROR[/bold red] [{kind}] {_clip(msg)}")
+                    self.query_one("#error-banner", ErrorBanner).show_error(kind, msg)
+                else:
+                    # Benign/recovery: yellow notice in log only, no banner
+                    log.write(f"[yellow]⚠ notice[/yellow] [{kind}] {_clip(msg)}")
 
             elif ev_type == "done":
                 stepper.mark_all_done()

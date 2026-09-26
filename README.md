@@ -16,7 +16,7 @@ git clone https://github.com/ParrvLuthra22/anvil.git && cd anvil
 # 2. Set your API key (never written to disk)
 export AI_API_KEY=<your-openai-compatible-key>
 
-# 3. Install everything
+# 3. Install everything (idempotent — safe to re-run)
 make setup
 
 # 4. Launch the TUI and paste a GitHub issue URL
@@ -32,49 +32,66 @@ make run ISSUE=https://github.com/owner/repo/issues/42
 
 ---
 
+## Demo mode (no API key needed)
+
+```bash
+make demo
+```
+
+Plays a scripted fake event stream through the TUI so you can explore the
+interface without any API key or network access.
+
+---
+
 ## Configuration
 
 All settings live in [`config.yaml`](config.yaml). **No code edit is ever
-needed** to change the model or provider.
+needed** to change the model or provider.  The table below documents every
+key in `config.yaml`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `model` | `gemini-2.0-flash` | Model name (any OpenAI-compatible) |
-| `base_url` | Gemini endpoint | Provider base URL |
-| `temperature` | `0` | Deterministic output |
-| `max_steps_per_phase` | `25` | Steps before advancing phase |
-| `max_total_steps` | `120` | Hard cap across all phases |
-| `max_tokens_total` | `1 500 000` | Token budget for the whole run |
-| `wall_clock_seconds` | `1800` | 30-minute wall-clock limit |
-| `tool_output_char_cap` | `8000` | Max chars fed back per tool call |
-| `sandbox` | `auto` | `auto` \| `worktree` \| `docker` |
+| `model` | `gemini-2.0-flash` | Model name passed to the OpenAI-compatible chat-completions endpoint |
+| `base_url` | `https://generativelanguage.googleapis.com/v1beta/openai/` | Provider base URL |
+| `temperature` | `0` | Sampling temperature — 0 = deterministic output |
+| `max_steps_per_phase` | `25` | LLM steps allowed before the orchestrator advances to the next phase |
+| `max_total_steps` | `120` | Hard cap on total LLM steps across all phases |
+| `max_tokens_total` | `1 500 000` | Token budget for the whole run; hitting it forces graceful FINALIZE |
+| `wall_clock_seconds` | `1800` | 30-minute wall-clock limit; hitting it forces graceful FINALIZE |
+| `tool_output_char_cap` | `8000` | Maximum characters of any single tool / shell output fed back to the model |
+| `sandbox` | `auto` | Sandbox backend: `auto` (Docker if available, else worktree) \| `worktree` \| `docker` |
 
-### Environment overrides
+### Environment overrides (never put these in config.yaml)
 
 | Variable | Effect |
 |----------|--------|
-| `AI_API_KEY` | **(required)** API key — never hard-coded anywhere |
-| `AI_BASE_URL` | Override `base_url` without editing `config.yaml` |
-| `AI_MODEL` | Override `model` without editing `config.yaml` |
+| `AI_API_KEY` | **(required)** API key — read only from the environment, never hard-coded |
+| `AI_BASE_URL` | Overrides `base_url` without editing `config.yaml` |
+| `AI_MODEL` | Overrides `model` without editing `config.yaml` |
 
 ---
 
 ## Entry points
 
 ```bash
-# Full TUI (default)
+# Full TUI (default) — requires AI_API_KEY
 python -m anvil
 python -m anvil --issue <url>
 
-# Headless (CI / scripting)
+# Headless — runs the REAL agent pipeline, no TUI, prints result to stdout
+# Requires AI_API_KEY and the real orchestrator to be wired up.
 python -m anvil --issue <url> --headless
 
-# Fallback when GitHub rate-limits you
+# Fallback when GitHub rate-limits you (passes repo URL + description to pipeline)
 python -m anvil --repo <repo-url> --issue-text "bug description" --headless
+
+# Demo — fake event stream, no key needed
+python -m anvil --demo
 
 # Replay a saved trace without any API calls
 python -m anvil replay output/trace.jsonl
 python -m anvil replay output/trace.jsonl --speed 4   # 4× fast-forward
+python -m anvil replay output/trace.jsonl --speed 0   # instant
 ```
 
 Every run writes three files to `output/`:
@@ -91,16 +108,20 @@ Every run writes three files to `output/`:
 
 | Key | Action |
 |-----|--------|
-| `q` | Quit |
+| `q` | Quit (output files are preserved) |
 | `r` | Restart (clear log, reset phases) |
 | `d` | Toggle diff preview pane |
+| `space` | Pause / resume replay |
+| `→` / `l` | Step one event forward (replay) |
+| `←` / `h` | Step one event back (replay) |
+| `1` / `4` / `0` | Set replay speed to 1× / 4× / instant |
 
 ---
 
 ## Running tests
 
 ```bash
-make test           # runs pytest -q
+make test           # runs pytest -q (offline, no API key required)
 ```
 
 All tests are offline — no network, no real LLM, no API key required.
@@ -114,7 +135,11 @@ AI_API_KEY=<key> make bench
 ```
 
 Runs each issue in `bench/issues.yaml` headlessly and writes results to
-`bench/results.md`.  Add your own issues by extending the YAML file.
+`bench/results.md`.  Issues are verified by Akshat from `candidates.yaml`
+before being added — no fabricated entries.
+
+> **No results yet** — `bench/issues.yaml` will be populated once the real
+> pipeline is operational and Akshat's verified candidates are confirmed.
 
 ---
 
@@ -122,7 +147,7 @@ Runs each issue in `bench/issues.yaml` headlessly and writes results to
 
 ```
 anvil/
-├── Makefile                   # setup · run · test · clean · bench
+├── Makefile                   # setup · run · test · clean · bench · demo
 ├── config.yaml                # model + budget settings (no secrets)
 ├── pyproject.toml             # package metadata + dependencies
 ├── .env.example               # AI_API_KEY=  (only empty placeholder)
@@ -131,8 +156,15 @@ anvil/
 │   ├── __main__.py            # CLI entry point (Sneha)
 │   ├── events.py              # AgentEvent · Phase · EventBus (Parrv)
 │   ├── agent/
-│   │   └── orchestrator.py   # Phase cycle driver (Parrv)
-│   ├── context/               # Context window manager (Parrv)
+│   │   ├── orchestrator.py   # Phase cycle driver + load_config (Parrv)
+│   │   ├── loop.py           # Per-phase LLM + tool loop (Parrv)
+│   │   ├── pipeline.py       # Phase sequencer (Parrv)
+│   │   ├── budget.py         # Step / token / wall-clock budgets (Parrv)
+│   │   ├── prompts.py        # Phase-specific system prompts (Parrv)
+│   │   ├── outputs.py        # patch.diff / report.md writer (Parrv)
+│   │   └── state.py          # Mutable run state (Parrv)
+│   ├── context/
+│   │   └── manager.py        # Context window manager + pruning (Parrv)
 │   ├── llm/
 │   │   └── client.py         # OpenAI-compatible LLM client (Parrv)
 │   ├── repo/
@@ -150,12 +182,13 @@ anvil/
 │
 ├── tests/
 │   ├── mock_llm.py           # MockLLM + fake_event_stream (Sneha)
+│   ├── test_makefile.py      # Makefile security tests (Sneha)
 │   ├── test_trace.py         # Trace recorder tests (Sneha)
-│   ├── test_tui.py           # TUI import/contract tests (Sneha)
+│   ├── test_tui.py           # TUI tests (Sneha)
 │   └── test_*.py             # Per-module tests (Parrv / Akshat)
 │
 ├── bench/
-│   ├── issues.yaml           # Benchmark issue list (Sneha)
+│   ├── issues.yaml           # Benchmark issue list (verified by Akshat)
 │   ├── run_bench.py          # Headless benchmark runner (Sneha)
 │   └── results.md            # Auto-generated results table
 │
