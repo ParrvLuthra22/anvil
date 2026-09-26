@@ -5,22 +5,42 @@ prompt and rewrites OpenAI-style tool history (assistant ``tool_calls`` and
 ``tool`` role messages) into plain assistant/user turns, so the agent can keep
 one canonical history format whichever mode is active.
 
-Incoming: ``parse_text_tool_call`` finds the model's ```json {"tool": ..., "args": ...}```
-block, tolerating trailing prose, several blocks, bare unfenced JSON and the
-usual malformed-JSON habits (see ``loads_lenient``).
+Incoming: ``parse_text_tool_calls`` finds the model's calls in a reply. Models answer in whatever
+dialect they were trained on, so all of these are accepted, surrounded by prose or not:
+
+* our own fenced block: ```json {"tool": "read_file", "args": {...}}```
+* Hermes / Qwen tags: ``<tool_call>{"name": "read_file", "arguments": {...}}</tool_call>``, closed or cut off
+* Qwen3-Coder XML: ``<tool_call><function=read_file><parameter=path>a.py</parameter></function></tool_call>``
+* a bare JSON object with ``tool``/``args`` or ``name``/``arguments`` (also ``parameters``)
+* OpenAI-shaped JSON: ``{"function": {"name": ..., "arguments": "<json string>" or {...}}}`` or ``{"tool_calls": [...]}``
+* several of the above in one reply (the first is taken; ``ParsedCalls`` reports them all)
+
+Malformed JSON is repaired where that is safe (see ``loads_lenient``).
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 _FENCE_RE = re.compile(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
-# Only a leading "tool" key marks a call, so unrelated JSON in prose (a package.json snippet) is ignored.
-_ANCHOR_RE = re.compile(r"\{\s*[\"']tool[\"']\s*:")
+_TAG_OPEN_RE = re.compile(r"<(tool_call|function_call|tool_use)\s*>", re.IGNORECASE)
+# Anchors that start a bare call object: a name key first, or an arguments key first.
+_ANCHOR_RE = re.compile(
+    r"\{\s*[\"'](?:tool|name|function|tool_name|args|arguments|parameters)[\"']\s*:"
+)
+_XML_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>(.*?)(?:</function\s*>|(?=<function=)|\Z)", re.DOTALL | re.IGNORECASE)
+_XML_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\s]+)>(.*?)(?:</parameter\s*>|(?=<parameter=)|(?=</function)|\Z)", re.DOTALL | re.IGNORECASE
+)
 _VALID_ESCAPES = frozenset('"\\/bfnrtu')
 _PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
+_NAME_KEYS = ("tool", "name", "function", "tool_name")
+_ARG_KEYS = ("args", "arguments", "parameters", "params", "input")
+# ``name`` alone is a common key in unrelated JSON; it only marks a call when it comes with these argument keys.
+_STRICT_ARG_KEYS = ("arguments", "parameters", "params", "input")
 
 _INSTRUCTIONS = """\
 You can call tools. Available tools:
@@ -81,24 +101,221 @@ def render_call(name: str, args: dict[str, Any]) -> str:
     return "```json\n" + json.dumps({"tool": name, "args": args}, ensure_ascii=False) + "\n```"
 
 
-def parse_text_tool_call(text: str) -> tuple[dict | None, str]:
-    """Extract the model's tool call from ``text``.
+@dataclass
+class ParsedCalls:
+    """Every tool call found in a reply, in order, and the reply with all of that call syntax removed."""
 
-    Returns ``({"tool": name, "args": {...}}, remaining_text)`` where
-    ``remaining_text`` is ``text`` without the call. Fenced blocks are tried in
-    order, then bare JSON objects; the first that yields a call wins. If none
-    does (no block, or malformed JSON that cannot be repaired) returns
-    ``(None, text)`` with the text untouched.
+    calls: list[dict]
+    text: str
+
+
+@dataclass
+class _Found:
+    start: int
+    end: int
+    calls: list[dict]
+
+
+def parse_text_tool_calls(text: str, tools: list[dict] | None = None) -> ParsedCalls:
+    """Find all the tool calls in ``text`` (see the module docstring for the accepted forms).
+
+    ``tools`` (OpenAI-format schemas, optional) sharpens two things: a JSON object with just a ``name`` is only a
+    call if that name is one of the tools, and a value written as text inside XML parameters is converted to the type
+    the schema declares. Each call is ``{"tool": name, "args": {...}}``. ``text`` has every recognised call removed,
+    prose around them kept.
     """
+    found = _scan(text, _tool_index(tools))
+    return ParsedCalls([call for item in found for call in item.calls], _without_spans(text, found))
+
+
+def parse_text_tool_call(text: str, tools: list[dict] | None = None) -> tuple[dict | None, str]:
+    """Extract the first tool call from ``text``.
+
+    Returns ``({"tool": name, "args": {...}}, remaining_text)`` where ``remaining_text`` is ``text`` without that
+    call (any further calls stay in it). If there is no call (no block, or malformed JSON that cannot be repaired)
+    returns ``(None, text)`` with the text untouched.
+    """
+    found = _scan(text, _tool_index(tools))
+    if not found:
+        return None, text
+    first = found[0]
+    return first.calls[0], _without(text, first.start, first.end)
+
+
+def _scan(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
+    """All call spans in ``text`` in order of appearance: tags first, then fences, then bare objects."""
+    found = _tag_calls(text, index)
     for fence in _FENCE_RE.finditer(text):
-        found = _call_in_block(fence.group(1))
-        if found is not None:
-            return found, _without(text, fence.start(), fence.end())
-    found_span = _first_call(text)
-    if found_span is not None:
-        call, start, end = found_span
-        return call, _without(text, start, end)
-    return None, text
+        if _overlaps(fence.start(), fence.end(), found):
+            continue
+        calls = _payload_calls(fence.group(1), index, "fence")[0] or [
+            item for hit in _bare_calls(fence.group(1), index, []) for item in hit.calls
+        ]
+        if calls:
+            found.append(_Found(fence.start(), fence.end(), calls))
+    found += _bare_calls(text, index, found)
+    return sorted(found, key=lambda item: item.start)
+
+
+def _tag_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
+    """Calls wrapped in ``<tool_call>`` (or ``<function_call>``, ``<tool_use>``) tags, closed or cut off."""
+    found: list[_Found] = []
+    resume = 0
+    for opening in _TAG_OPEN_RE.finditer(text):
+        if opening.start() < resume:
+            continue
+        after = opening.end()
+        closing = re.compile(rf"</{opening.group(1)}\s*>", re.IGNORECASE).search(text, after)
+        following = _TAG_OPEN_RE.search(text, after)
+        if closing and (following is None or closing.start() < following.start()):
+            content_end, span_end = closing.start(), closing.end()
+        else:  # never closed: the reply ended, or the next call began
+            content_end = span_end = following.start() if following else len(text)
+        calls, used = _payload_calls(text[after:content_end], index, "tag")
+        if not calls:
+            continue
+        if span_end == content_end:
+            span_end = after + used
+        found.append(_Found(opening.start(), span_end, calls))
+        resume = span_end
+    return found
+
+
+def _bare_calls(text: str, index: Mapping[str, Mapping[str, str]], taken: list[_Found]) -> list[_Found]:
+    """Call objects written straight into prose, outside the spans in ``taken``."""
+    found: list[_Found] = []
+    resume = 0
+    for anchor in _ANCHOR_RE.finditer(text):
+        start = anchor.start()
+        if start < resume or _overlaps(start, start + 1, taken):
+            continue
+        end = _object_end(text, start)
+        try:
+            call = _as_call(loads_lenient(text[start:end]), index, "bare")
+        except ValueError:
+            continue
+        if call is not None:
+            found.append(_Found(start, end, [call]))
+            resume = end
+    return found
+
+
+def _payload_calls(content: str, index: Mapping[str, Mapping[str, str]], context: str) -> tuple[list[dict], int]:
+    """The calls in the content of a tag or a fence, and how many characters of it they take up."""
+    xml = list(_XML_FUNCTION_RE.finditer(content))
+    if xml:
+        calls = [_xml_call(m.group(1), m.group(2), index) for m in xml]
+        return [c for c in calls if c is not None], xml[-1].end()
+    opening = re.search(r"[\[{]", content)
+    if opening is None:
+        return [], 0
+    end = _object_end(content, opening.start())
+    try:
+        value = loads_lenient(content[opening.start():end])
+    except ValueError:
+        return [], 0
+    return _calls_in(value, index, context), end
+
+
+def _calls_in(value: Any, index: Mapping[str, Mapping[str, str]], context: str) -> list[dict]:
+    """A parsed JSON value as calls: an object, a list of them, or a ``{"tool_calls": [...]}`` wrapper."""
+    if isinstance(value, list):
+        return [call for item in value for call in _calls_in(item, index, context)]
+    if not isinstance(value, dict):
+        return []
+    wrapped = value.get("tool_calls")
+    if isinstance(wrapped, list):
+        return _calls_in(wrapped, index, context)
+    call = _as_call(value, index, context)
+    return [call] if call is not None else []
+
+
+def _as_call(obj: Any, index: Mapping[str, Mapping[str, str]], context: str) -> dict | None:
+    """Validate a parsed object as a call: ``{"tool"|"name"|"function": name, "args"|"arguments"|...: {...}}``.
+
+    Inside ``<tool_call>`` tags any object with a name is a call. In fences and bare text ``tool`` is always a
+    call marker, but ``name`` / ``function`` only count with arguments (``arguments``, ``parameters``, ...) or when
+    the name is a known tool: ``{"name": "pkg", "version": "1.0"}`` is package metadata, not a call.
+    """
+    if not isinstance(obj, dict):
+        return None
+    source = obj
+    name_key = next((key for key in _NAME_KEYS if key in obj), None)
+    if isinstance(obj.get("function"), dict):  # OpenAI shape: {"type": "function", "function": {"name", "arguments"}}
+        source, name_key = obj["function"], "name"
+    name = source.get(name_key) if name_key else None
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    arg_key = next((key for key in _ARG_KEYS if key in source), None)
+    if context != "tag" and name_key not in ("tool", "tool_name"):
+        if name not in index and arg_key not in _STRICT_ARG_KEYS:
+            return None
+    args = source.get(arg_key) if arg_key else None
+    if args is None:
+        args = {}
+    elif isinstance(args, str):
+        try:
+            args = loads_lenient(args) if args.strip() else {}
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    return {"tool": name, "args": args}
+
+
+def _xml_call(name: str, body: str, index: Mapping[str, Mapping[str, str]]) -> dict | None:
+    """One ``<function=NAME><parameter=KEY>value</parameter>...</function>`` block (Qwen3-Coder) as a call."""
+    types = index.get(name.strip(), {})
+    args = {
+        match.group(1): _coerce(match.group(2), types.get(match.group(1)))
+        for match in _XML_PARAMETER_RE.finditer(body)
+    }
+    return {"tool": name.strip(), "args": args} if name.strip() else None
+
+
+def _coerce(raw: str, declared: str | None) -> Any:
+    """An XML parameter's text as the value it stands for: by the schema's type if known, else by how it looks."""
+    value = re.sub(r"^\r?\n|\r?\n$", "", raw)
+    if declared == "string":
+        return value
+    looks_json = value.strip()[:1] in ("{", "[") or value.strip() in ("true", "false", "null") or re.fullmatch(
+        r"-?\d+(\.\d+)?", value.strip()
+    )
+    if declared is not None or looks_json:
+        try:
+            return loads_lenient(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _tool_index(tools: list[dict] | None) -> dict[str, dict[str, str]]:
+    """``{tool name: {parameter: declared JSON type}}`` from OpenAI-format tool schemas."""
+    index: dict[str, dict[str, str]] = {}
+    for tool in tools or []:
+        spec = tool.get("function", tool)
+        name = spec.get("name")
+        if isinstance(name, str) and name:
+            properties = (spec.get("parameters") or {}).get("properties") or {}
+            index[name] = {
+                key: str(prop.get("type")) for key, prop in properties.items() if isinstance(prop, dict) and prop.get("type")
+            }
+    return index
+
+
+def _overlaps(start: int, end: int, found: list[_Found]) -> bool:
+    return any(start < item.end and item.start < end for item in found)
+
+
+def _without_spans(text: str, found: list[_Found]) -> str:
+    """``text`` with the spans in ``found`` cut out; what is left around them is joined by blank lines."""
+    pieces, position = [], 0
+    for item in found:
+        pieces.append(text[position:item.start])
+        position = item.end
+    pieces.append(text[position:])
+    return "\n\n".join(piece.strip() for piece in pieces if piece.strip())
 
 
 def loads_lenient(text: str) -> Any:
@@ -138,51 +355,6 @@ def _decode_arguments(raw: Any) -> dict[str, Any]:
     except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
-
-
-def _call_in_block(block: str) -> dict | None:
-    """Find a tool call in one fenced block: whole-block JSON first, then any embedded object."""
-    try:
-        call = _as_call(loads_lenient(block.strip()))
-    except ValueError:
-        call = None
-    if call is not None:
-        return call
-    found = _first_call(block)
-    return found[0] if found else None
-
-
-def _first_call(text: str) -> tuple[dict, int, int] | None:
-    """Return (call, start, end) for the first ``{"tool": ...}`` object in ``text``."""
-    for anchor in _ANCHOR_RE.finditer(text):
-        end = _object_end(text, anchor.start())
-        try:
-            call = _as_call(loads_lenient(text[anchor.start():end]))
-        except ValueError:
-            continue
-        if call is not None:
-            return call, anchor.start(), end
-    return None
-
-
-def _as_call(obj: Any) -> dict | None:
-    """Validate a parsed value as ``{"tool": str, "args": dict}`` (``arguments`` accepted for ``args``)."""
-    if not isinstance(obj, dict):
-        return None
-    name = obj.get("tool")
-    if not isinstance(name, str) or not name.strip():
-        return None
-    args = obj.get("args", obj.get("arguments"))
-    if args is None:
-        args = {}
-    elif isinstance(args, str):
-        try:
-            args = loads_lenient(args)
-        except ValueError:
-            return None
-    if not isinstance(args, dict):
-        return None
-    return {"tool": name.strip(), "args": args}
 
 
 def _object_end(text: str, start: int) -> int:

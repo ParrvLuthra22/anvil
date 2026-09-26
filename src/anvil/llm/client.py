@@ -33,7 +33,7 @@ import httpx
 from anvil.llm.config import LLMConfig
 from anvil.llm.errors import LLMConfigError, LLMError
 from anvil.llm.reasoning import Reply, content_text, split_message
-from anvil.llm.toolcalls import adapt_messages_for_text_mode, loads_lenient, parse_text_tool_call
+from anvil.llm.toolcalls import adapt_messages_for_text_mode, loads_lenient, parse_text_tool_calls
 
 logger = logging.getLogger("anvil.llm")
 logger.addHandler(logging.NullHandler())  # silent unless the app configures logging (keeps the TUI clean)
@@ -72,6 +72,7 @@ class UsageTotals:
     calls: int = 0
     reasoning_tokens: int = 0  # as reported by the provider (already inside completion_tokens)
     reasoning_replies: int = 0  # replies that carried reasoning, which was removed from the text
+    ignored_calls: int = 0  # tool calls beyond the first in a text-mode reply, which were not run
 
 
 class _Retryable(Exception):
@@ -159,7 +160,7 @@ class OpenAICompatClient(LLMClient):
         text = reply.text
         calls = self._native_calls(message)
         if tools and self._config.tool_mode == "auto":
-            text, calls = self._rescue_native_miss(text, calls)
+            text, calls = self._rescue_native_miss(text, calls, tools)
         return self._finish(text, calls, payload, data, reply)
 
     def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
@@ -170,14 +171,34 @@ class OpenAICompatClient(LLMClient):
         text = reply.text
         calls: list[dict] = []
         if tools:
-            call, text = parse_text_tool_call(text)
-            if call is not None:
-                calls = [self._new_call(call["tool"], call["args"])]
+            text, calls = self._first_text_call(text, tools)
         return self._finish(text, calls, payload, data, reply)
+
+    def _first_text_call(self, text: str, tools: list[dict]) -> tuple[str, list[dict]]:
+        """The first tool call written in ``text`` (the text-mode protocol is one call per reply) and the prose around it.
+
+        Further calls are dropped from the text and counted; the count travels on the call as ``ignored_calls`` so
+        the agent can tell the model that only the first one ran.
+        """
+        parsed = parse_text_tool_calls(text, tools)
+        if not parsed.calls:
+            return text, []
+        first = parsed.calls[0]
+        call = self._new_call(first["tool"], first["args"])
+        extra = len(parsed.calls) - 1
+        if extra:
+            call["ignored_calls"] = extra
+            self.totals.ignored_calls += extra
+            logger.warning("the reply contained %d tool calls; only the first will run", extra + 1)
+        return parsed.text, [call]
 
     def _native_calls(self, message: dict) -> list[dict]:
         calls = []
-        for raw in message.get("tool_calls") or []:
+        raw_calls = message.get("tool_calls") or []
+        legacy = message.get("function_call")  # the pre-2023 form, still returned by some servers
+        if not raw_calls and isinstance(legacy, dict):
+            raw_calls = [{"function": legacy}]
+        for raw in raw_calls:
             fn = raw.get("function") if isinstance(raw, dict) else None
             name = fn.get("name") if isinstance(fn, dict) else None
             if not isinstance(name, str) or not name:
@@ -195,24 +216,26 @@ class OpenAICompatClient(LLMClient):
                     call["args"] = parsed
                 else:
                     call["error"] = f"arguments were not a valid JSON object: {args_raw[:200]!r}"
+            elif args_raw is not None and not isinstance(args_raw, str):
+                call["error"] = f"arguments were not a valid JSON object: {json.dumps(args_raw, default=str)[:200]}"
             calls.append(call)
         return calls
 
-    def _rescue_native_miss(self, text: str, calls: list[dict]) -> tuple[str, list[dict]]:
+    def _rescue_native_miss(self, text: str, calls: list[dict], tools: list[dict]) -> tuple[str, list[dict]]:
         """Auto mode: spot replies that put a tool call in the text instead of ``tool_calls``.
 
         The call is rescued from the text. After two such replies in a row the
         client switches to text mode for good.
         """
-        attempted, remaining = parse_text_tool_call(text) if not calls else (None, text)
-        if attempted is None:
+        remaining, rescued = self._first_text_call(text, tools) if not calls else (text, [])
+        if not rescued:
             self._native_misses = 0
             return text, calls
         self._native_misses += 1
         if self._native_misses >= _MISSES_BEFORE_TEXT_MODE:
             logger.warning("provider ignored native tool calling twice in a row; switching to text mode")
             self._use_text = True
-        return remaining, [self._new_call(attempted["tool"], attempted["args"])]
+        return remaining, rescued
 
     def _new_call(self, tool: str, args: dict, call_id: Any = None) -> dict:
         return {"id": call_id or f"call_{next(self._call_ids)}", "tool": tool, "args": args}

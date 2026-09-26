@@ -587,3 +587,28 @@ def test_a_sandbox_that_reports_checkpoint_failure_as_a_string_is_never_rolled_b
     assert checkpoint_result.data["ok"] is False
     assert "Checkpointing failed, so rolling back was not possible." in run.report
     assert "rollbacks: 0" in run.report
+
+
+# ---- several tool calls in one text-mode reply ------------------------------------------------
+
+
+def test_the_model_is_told_when_only_the_first_of_several_calls_in_its_reply_was_run():
+    """Text mode runs one call per reply; the client reports the dropped ones so the model does not wait for them."""
+    grep, runs = counting_grep()
+    first = call("grep", pattern="add")
+    first["ignored_calls"] = 2
+    h = Harness([reply(first), done("ok")], registry=registry_with(grep))
+    outcome = h.run(LOCALIZE)
+
+    assert outcome.done and runs == [{"pattern": "add"}]
+    result = tool_results(h)[0]
+    assert result.startswith("calc.py:1:def add") and "Note: your reply contained 2 more tool call(s)" in result
+    assert "Only this first one was run" in result
+    assert kinds(h) == ["invalid_call"] and "3 tool calls" in messages_of(h, "invalid_call")[0]
+
+
+def test_a_reply_with_a_single_call_gets_no_such_note():
+    grep, _ = counting_grep()
+    h = Harness([reply(call("grep", pattern="add")), done("ok")], registry=registry_with(grep))
+    h.run(LOCALIZE)
+    assert "Note:" not in tool_results(h)[0] and kinds(h) == []

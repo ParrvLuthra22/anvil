@@ -86,6 +86,7 @@ class _Call:
     name: str
     args: dict
     error: str = ""
+    ignored: int = 0  # further calls in the same (text-mode) reply that the client dropped
 
 
 class PhaseRunner:
@@ -174,6 +175,7 @@ class PhaseRunner:
             name=str(raw.get("tool") or raw.get("name") or ""),
             args=args if isinstance(args, dict) else {},
             error=str(raw.get("error") or ""),
+            ignored=int(raw.get("ignored_calls") or 0),
         )
 
     def _record_assistant(self, text: str, calls: list[_Call]) -> None:
@@ -203,6 +205,11 @@ class PhaseRunner:
                 self._ctx.add_message("tool", "Skipped: the phase already ended.", tool_call_id=call.id)
                 continue
             self._emitter.tool_call(call.name, call.args)
+            if call.ignored:
+                guard.announce(
+                    ErrorClass.INVALID_CALL,
+                    f"the reply had {call.ignored + 1} tool calls; only the first ({call.name}) was run",
+                )
             outcome = self._execute_one(spec, call, gate, records, guard)
         return outcome
 
@@ -269,6 +276,11 @@ class PhaseRunner:
 
     def _reply(self, call: _Call, ok: bool, output: str) -> None:
         """Answer a tool call in both the history and the event stream."""
+        if call.ignored:
+            output += (
+                f"\n\nNote: your reply contained {call.ignored} more tool call(s). Only this first one was run; "
+                "call one tool per reply and wait for its result."
+            )
         self._emitter.tool_result(call.name, ok, output)
         self._ctx.add_message("tool", output, tool_call_id=call.id, ok=ok)
 
