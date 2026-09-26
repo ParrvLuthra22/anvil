@@ -107,8 +107,16 @@ def test_a_very_long_first_line_gives_a_short_title(tmp_path, net):
 # ---- a failed fetch (item 7) ----------------------------------------------------------------
 
 
+ERROR_404 = "Issue not found (HTTP 404) — may be private or deleted. URL: https://github.com/acme/calc/issues/7"
+
+
+def failed_fetch(ref):
+    """How fetch_issue reports a failure now: ``fetch_error`` set, title and body left empty."""
+    return replace(ref, title="", body="", fetch_error=ERROR_404)
+
+
 def test_a_failed_fetch_is_an_error_not_an_issue_and_nothing_is_cloned(tmp_path, net):
-    net.result = staticmethod(lambda ref: replace(ref, title="", body=NOTE_404))
+    net.result = staticmethod(failed_fetch)
     with pytest.raises(IssueFetchError) as info:
         ingest(tmp_path, ISSUE)
     message = str(info.value)
@@ -116,8 +124,36 @@ def test_a_failed_fetch_is_an_error_not_an_issue_and_nothing_is_cloned(tmp_path,
     assert net.cloned == [], "no point cloning a repository for an issue nobody can read"
 
 
-def test_supplied_text_is_the_way_out_of_a_failed_fetch(tmp_path, net):
+def test_the_note_is_the_fetch_error_itself_not_a_placeholder(tmp_path, net):
+    """Regression: with the structured field the reason was read from the (now empty) body: 'no reason given'."""
+    net.result = staticmethod(failed_fetch)
+    with pytest.raises(IssueFetchError) as info:
+        ingest(tmp_path, ISSUE)
+    assert f"Could not fetch the issue from GitHub: {ERROR_404}." in str(info.value)
+    assert "no reason given" not in str(info.value)
+
+
+def test_a_fetch_error_wins_even_when_a_title_came_back(tmp_path, net):
+    net.result = staticmethod(lambda ref: replace(ref, title="add is wrong", body="half a body", fetch_error="HTTP error 502"))
+    with pytest.raises(IssueFetchError, match="HTTP error 502"):
+        ingest(tmp_path, ISSUE)
+    assert net.cloned == []
+
+
+def test_a_fetch_that_returns_nothing_at_all_still_ends_the_run(tmp_path, net):
+    net.result = staticmethod(lambda ref: replace(ref, title="", body="", fetch_error=""))
+    with pytest.raises(IssueFetchError, match="no reason given"):
+        ingest(tmp_path, ISSUE)
+
+
+def test_the_older_contract_a_note_in_the_body_with_no_title_is_still_recognised(tmp_path, net):
     net.result = staticmethod(lambda ref: replace(ref, title="", body=NOTE_404))
+    with pytest.raises(IssueFetchError, match="Issue not found"):
+        ingest(tmp_path, ISSUE)
+
+
+def test_supplied_text_is_the_way_out_of_a_failed_fetch(tmp_path, net):
+    net.result = staticmethod(failed_fetch)
     assert ingest(tmp_path, ISSUE, issue_text="add() is wrong").issue.body == "add() is wrong"
     assert net.fetched == []
 

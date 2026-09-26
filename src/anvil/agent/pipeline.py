@@ -125,9 +125,11 @@ class RepoPipeline:
         if text:
             return _supplied_issue(issue_url, repo_url, text)
         issue = fetch_issue(parse_issue_url(issue_url))
-        if not issue.title.strip():
-            # fetch_issue reports every failure as a note in ``body`` and leaves the title empty; a real issue always has one.
-            note = issue.body.strip().strip("[]") or "no reason given"
+        error = str(getattr(issue, "fetch_error", "") or "").strip()
+        if error or not issue.title.strip():
+            # fetch_issue reports a failure in ``fetch_error`` (body stays empty) and leaves the title empty; a real
+            # issue always has a title. Older versions put a "[...]" note in ``body`` instead, still recognised here.
+            note = error or issue.body.strip().strip("[]") or "no reason given"
             raise IssueFetchError(
                 f"Could not fetch the issue from GitHub: {note}. To work without the API, supply the issue text "
                 f'yourself: --repo <repository url> --issue-text "<the issue>".'
