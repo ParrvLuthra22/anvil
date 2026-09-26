@@ -1,9 +1,47 @@
-"""LLM client contract."""
+"""LLM client contract and the OpenAI-compatible implementation behind it.
+
+``chat`` speaks the OpenAI chat-completions dialect over httpx and hides three
+provider quirks from the agent:
+
+* transient failures (429, 5xx, network) are retried with jittered backoff;
+* token usage is always reported, estimated at chars/4 when the provider omits it;
+* tools work whether or not the provider supports native tool calling (see
+  ``tool_mode`` in config.yaml).
+
+Tool calls always come back normalised as ``{"id", "tool", "args"}`` (plus an
+``error`` key when native arguments were not valid JSON). The agent keeps its
+history in OpenAI format (assistant ``tool_calls`` whose ``function.arguments``
+is a JSON string, then ``tool`` messages carrying ``tool_call_id``); in text
+mode the client rewrites that history on the way out.
+"""
 
 from __future__ import annotations
 
+import email.utils
+import itertools
+import json
+import logging
+import os
+import random
+import time
 from dataclasses import dataclass
-from typing import Protocol
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Protocol
+
+import httpx
+
+from anvil.llm.config import LLMConfig
+from anvil.llm.errors import LLMConfigError, LLMError
+from anvil.llm.toolcalls import adapt_messages_for_text_mode, loads_lenient, parse_text_tool_call
+
+logger = logging.getLogger("anvil.llm")
+logger.addHandler(logging.NullHandler())  # silent unless the app configures logging (keeps the TUI clean)
+
+API_KEY_ENV = "AI_API_KEY"
+_REDACTED = "[REDACTED]"
+# Statuses that, in auto mode, may mean "this provider does not accept the tools parameter".
+_POSSIBLE_TOOL_REJECTIONS = (400, 404, 422)
+_MISSES_BEFORE_TEXT_MODE = 2
 
 
 @dataclass
@@ -21,3 +59,371 @@ class LLMClient(Protocol):
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
         """Send ``messages`` (and optional tool schemas) and return the model's reply."""
         ...
+
+
+@dataclass
+class UsageTotals:
+    """Cumulative token usage and number of successful model calls on one client."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+
+
+class _Retryable(Exception):
+    """Internal signal: this attempt failed in a way worth retrying."""
+
+    def __init__(self, error: LLMError, retry_after: float | None = None) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.retry_after = retry_after
+
+
+class OpenAICompatClient(LLMClient):
+    """Chat-completions client for any OpenAI-compatible provider.
+
+    The API key is held privately, only ever sent in the Authorization header,
+    and scrubbed from every error message and from ``repr``.
+    """
+
+    def __init__(
+        self,
+        config: LLMConfig,
+        api_key: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: Callable[[], float] = random.random,
+    ) -> None:
+        self._config = config
+        self._api_key = api_key
+        self._url = f"{config.base_url}/chat/completions"
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(config.timeout_seconds, connect=config.connect_timeout_seconds),
+            transport=transport,
+        )
+        self._sleep = sleep
+        self._rng = rng
+        self._call_ids = itertools.count(1)
+        self._use_text = config.tool_mode == "text"
+        self._native_misses = 0
+        self.totals = UsageTotals()
+
+    def __repr__(self) -> str:
+        return (
+            f"OpenAICompatClient(model={self._config.model!r}, base_url={self._config.base_url!r}, "
+            f"tool_mode={self.active_tool_mode!r})"
+        )
+
+    @property
+    def active_tool_mode(self) -> str:
+        """``"native"`` or ``"text"``: how tools are being sent right now (auto may switch to text)."""
+        return "text" if self._use_text else "native"
+
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool."""
+        self._http.close()
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
+        """Send ``messages`` (and optional OpenAI-format ``tools``) and return the reply.
+
+        Raises ``LLMError`` once retries are exhausted or on a non-retryable failure.
+        """
+        tools = list(tools) if tools else None
+        if self._use_text:
+            return self._chat_text(messages, tools)
+        try:
+            return self._chat_native(messages, tools)
+        except LLMError as err:
+            if not tools or self._config.tool_mode != "auto" or err.status_code not in _POSSIBLE_TOOL_REJECTIONS:
+                raise
+            logger.warning("HTTP %s with tools attached; trying text-mode tool calling", err.status_code)
+            response = self._chat_text(messages, tools)
+            self._use_text = True  # only once text mode has actually worked
+            return response
+
+    # ---- the two tool dialects -----------------------------------------------------------
+
+    def _chat_native(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
+        payload = self._payload(messages)
+        if tools:
+            payload["tools"] = [t if "function" in t else {"type": "function", "function": t} for t in tools]
+        data = self._request(payload)
+        message = data["choices"][0]["message"]
+        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        calls = self._native_calls(message)
+        if tools and self._config.tool_mode == "auto":
+            text, calls = self._rescue_native_miss(text, calls)
+        return self._finish(text, calls, payload, data)
+
+    def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
+        payload = self._payload(adapt_messages_for_text_mode(messages, tools))
+        data = self._request(payload)
+        message = data["choices"][0]["message"]
+        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        calls: list[dict] = []
+        if tools:
+            call, text = parse_text_tool_call(text)
+            if call is not None:
+                calls = [self._new_call(call["tool"], call["args"])]
+        return self._finish(text, calls, payload, data)
+
+    def _native_calls(self, message: dict) -> list[dict]:
+        calls = []
+        for raw in message.get("tool_calls") or []:
+            fn = raw.get("function") if isinstance(raw, dict) else None
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            args_raw = fn.get("arguments")
+            call = self._new_call(name, {}, call_id=raw.get("id"))
+            if isinstance(args_raw, dict):
+                call["args"] = args_raw
+            elif isinstance(args_raw, str) and args_raw.strip():
+                try:
+                    parsed = loads_lenient(args_raw)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    call["args"] = parsed
+                else:
+                    call["error"] = f"arguments were not a valid JSON object: {args_raw[:200]!r}"
+            calls.append(call)
+        return calls
+
+    def _rescue_native_miss(self, text: str, calls: list[dict]) -> tuple[str, list[dict]]:
+        """Auto mode: spot replies that put a tool call in the text instead of ``tool_calls``.
+
+        The call is rescued from the text. After two such replies in a row the
+        client switches to text mode for good.
+        """
+        attempted, remaining = parse_text_tool_call(text) if not calls else (None, text)
+        if attempted is None:
+            self._native_misses = 0
+            return text, calls
+        self._native_misses += 1
+        if self._native_misses >= _MISSES_BEFORE_TEXT_MODE:
+            logger.warning("provider ignored native tool calling twice in a row; switching to text mode")
+            self._use_text = True
+        return remaining, [self._new_call(attempted["tool"], attempted["args"])]
+
+    def _new_call(self, tool: str, args: dict, call_id: Any = None) -> dict:
+        return {"id": call_id or f"call_{next(self._call_ids)}", "tool": tool, "args": args}
+
+    # ---- request / retry -----------------------------------------------------------------
+
+    def _payload(self, messages: list[dict]) -> dict[str, Any]:
+        return {"model": self._config.model, "messages": messages, "temperature": self._config.temperature}
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST with retries; return the parsed body of the first good response.
+
+        A good body is guaranteed to have ``choices[0].message`` as a dict.
+        """
+        attempts = self._config.max_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._send_once(payload, attempt)
+            except _Retryable as failure:
+                if attempt == attempts:
+                    raise failure.error from None
+                delay = self._delay(attempt, failure.retry_after)
+                logger.warning("%s; retry %d/%d in %.1fs", failure.error, attempt, attempts - 1, delay)
+                self._sleep(delay)
+        raise AssertionError("unreachable: max_attempts >= 1")  # pragma: no cover
+
+    def _send_once(self, payload: dict[str, Any], attempt: int) -> dict:
+        try:
+            response = self._http.post(
+                self._url, json=payload, headers={"Authorization": f"Bearer {self._api_key}"}
+            )
+        except httpx.TransportError as exc:
+            error = self._error(f"network error: {type(exc).__name__}: {exc}", attempt, retryable=True)
+            raise _Retryable(error) from None
+        except httpx.RequestError as exc:
+            raise self._error(f"request failed: {type(exc).__name__}: {exc}", attempt) from None
+
+        status = response.status_code
+        if not response.is_success:
+            detail = _excerpt(response.text)
+            transient = status == 429 or status >= 500
+            error = self._error(
+                f"LLM request failed with HTTP {status}", attempt, status=status, retryable=transient, detail=detail
+            )
+            if transient:
+                raise _Retryable(error, _retry_after_seconds(response.headers.get("retry-after")))
+            raise error
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise _Retryable(self._error("response body was not valid JSON", attempt, retryable=True)) from None
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            if isinstance(choices[0].get("message"), dict):
+                return data
+        raise self._body_error(data, attempt)
+
+    def _body_error(self, data: Any, attempt: int) -> LLMError | _Retryable:
+        """Classify a 200 response that carries no completion (some gateways report errors this way)."""
+        error = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(error, dict):
+            return _Retryable(self._error("response contained no completion", attempt, retryable=True))
+        code = error.get("code")
+        transient = isinstance(code, int) and (code == 429 or code >= 500)
+        failure = self._error(
+            "provider returned an error payload",
+            attempt,
+            status=code if isinstance(code, int) else None,
+            retryable=transient,
+            detail=_excerpt(json.dumps(error)),
+        )
+        return _Retryable(failure) if transient else failure
+
+    def _delay(self, attempt: int, retry_after: float | None) -> float:
+        """Exponential backoff with equal jitter; a Retry-After hint sets the floor. Always capped."""
+        cfg = self._config
+        backoff = min(cfg.backoff_max_seconds, cfg.backoff_base_seconds * 2 ** (attempt - 1))
+        delay = backoff / 2 + self._rng() * backoff / 2
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return min(delay, cfg.backoff_max_seconds)
+
+    # ---- usage ---------------------------------------------------------------------------
+
+    def _finish(self, text: str, calls: list[dict], payload: dict[str, Any], data: dict) -> LLMResponse:
+        usage = self._usage(data.get("usage"), payload, data["choices"][0]["message"])
+        self.totals.prompt_tokens += usage["prompt_tokens"]
+        self.totals.completion_tokens += usage["completion_tokens"]
+        self.totals.total_tokens += usage["total_tokens"]
+        self.totals.calls += 1
+        return LLMResponse(text=text, tool_calls=calls, usage=usage)
+
+    @staticmethod
+    def _usage(reported: Any, payload: dict[str, Any], message: dict) -> dict:
+        """Provider usage where given, chars/4 estimates for whatever is missing."""
+        reported = reported if isinstance(reported, dict) else {}
+        prompt = _as_count(reported.get("prompt_tokens"))
+        completion = _as_count(reported.get("completion_tokens"))
+        total = _as_count(reported.get("total_tokens"))
+        estimated = prompt is None or completion is None
+        if prompt is None:
+            prompt = _tokens_from_chars(_prompt_chars(payload))
+        if completion is None:
+            completion = _tokens_from_chars(_completion_chars(message))
+        if total is None:
+            total = prompt + completion
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "estimated": estimated,
+        }
+
+    # ---- errors --------------------------------------------------------------------------
+
+    def _error(
+        self,
+        message: str,
+        attempt: int,
+        *,
+        status: int | None = None,
+        retryable: bool = False,
+        detail: str = "",
+    ) -> LLMError:
+        """Build an ``LLMError`` whose text can never contain the API key."""
+        message, detail = self._redact(message), self._redact(detail)
+        full = f"{message}: {detail}" if detail else message
+        return LLMError(full, status_code=status, retryable=retryable, attempts=attempt, detail=detail)
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self._api_key, _REDACTED) if self._api_key else text
+
+
+def make_client(
+    config: LLMConfig | Mapping[str, Any],
+    *,
+    transport: httpx.BaseTransport | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    rng: Callable[[], float] = random.random,
+) -> OpenAICompatClient:
+    """Build the LLM client from the parsed ``config.yaml`` (or an ``LLMConfig``).
+
+    The key is read only from the ``AI_API_KEY`` environment variable;
+    ``AI_MODEL`` / ``AI_BASE_URL`` override the config. Raises ``LLMConfigError``
+    if the key is missing or malformed or the config is invalid. ``transport``,
+    ``sleep`` and ``rng`` exist so tests can run offline and instantly.
+    """
+    llm_config = config if isinstance(config, LLMConfig) else LLMConfig.from_mapping(config)
+    return OpenAICompatClient(llm_config, _read_api_key(), transport=transport, sleep=sleep, rng=rng)
+
+
+def _read_api_key() -> str:
+    try:
+        key = os.environ[API_KEY_ENV]
+    except KeyError:
+        raise LLMConfigError(
+            f"{API_KEY_ENV} environment variable is not set; export it before running (see .env.example)"
+        ) from None
+    key = key.strip()
+    if not key:
+        raise LLMConfigError(f"{API_KEY_ENV} environment variable is empty")
+    if not key.isascii() or not key.isprintable() or any(c.isspace() for c in key):
+        raise LLMConfigError(
+            f"{API_KEY_ENV} contains spaces, line breaks or non-ASCII characters; check how it was exported"
+        )
+    return key
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a Retry-After header (delay in seconds or an HTTP date); ``None`` if absent or unparseable."""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, seconds)
+
+
+def _excerpt(text: str, limit: int = 500) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _as_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _tokens_from_chars(chars: int) -> int:
+    return (chars + 3) // 4
+
+
+def _prompt_chars(payload: dict[str, Any]) -> int:
+    total = 0
+    for msg in payload["messages"]:
+        content = msg.get("content")
+        total += len(content) if isinstance(content, str) else len(json.dumps(content))
+        if msg.get("tool_calls"):
+            total += len(json.dumps(msg["tool_calls"]))
+    if payload.get("tools"):
+        total += len(json.dumps(payload["tools"]))
+    return total
+
+
+def _completion_chars(message: dict) -> int:
+    content = message.get("content")
+    total = len(content) if isinstance(content, str) else 0
+    for raw in message.get("tool_calls") or []:
+        fn = raw.get("function") if isinstance(raw, dict) else None
+        if isinstance(fn, dict):
+            args = fn.get("arguments")
+            total += len(str(fn.get("name", ""))) + (len(args) if isinstance(args, str) else len(json.dumps(args)))
+    return total
