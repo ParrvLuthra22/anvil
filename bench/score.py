@@ -1,265 +1,178 @@
 #!/usr/bin/env python3
-"""ANVIL benchmark scorer."""
-
+"""Apply and evaluate benchmark patches in disposable checkouts."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import py_compile
+import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT / "src"))
-
-from anvil.repo.profile import profile_repo
+ROOT = Path(__file__).resolve().parents[1]
+CATEGORIES = {"no_patch", "empty_patch", "patch_does_not_apply", "f2p_fail", "p2p_regression", "timeout", "harness_error"}
 
 
-def _run_cmd(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int = 120,
-    env: dict | None = None,
-) -> subprocess.CompletedProcess:
-    base_env = os.environ.copy()
-    base_env["PYTHONPATH"] = f"{cwd}:{base_env.get('PYTHONPATH', '')}".rstrip(":")
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=base_env,
-    )
+def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    """Run a bounded command without allowing it to prompt for input."""
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+
+
+def _repo_url(value: str) -> str:
+    """Resolve fixture-relative repository URLs while preserving remote URLs."""
+    if value.startswith("file://"):
+        return value[7:]
+    candidate = Path(value)
+    if not candidate.is_absolute() and (ROOT / candidate).exists():
+        return str((ROOT / candidate).resolve())
+    if candidate.exists():
+        return str(candidate.resolve())
+    return value if "://" in value else f"https://github.com/{value}"
+
+
+def _command(text: str, cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    """Execute a recorded shell command, adapting benchmark venv Python paths."""
+    words = shlex.split(text)
+    if not words:
+        return subprocess.CompletedProcess([], 0, "", "")
+    words = [str(cwd / ".anvil_venv/bin/python") if w.endswith("/.anvil_venv/bin/python") or w == ".anvil_venv/bin/python" else (sys.executable if w in {"python", "python3"} else w) for w in words]
+    return _run(words, cwd, timeout)
+
+
+def _test_command(test_cmd: str, targets: list[str]) -> str:
+    """Reuse the recorded runner and flags, substituting just its test selection."""
+    words = shlex.split(test_cmd)
+    # SWE-bench test_cmd ends with selected test node ids. Preserve the runner
+    # and options while replacing those nodes with the requested oracle set.
+    first_target = next((i for i, word in enumerate(words) if ".py::" in word or word.endswith(".py")), len(words))
+    prefix = words[:first_target]
+    if prefix and prefix[0] in {"python", "python3"}:
+        prefix[0] = sys.executable
+    return " ".join(shlex.quote(w) for w in prefix + targets)
 
 
 def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
-    patch_path_str = run_result.get("patch_path", "")
-    patch_path = Path(patch_path_str) if patch_path_str else None
+    """Score one result. Oracle fields are used only here, after agent execution."""
+    result = dict(run_result)
+    patch = Path(result.get("patch_path", "")) if result.get("patch_path") else None
+    if result.get("error"):
+        result.update(resolved=False, category="timeout" if "timeout" in str(result["error"]).lower() else "harness_error")
+        return result
+    if patch is None or not patch.is_file():
+        result.update(resolved=False, category="no_patch")
+        return result
+    if not patch.read_text(encoding="utf-8").strip():
+        result.update(resolved=False, category="empty_patch")
+        return result
 
-    # 1. Error checks
-    if run_result.get("error"):
-        if "timeout" in run_result["error"].lower():
-            run_result["category"] = "timeout"
-        else:
-            run_result["category"] = "harness_error"
-        run_result["resolved"] = False
-        return run_result
-
-    if not patch_path or not patch_path.exists():
-        run_result["category"] = "no_patch"
-        run_result["resolved"] = False
-        return run_result
-
-    patch_text = patch_path.read_text(encoding="utf-8").strip()
-    if not patch_text:
-        run_result["category"] = "empty_patch"
-        run_result["resolved"] = False
-        return run_result
-
-    # 2. Setup fresh worktree / clone
-    repo_url = instance["repo"]
-    base_commit = instance["base_commit"]
-    repo_dir = work_dir / instance["instance_id"]
-
-    if repo_url.startswith("file://"):
-        local_path = repo_url[7:]
-    elif (_ROOT / repo_url).exists():
-        local_path = str((_ROOT / repo_url).resolve())
-    elif Path(repo_url).exists():
-        local_path = str(Path(repo_url).resolve())
-    else:
-        local_path = repo_url
-
+    repo = work_dir / f"repo-{instance['instance_id']}"
     try:
-        clone_res = _run_cmd(["git", "clone", local_path, str(repo_dir)], cwd=work_dir)
-        if clone_res.returncode != 0:
-            run_result["category"] = "harness_error"
-            run_result["resolved"] = False
-            run_result["error"] = f"Clone failed: {clone_res.stderr or clone_res.stdout}"
-            return run_result
+        clone = _run(["git", "clone", "--no-checkout", _repo_url(instance["repo"]), str(repo)], work_dir)
+        if clone.returncode:
+            raise RuntimeError(clone.stderr[-1000:])
+        checkout = _run(["git", "checkout", "--detach", instance["base_commit"]], repo)
+        if checkout.returncode:
+            raise RuntimeError(checkout.stderr[-1000:])
+        check = _run(["git", "apply", "--check", str(patch.resolve())], repo)
+        if check.returncode:
+            result.update(resolved=False, category="patch_does_not_apply")
+            return result
+        applied = _run(["git", "apply", str(patch.resolve())], repo)
+        if applied.returncode:
+            result.update(resolved=False, category="patch_does_not_apply")
+            return result
+        # Reject syntactically invalid Python patches before tests, matching the
+        # general patch validity category without making language assumptions.
+        py_compile = _run([sys.executable, "-m", "compileall", "-q", "."], repo, timeout=120)
+        if py_compile.returncode:
+            result.update(resolved=False, category="patch_does_not_apply")
+            return result
+        oracle = instance.get("test_patch", "")
+        if oracle:
+            oracle_path = work_dir / f"oracle-{instance['instance_id']}.diff"
+            oracle_path.write_text(oracle, encoding="utf-8")
+            applied_oracle = _run(["git", "apply", "--check", str(oracle_path)], repo)
+            if applied_oracle.returncode:
+                raise RuntimeError(f"test_patch does not apply: {applied_oracle.stderr[-800:]}")
+            applied_oracle = _run(["git", "apply", str(oracle_path)], repo)
+            if applied_oracle.returncode:
+                raise RuntimeError(f"test_patch failed: {applied_oracle.stderr[-800:]}")
 
-        co_res = _run_cmd(["git", "checkout", base_commit], cwd=repo_dir)
-        if co_res.returncode != 0:
-            run_result["category"] = "harness_error"
-            run_result["resolved"] = False
-            run_result["error"] = f"Checkout failed: {co_res.stderr or co_res.stdout}"
-            return run_result
-    except Exception as e:
-        run_result["category"] = "harness_error"
-        run_result["resolved"] = False
-        run_result["error"] = f"Workspace setup failed: {e}"
-        return run_result
+        from anvil.repo.profile import profile_repo
+        install_cmd = instance.get("install_cmd") or profile_repo(repo).install_cmd
+        if install_cmd:
+            # Keep dependency changes inside this instance's disposable tree.
+            venv_python = repo / ".anvil_venv" / "bin" / "python"
+            if not venv_python.exists():
+                created = _run([sys.executable, "-m", "venv", str(repo / ".anvil_venv")], repo)
+                if created.returncode:
+                    raise RuntimeError(f"venv creation failed: {created.stderr[-800:]}")
+            install_words = shlex.split(install_cmd)
+            if install_words[:2] == ["pip", "install"]:
+                install_words = [str(venv_python), "-m", "pip", *install_words[1:]]
+            installed = _run(install_words, repo, timeout=600)
+            if installed.returncode:
+                raise RuntimeError(f"dependency installation failed: {installed.stderr[-800:]}")
+        test_cmd = str(instance.get("test_cmd", "python -m pytest -q"))
+        for category, targets in (("p2p_regression", instance.get("PASS_TO_PASS", [])), ("f2p_fail", instance.get("FAIL_TO_PASS", []))):
+            if not targets:
+                continue
+            cmd = _test_command(test_cmd, [str(t) for t in targets])
+            try:
+                tested = _command(cmd, repo)
+            except subprocess.TimeoutExpired:
+                result.update(resolved=False, category="timeout")
+                return result
+            if tested.returncode:
+                result.update(resolved=False, category=category, test_output=(tested.stdout + tested.stderr)[-2000:])
+                return result
+        result.update(resolved=True, category="resolved")
+    except subprocess.TimeoutExpired:
+        result.update(resolved=False, category="timeout")
+    except (OSError, RuntimeError, KeyError) as exc:
+        result.update(resolved=False, category="harness_error", error=str(exc))
+    return result
 
-    # 3. Apply agent's patch
-    check_agent = _run_cmd(
-        ["git", "apply", "--check", "--allow-empty", str(patch_path.resolve())], cwd=repo_dir
-    )
-    if check_agent.returncode != 0:
-        run_result["category"] = "patch_does_not_apply"
-        run_result["resolved"] = False
-        return run_result
 
-    apply_agent = _run_cmd(
-        ["git", "apply", "--allow-empty", str(patch_path.resolve())], cwd=repo_dir
-    )
-    if apply_agent.returncode != 0:
-        run_result["category"] = "patch_does_not_apply"
-        run_result["resolved"] = False
-        return run_result
-
-    # 4. Check for syntax errors introduced by the patch
-    for py_file in repo_dir.rglob("*.py"):
-        if ".git" in py_file.parts or ".venv" in py_file.parts:
-            continue
+def _read_jsonl(path: Path) -> list[dict]:
+    """Read valid JSON records from a JSONL file."""
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            py_compile.compile(str(py_file), doraise=True)
-        except py_compile.PyCompileError:
-            run_result["category"] = "patch_does_not_apply"
-            run_result["resolved"] = False
-            return run_result
-
-    # 5. Apply test_patch
-    test_patch_text = instance.get("test_patch", "")
-    if test_patch_text:
-        tp_path = repo_dir / "test_patch.diff"
-        tp_path.write_text(test_patch_text, encoding="utf-8")
-        apply_test = _run_cmd(["git", "apply", "--allow-empty", "test_patch.diff"], cwd=repo_dir)
-        if apply_test.returncode != 0:
-            print(f"Warning: test_patch failed to apply for {instance['instance_id']}")
-
-    # 6. Profile repo for install/test commands if needed
-    profile = profile_repo(repo_dir)
-    if profile.install_cmd:
-        _run_cmd(profile.install_cmd.split(), cwd=repo_dir, timeout=300)
-
-    # 7. Run PASS_TO_PASS and FAIL_TO_PASS with the recorded test_cmd
-    f2p = instance.get("FAIL_TO_PASS", [])
-    p2p = instance.get("PASS_TO_PASS", [])
-
-    base_test_cmd = profile.test_cmd.split() if profile.test_cmd else [sys.executable, "-m", "pytest", "-q"]
-
-    # Run PASS_TO_PASS first
-    if p2p:
-        cmd = base_test_cmd + p2p
-        res = _run_cmd(cmd, cwd=repo_dir)
-        if res.returncode != 0:
-            run_result["category"] = "p2p_regression"
-            run_result["resolved"] = False
-            return run_result
-
-    # Run FAIL_TO_PASS
-    if f2p:
-        cmd = base_test_cmd + f2p
-        res = _run_cmd(cmd, cwd=repo_dir)
-        if res.returncode != 0:
-            run_result["category"] = "f2p_fail"
-            run_result["resolved"] = False
-            return run_result
-
-    # All tests passed!
-    run_result["category"] = "resolved"
-    run_result["resolved"] = True
-    return run_result
+            if line.strip(): rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
 
 
-def _print_summary_table(results: list[dict]) -> None:
-    cols = ["#", "Instance ID", "Category", "Resolved", "Time(s)", "Steps", "Tokens"]
-    widths = [3, 24, 16, 10, 8, 7, 10]
-    header = "  ".join(c.ljust(w) for c, w in zip(cols, widths))
-    sep = "  ".join("-" * w for w in widths)
-
-    print("\n" + "=" * len(header))
-    print("ANVIL Benchmark Score Summary".center(len(header)))
-    print("=" * len(header))
-    print(header)
-    print(sep)
-
-    for i, r in enumerate(results, 1):
-        iid = r.get("instance_id", "?")[:24]
-        cat = r.get("category", "unknown")[:16]
-        res = "YES" if r.get("resolved") else "NO"
-        dur = f"{r.get('duration', 0.0):.1f}"
-        steps = str(r.get("steps", 0))
-        toks = f"{r.get('tokens', 0):,}"
-        print(
-            "  ".join(
-                str(v).ljust(w)
-                for v, w in zip([i, iid, cat, res, dur, steps, toks], widths)
-            )
-        )
-
-    print(sep)
-    total = len(results)
-    resolved = sum(1 for r in results if r.get("resolved"))
-    rate = (resolved / total) if total else 0.0
-    print(f"Total: {total} | Resolved: {resolved} ({rate:.1%})\n")
+def _print_summary_table(rows: list[dict]) -> None:
+    """Print compact scores and the resolved rate."""
+    print("\nID                       RESOLVED  CATEGORY             STEPS  TOKENS  SECONDS  LABEL")
+    for r in rows:
+        print(f"{r.get('instance_id','?')[:24]:24}  {str(bool(r.get('resolved'))):8}  {r.get('category','unscored'):20.20}  {r.get('steps',0):5}  {r.get('tokens',0):6}  {r.get('seconds',r.get('duration',0)):7.1f}  {r.get('label','')}")
+    count = len(rows); solved = sum(bool(r.get("resolved")) for r in rows)
+    print(f"Resolved: {solved}/{count} ({solved/count:.1%})" if count else "Resolved: 0/0 (0.0%)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ANVIL benchmark scorer")
-    parser.add_argument("--instances", type=Path, default=Path("bench/instances.json"))
-    parser.add_argument("--results", type=Path, default=Path("bench/results.jsonl"))
-    parser.add_argument("--out", type=Path, default=Path("bench/score.json"))
+    """Score all completed benchmark runs."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--instances", type=Path, default=ROOT / "bench/instances.json")
+    parser.add_argument("--results", type=Path, default=ROOT / "bench/results.jsonl")
+    parser.add_argument("--out", type=Path, default=ROOT / "bench/score.json")
     args = parser.parse_args()
-
-    instances = {
-        i["instance_id"]: i
-        for i in json.loads(args.instances.read_text(encoding="utf-8"))
-    }
-
-    results = []
-    if args.results.exists():
-        for line in args.results.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    results.append(json.loads(line))
-                except Exception:
-                    pass
-
-    scored = []
-    with tempfile.TemporaryDirectory() as td:
-        work_dir = Path(td)
-        for r in results:
-            inst = instances.get(r["instance_id"])
-            if not inst:
-                continue
-
-            print(f"Scoring {r['instance_id']}...")
-            r_scored = _score_instance(inst, r, work_dir)
-            scored.append(r_scored)
-            print(f"  -> {r_scored['category']} (resolved: {r_scored['resolved']})")
-
-    # Output bench/score.json
-    total = len(scored)
-    resolved_count = sum(1 for r in scored if r.get("resolved"))
-    cat_counts: dict[str, int] = {}
-    for r in scored:
-        c = r.get("category", "unknown")
-        cat_counts[c] = cat_counts.get(c, 0) + 1
-
-    score_data = {
-        "instances": scored,
-        "summary": {
-            "total": total,
-            "resolved": resolved_count,
-            "resolved_rate": (resolved_count / total) if total else 0.0,
-            "categories": cat_counts,
-        },
-    }
+    instances = {x["instance_id"]: x for x in json.loads(args.instances.read_text(encoding="utf-8"))}
+    records = _read_jsonl(args.results)
+    with tempfile.TemporaryDirectory(prefix="anvil-score-") as td:
+        scored = [_score_instance(instances[r["instance_id"]], r, Path(td)) for r in records if r.get("instance_id") in instances]
+    args.results.write_text("".join(json.dumps(r) + "\n" for r in scored), encoding="utf-8")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(score_data, indent=2), encoding="utf-8")
-
-    # Rewrite results.jsonl with scored fields
-    lines = [json.dumps(r) + "\n" for r in scored]
-    args.results.write_text("".join(lines), encoding="utf-8")
-
-    # Print summary table to stdout
+    args.out.write_text(json.dumps({"instances": scored, "summary": {"total": len(scored), "resolved": sum(bool(r.get("resolved")) for r in scored)}}, indent=2), encoding="utf-8")
     _print_summary_table(scored)
 
 
