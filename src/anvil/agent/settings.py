@@ -13,7 +13,7 @@ from anvil.context.manager import (
 from anvil.llm.profiles import resolve_profile
 
 # Model calls a phase may make before the harness forces it to close (``features.token_budgets``).
-DEFAULT_PHASE_CALLS: dict[str, int] = {"understand": 1, "localize": 8, "reproduce": 10, "patch": 15, "verify": 8, "review": 3}
+DEFAULT_PHASE_CALLS: dict[str, int] = {"understand": 1, "localize": 8, "reproduce": 10, "patch": 15, "verify": 8, "review": 6}
 DEFAULT_READ_FILE_MAX_LINES = 150
 DEFAULT_READ_FILE_HEAD_LINES = 60
 DEFAULT_TOKEN_SAVING_KEEP_STEPS = 3

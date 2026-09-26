@@ -39,7 +39,7 @@ def test_the_shipped_config_says_why_weak_model_prompts_is_off():
 
 def test_the_shipped_phase_caps_are_the_agreed_ones():
     assert dict(AgentSettings.from_mapping(load_config()).phase_call_caps) == {
-        "understand": 1, "localize": 8, "reproduce": 10, "patch": 15, "verify": 8, "review": 3,
+        "understand": 1, "localize": 8, "reproduce": 10, "patch": 15, "verify": 8, "review": 6,
     }
     assert DEFAULT_PHASE_CALLS == dict(settings().phase_call_caps)
 
@@ -60,7 +60,7 @@ def test_with_token_budgets_off_the_context_settings_are_exactly_the_configured_
 
 def test_call_cap_by_phase_name():
     on = settings()
-    assert [on.call_cap(p) for p in PHASES] == [1, 8, 10, 15, 8, 3]
+    assert [on.call_cap(p) for p in PHASES] == [1, 8, 10, 15, 8, 6]
     assert on.call_cap("finalize") is None and on.call_cap("ingest") is None
 
 
@@ -72,7 +72,7 @@ def test_the_numbers_can_be_changed_in_the_config():
     assert (custom.read_file_max_lines, custom.read_file_head_lines, custom.repo_map_chars) == (80, 20, 1500)
     assert (custom.context_keep_steps, custom.tool_output_char_cap) == (2, 2500)
     assert custom.call_cap("localize") == 4 and custom.call_cap("patch") == 6
-    assert custom.call_cap("review") == 3, "a phase left out keeps its default"
+    assert custom.call_cap("review") == 6, "a phase left out keeps its default"
 
 
 def test_features_are_switched_one_at_a_time_and_do_not_affect_each_other():

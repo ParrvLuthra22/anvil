@@ -165,10 +165,14 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
     of the definitions in the rest (`line: signature`, at most 80) and a hint to call `read_file` with a line range. Only
     numbered file text is treated so; short reads and other tools' output are untouched. Flask's `blueprints.py` went from
     about 6,400 tokens to about 900.
-  - Each phase has a call cap (UNDERSTAND 1, LOCALIZE 8, REPRODUCE 10, PATCH 15, VERIFY 8, REVIEW 3; per PATCH attempt).
+  - Each phase has a call cap (UNDERSTAND 1, LOCALIZE 8, REPRODUCE 10, PATCH 15, VERIFY 8, REVIEW 6; per PATCH attempt).
     A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls. The forced close: only `phase_done` and `give_up` are offered, with a phase-specific instruction to
     summarise the best findings so far, any other tool is refused, and `phase_done` still goes through the phase's gate. The
     report lists the phases closed this way. A cap at or above `max_steps_per_phase` never comes up.
+    Why these numbers (9 real Qwen3-Coder runs on the toy repo): when the model closed a phase itself it needed at most 1 call
+    (UNDERSTAND), 8 (LOCALIZE), 6 (REPRODUCE), 10 (PATCH), 6 (VERIFY) and 5 (REVIEW). A REPRODUCE that got past 6 calls never closed
+    (11 calls at the cap, 25 without one), so 10 is enough and more only buys wandering. REVIEW took 4 to 5 calls, so the old cap of 3
+    forced the close in 4 of 4 capped runs; 6 lets a natural close happen.
   - `context_keep_steps` and `tool_output_char_cap` are only ever tightened (to 3 and 4000), and the repository map is
     `token_saving.repo_map_chars` (3000) instead of 6000 characters.
   - `report.md` gets a "Tokens by phase" table (calls, prompt and completion tokens, prompt tokens per call, and a total).
