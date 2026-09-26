@@ -32,6 +32,7 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from anvil.agent.emitter import Emitter
+from anvil.agent.outputs import changed_files, filter_diff
 from anvil.agent.text import clip_head
 from anvil.context.truncate import format_call
 from anvil.events import Phase
@@ -502,6 +503,11 @@ class Checkpointer:
 
     A sandbox's checkpoint or rollback may sweep away untracked files (``git stash`` does), and the
     repro script is untracked, so the files named by ``protected_paths`` are put back if missing.
+    A sandbox's checkpoint must snapshot the tree without changing it, but a ``git stash`` based one empties it.
+    The edits the model has made are therefore read before the checkpoint and written back if they are gone; if
+    that is impossible the checkpoint is undone and reported as failed, so a rework round never starts on a tree
+    that silently lost the patch it is meant to improve.
+
     Nothing here raises: a failed checkpoint or rollback is announced and reported by its result.
     """
 
@@ -513,6 +519,7 @@ class Checkpointer:
     def checkpoint(self, label: str) -> str | None:
         """Snapshot the tree; returns the ref, or ``None`` if the sandbox could not (it raised, or returned no ref)."""
         saved = self._save()
+        edits = self._edits()
         self._emitter.tool_call("checkpoint", {"label": label})
         try:
             ref = self._sandbox.checkpoint(label)
@@ -524,6 +531,12 @@ class Checkpointer:
         if not usable_ref(ref):
             self._emitter.tool_result("checkpoint", False, str(ref))
             self._emitter.error("sandbox", f"checkpoint failed: the sandbox returned {str(ref)[:200]!r} instead of a ref")
+            return None
+        if not self._edits_survived(edits):
+            self._sandbox_undo(ref)
+            self._restore(saved)
+            self._emitter.tool_result("checkpoint", False, "the checkpoint emptied the working tree")
+            self._emitter.error("sandbox", "checkpoint failed: it emptied the working tree and the edits could not be restored")
             return None
         self._emitter.tool_result("checkpoint", True, str(ref))
         return ref
@@ -549,6 +562,53 @@ class Checkpointer:
         told = f"; the model is told about {len(tried)} approach(es) already tried" if tried else ""
         self._emitter.error("rollback", f"reset the working tree to {ref}{told}")
         return True
+
+    def _edits(self) -> dict[str, str | None]:
+        """Contents of the files that differ from the baseline (``None`` for a deleted one), read through the sandbox."""
+        try:
+            paths = [change.path for change in changed_files(filter_diff(self._sandbox.diff()))]
+        except Exception:  # noqa: BLE001 - without a readable diff there is nothing to protect or verify
+            return {}
+        edits: dict[str, str | None] = {}
+        for path in paths:
+            try:
+                edits[path] = self._sandbox.read_file(path)
+            except Exception:  # noqa: BLE001 - a deleted file: it cannot be written back
+                edits[path] = None
+        return edits
+
+    def _edits_survived(self, edits: Mapping[str, str | None]) -> bool:
+        """After a checkpoint: are the edits still in the tree? Writes back any that are gone; ``False`` if it cannot."""
+        if not edits:
+            return True
+        gone = self._gone(edits)
+        if not gone:
+            return True
+        for path in gone:
+            content = edits[path]
+            if content is not None:
+                try:
+                    self._sandbox.write_file(path, content)
+                except Exception:  # noqa: BLE001
+                    return False
+        remaining = self._gone(edits)
+        if not remaining:
+            self._emitter.error("sandbox", f"the checkpoint emptied the working tree; wrote back {len(gone)} edited file(s)")
+        return not remaining
+
+    def _gone(self, edits: Mapping[str, str | None]) -> list[str]:
+        try:
+            present = {change.path for change in changed_files(filter_diff(self._sandbox.diff()))}
+        except Exception:  # noqa: BLE001
+            return list(edits)
+        return [path for path in edits if path not in present]
+
+    def _sandbox_undo(self, ref: str) -> None:
+        """Undo a checkpoint that damaged the tree by rolling back to the snapshot it just took."""
+        try:
+            self._sandbox.rollback(ref)
+        except Exception:  # noqa: BLE001 - nothing more can be done; the caller reports the failure
+            pass
 
     def _save(self) -> dict[str, str]:
         saved = {}

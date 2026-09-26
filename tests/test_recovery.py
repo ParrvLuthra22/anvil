@@ -558,3 +558,98 @@ def test_rolling_back_to_an_unusable_ref_never_touches_the_sandbox(ref):
     checkpointer, events = make_checkpointer(sandbox)
     assert checkpointer.rollback(ref) is False
     assert sandbox.rollbacks == [] and sandbox.files["calc.py"] == "patched" and events() == []
+
+
+# ---- a checkpoint that empties the working tree ---------------------------------------------
+
+PATCHED = "def add(a, b):\n    return a + b\n"
+
+
+def kinds_of(events):
+    return [(e.type, e.data.get("kind")) for e in events() if e.type == "error"]
+
+
+def test_a_checkpoint_that_wipes_the_tree_gets_the_edits_written_back():
+    """Regression (audit, rework scenario): git-stash checkpoints empty the tree, so the verified patch vanished."""
+    sandbox = StashStyleSandbox({"calc.py": BUGGY})
+    sandbox.write_file("calc.py", PATCHED)
+    checkpointer, events = make_checkpointer(sandbox)
+    ref = checkpointer.checkpoint("before-rework")
+    assert ref and sandbox.files["calc.py"] == PATCHED, "the tree must still hold the patch after the checkpoint"
+    ((_, kind),) = kinds_of(events)
+    assert kind == "sandbox"
+    sandbox.write_file("calc.py", "def add(a, b):\n    return a * b\n")
+    assert checkpointer.rollback(ref) is True and sandbox.files["calc.py"] == PATCHED, "and the ref must be valid"
+
+
+def test_the_repro_and_the_edits_both_survive_a_wiping_checkpoint():
+    sandbox = StashStyleSandbox({"calc.py": BUGGY})
+    sandbox.write_file(".anvil/repro.py", "print('repro')\n")
+    sandbox.write_file("calc.py", PATCHED)
+    checkpointer, _ = make_checkpointer(sandbox, lambda: [".anvil/repro.py"])
+    assert checkpointer.checkpoint("s")
+    assert sandbox.files["calc.py"] == PATCHED and sandbox.files[".anvil/repro.py"] == "print('repro')\n"
+
+
+def test_a_checkpoint_that_leaves_the_tree_alone_is_not_second_guessed():
+    sandbox = FakeSandbox({"calc.py": BUGGY})
+    sandbox.write_file("calc.py", PATCHED)
+    checkpointer, events = make_checkpointer(sandbox)
+    assert checkpointer.checkpoint("s") == "ckpt-1"
+    assert kinds_of(events) == [] and sandbox.files["calc.py"] == PATCHED
+
+
+def test_a_clean_tree_needs_no_repair_and_costs_no_extra_diff():
+    class Counting(StashStyleSandbox):
+        diffs = 0
+
+        def diff(self):
+            type(self).diffs += 1
+            return super().diff()
+
+    sandbox = Counting({"calc.py": BUGGY})
+    checkpointer, events = make_checkpointer(sandbox)
+    assert checkpointer.checkpoint("patch-start")
+    assert Counting.diffs == 1 and kinds_of(events) == []
+
+
+def test_a_deleted_file_cannot_be_written_back_so_the_checkpoint_is_undone_and_reported():
+    sandbox = StashStyleSandbox({"calc.py": BUGGY, "old.py": "x = 1\n"})
+    del sandbox.files["old.py"]
+    checkpointer, events = make_checkpointer(sandbox)
+    assert checkpointer.checkpoint("before-rework") is None
+    assert "old.py" not in sandbox.files, "undoing the checkpoint restores the tree as it was, deletion included"
+    recorded = events()
+    assert [e.data["ok"] for e in recorded if e.type == "tool_result"] == [False]
+    (error,) = [e for e in recorded if e.type == "error"]
+    assert "emptied the working tree" in error.data["message"]
+
+
+def test_a_write_failure_while_repairing_undoes_the_checkpoint():
+    class ReadOnlyAfterCheckpoint(StashStyleSandbox):
+        locked = False
+
+        def checkpoint(self, label):
+            ref = super().checkpoint(label)
+            self.locked = True
+            return ref
+
+        def write_file(self, path, content):
+            if self.locked:
+                raise PermissionError("read-only")
+            super().write_file(path, content)
+
+    sandbox = ReadOnlyAfterCheckpoint({"calc.py": BUGGY})
+    sandbox.write_file("calc.py", PATCHED)
+    checkpointer, _ = make_checkpointer(sandbox)
+    assert checkpointer.checkpoint("s") is None
+    assert sandbox.files["calc.py"] == PATCHED
+
+
+def test_an_unreadable_diff_does_not_stop_a_checkpoint():
+    class BrokenDiff(FakeSandbox):
+        def diff(self):
+            raise RuntimeError("git is confused")
+
+    checkpointer, _ = make_checkpointer(BrokenDiff({"a": "1"}))
+    assert checkpointer.checkpoint("s") == "ckpt-1"
