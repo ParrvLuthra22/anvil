@@ -4,13 +4,15 @@ The manager keeps the prompt inside a token budget (``max_context_tokens``,
 estimated at chars/4) by compacting the history, cheapest measure first:
 
 1. Every tool observation is truncated when it is added (head and tail kept).
-2. Observations older than ``keep_steps`` model steps become a one-line summary:
+2. (Optionally) a ``read_file`` result of more than ``read_file_max_lines`` lines becomes its first lines plus an
+   outline of the file, with a hint to read a line range.
+3. Observations older than ``keep_steps`` model steps become a one-line summary:
    the tool, its arguments, ok/failed and the first line of output. The
    assistant's actions stay; only the payloads go.
-3. Past ``summarize_threshold`` of the budget, the oldest unpinned turns are folded
+4. Past ``summarize_threshold`` of the budget, the oldest unpinned turns are folded
    into one summary message by an injected ``summarizer`` (one LLM call), or, if
    there is none or it fails, hard-pruned into a digest of the actions taken.
-4. If the prompt is still over budget: the repo map is trimmed, recent observations
+5. If the prompt is still over budget: the repo map is trimmed, recent observations
    are pruned early, and the oldest turns are dropped.
 
 Never pruned: pinned messages (the issue brief, phase summaries the caller pinned),
@@ -32,7 +34,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from anvil.context.tokens import CHARS_PER_TOKEN, estimate_message_tokens, estimate_tokens
-from anvil.context.truncate import clip_lines, first_line, format_call, truncate_output
+from anvil.context.truncate import cap_read_output, clip_lines, first_line, format_call, truncate_output
 
 logger = logging.getLogger("anvil.context")
 logger.addHandler(logging.NullHandler())
@@ -95,11 +97,15 @@ class ContextManager:
         keep_steps: int = DEFAULT_KEEP_STEPS,
         summarize_threshold: float = DEFAULT_SUMMARIZE_THRESHOLD,
         summarizer: Summarizer | None = None,
+        read_file_max_lines: int | None = None,
+        read_file_head_lines: int = 60,
     ) -> None:
         self._max = max_context_tokens
         self._threshold = int(max_context_tokens * summarize_threshold)
         self._cap = tool_output_char_cap
         self._keep_steps = keep_steps
+        self._read_max_lines = read_file_max_lines  # None: read_file results are kept whole (up to the output cap)
+        self._read_head_lines = read_file_head_lines
         self._summarizer = summarizer
         self._entries: list[_Entry] = []
         self._calls: dict[str, tuple[str, Any, int]] = {}  # tool_call_id -> (tool, args, step)
@@ -134,6 +140,8 @@ class ContextManager:
             name, args, step = self._calls.get(
                 str(fields.get("tool_call_id", "")), (str(fields.get("name") or "tool"), None, step)
             )
+            if name == "read_file" and self._read_max_lines is not None:
+                content = cap_read_output(content, args, self._read_max_lines, self._read_head_lines, self._cap)
             content = truncate_output(content, self._cap)
             label, line = _describe_observation(name, args, ok, content)
         self._append(
