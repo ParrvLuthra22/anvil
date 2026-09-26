@@ -76,7 +76,10 @@ def render_report(state: RunState, patch: str, *, steps: int, tokens: int, secon
     files = changed_files(patch)
     confidence = state.confidence(bool(files))
     issue = state.issue
-    title = f"{issue.title or 'untitled'} ({issue.owner}/{issue.repo}#{issue.number})" if issue else state.issue_url
+    title = state.issue_url
+    if issue:
+        number = f"#{issue.number}" if issue.number else ""
+        title = f"{issue.title or 'untitled'} ({issue.owner}/{issue.repo}{number})"
 
     out = ["# ANVIL report", "", "## Issue", "", f"- Issue: {title}", f"- URL: {state.issue_url}"]
     out += ["", state.understanding.strip() or "_No issue summary was produced._"]

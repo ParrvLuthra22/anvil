@@ -345,11 +345,16 @@ class FakePipeline:
         self.sandbox = sandbox or project_sandbox()
         self.registry = registry or FakeRegistry()
         self.fail_ingest, self.fail_profile = fail_ingest, fail_profile
+        self.ingest_calls: list[dict] = []
 
-    def ingest(self, issue_url: str) -> Ingested:
+    def ingest(self, issue_url: str, *, repo_url: str | None = None, issue_text: str | None = None) -> Ingested:
+        self.ingest_calls.append({"issue_url": issue_url, "repo_url": repo_url, "issue_text": issue_text})
         if self.fail_ingest:
             raise self.fail_ingest
-        return Ingested(project_issue(), self.sandbox.root)
+        issue = project_issue()
+        if issue_text:
+            issue.body = issue_text
+        return Ingested(issue, self.sandbox.root)
 
     def profile(self, ingested: Ingested) -> Workspace:
         if self.fail_profile:

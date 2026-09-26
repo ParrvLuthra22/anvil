@@ -80,16 +80,20 @@ def run_harness(
     *,
     llm: LLMClient | None = None,
     pipeline: Pipeline | None = None,
+    repo_url: str | None = None,
+    issue_text: str | None = None,
 ) -> None:
     """Run the full phase cycle for ``issue_url``, emitting events on ``bus``.
 
     Blocks until the run ends (call it from a worker thread under the TUI).
     ``llm`` and ``pipeline`` default to the real OpenAI-compatible client and the
-    real ``RepoPipeline``; tests pass fakes. Whatever happens, ``output/patch.diff`` and
+    real ``RepoPipeline``; tests pass fakes. ``issue_text`` (with ``repo_url``, or an ``issue_url``
+    that names the repository) is the fallback for when GitHub cannot be asked for the issue: it is
+    used as the issue body and nothing is fetched. Whatever happens, ``output/patch.diff`` and
     ``output/report.md`` are written and a ``done`` event is emitted. Nothing is raised
     to the caller, except that Ctrl-C still propagates once those outputs exist.
     """
-    Orchestrator(issue_url, config, bus, llm=llm, pipeline=pipeline).run()
+    Orchestrator(issue_url, config, bus, llm=llm, pipeline=pipeline, repo_url=repo_url, issue_text=issue_text).run()
 
 
 # Phases that end with text the model wrote itself; only those can be replaced by their summary.
@@ -113,9 +117,13 @@ class Orchestrator:
         *,
         llm: LLMClient | None = None,
         pipeline: Pipeline | None = None,
+        repo_url: str | None = None,
+        issue_text: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._repo_url = repo_url
+        self._issue_text = issue_text
         self._settings_error = ""
         try:
             self._settings = AgentSettings.from_mapping(config)
@@ -185,11 +193,15 @@ class Orchestrator:
 
     def _ingest(self) -> Ingested:
         self._enter(Phase.INGEST)
-        ingested = self._pipeline.ingest(self._state.issue_url)
-        issue = self._state.issue = ingested.issue
-        self._emitter.message(
-            "system", f"Fetched issue #{issue.number} ({issue.title}) and cloned {issue.owner}/{issue.repo}."
+        ingested = self._pipeline.ingest(
+            self._state.issue_url, repo_url=self._repo_url, issue_text=self._issue_text
         )
+        issue = self._state.issue = ingested.issue
+        repo = f"{issue.owner}/{issue.repo}"
+        if (self._issue_text or "").strip():
+            self._emitter.message("system", f"Using the issue text you supplied and cloned {repo}.")
+        else:
+            self._emitter.message("system", f"Fetched issue #{issue.number} ({issue.title}) and cloned {repo}.")
         return ingested
 
     def _profile(self, ingested: Ingested) -> None:
