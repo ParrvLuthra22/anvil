@@ -55,6 +55,8 @@ def main() -> None:
         print(f"  {cat.ljust(20)} {count} ({pct:.1%})")
 
     resolved_results = [r for r in results if r.get("resolved")]
+    token_total = sum(int(r.get("tokens", 0) or 0) for r in resolved_results)
+    print(f"\nTokens per resolved instance: {token_total / len(resolved_results):,.0f}" if resolved_results else "\nTokens per resolved instance: n/a")
     if resolved_results:
         avg_tokens = sum(r.get("tokens", 0) for r in resolved_results) / len(resolved_results)
         avg_steps = sum(r.get("steps", 0) for r in resolved_results) / len(resolved_results)
@@ -73,7 +75,7 @@ def main() -> None:
     for r in results:
         iid = r.get("instance_id")
         if not iid: continue
-        trace_file = Path(f"bench/runs/{iid}/trace.jsonl")
+        trace_file = Path(r.get("trace_path") or f"bench/runs/{iid}/trace.jsonl")
         if not trace_file.exists():
             continue
         traces_found += 1

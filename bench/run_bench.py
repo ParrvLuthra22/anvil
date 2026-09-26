@@ -160,10 +160,12 @@ async def _run_instance(
             "patch_path": str(run_dir / "patch.diff"),
             "report_path": str(run_dir / "report.md"),
             "trace_path": str(trace_path),
-            "duration": duration,
+            "seconds": duration,
             "error": error,
             "steps": steps,
             "tokens": tokens,
+            "resolved": False,
+            "category": "timeout" if error.startswith("timeout") else ("harness_error" if error else "unscored"),
         }
 
         with open(results_file, "a", encoding="utf-8") as f:
@@ -193,8 +195,11 @@ async def main() -> None:
     completed = _load_completed(results_file)
     to_run = [i for i in instances if i["instance_id"] not in completed]
 
-    if args.limit:
+    if args.limit is not None:
         to_run = to_run[: args.limit]
+
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     print(f"Running {len(to_run)} instances ({len(completed)} completed skipped)")
 
