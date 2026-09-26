@@ -120,7 +120,7 @@ class TestEnsureDepsNoCmd:
             install_cmd=None, test_cmd="pytest", test_framework="pytest",
         )
         sb = MagicMock()
-        result = ensure_deps(sb, profile)
+        result = ensure_deps(sb, profile, as_of="2025-01-01")
         assert result.ok
         assert result.skipped
         sb.exec.assert_not_called()
@@ -154,7 +154,7 @@ class TestNormalizeAsOf:
         sb = MagicMock()
         sb.exec.side_effect = RuntimeError("boom")
         sb.root = Path("/fake")
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
         assert "internal error" in result.report.lower() or "boom" in result.report.lower()
 
@@ -286,7 +286,7 @@ class TestEnsureDepsPython:
                 _exec_result(0),   # pytest install
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert result.ok
         assert result.venv_python is not None
         assert _VENV_DIR in result.venv_python
@@ -337,8 +337,8 @@ class TestEnsureDepsPython:
 
     def test_no_interpreter_found_skips(self):
         """Task 3: all candidates fail → skipped with clear reason."""
-        sb = _make_sandbox([_exec_result(1)] * len(_PYTHON_CANDIDATES))
-        result = ensure_deps(sb, _python_profile())
+        sb = _make_sandbox([_exec_result(1)] * (len(_PYTHON_CANDIDATES)*6 + 1))
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
         assert result.skipped
         assert "python" in result.report.lower()
@@ -350,7 +350,7 @@ class TestEnsureDepsPython:
                 _exec_result(1, stderr="No space left"),
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
         assert "venv" in result.report.lower()
 
@@ -362,7 +362,7 @@ class TestEnsureDepsPython:
                 _exec_result(1, stderr="No module named 'setuptools'"),
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
         assert "failed" in result.report.lower()
         assert result.venv_python is not None
@@ -375,7 +375,7 @@ class TestEnsureDepsPython:
                 _exec_result(-1, timed_out=True),
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
         assert "timed out" in result.report.lower()
 
@@ -389,11 +389,8 @@ class TestEnsureDepsPython:
                 _exec_result(0),
             ]
         )
-        ensure_deps(sb, _python_profile("pip install -r requirements.txt"))
-        # index 4 = venv(2) + pip_upgrade(3) + install(4)
-        install_call_cmd = sb.exec.call_args_list[4][0][0]
-        assert _VENV_DIR in install_call_cmd
-        assert "pip install" in install_call_cmd
+        ensure_deps(sb, _python_profile("pip install -r requirements.txt"), as_of="2025-01-01")
+        assert any(".anvil_venv/bin/pip install" in str(c) for c in sb.exec.call_args_list)
 
     def test_venv_timeout_is_handled(self):
         """venv creation times out → ok=False."""
@@ -402,7 +399,7 @@ class TestEnsureDepsPython:
                 _exec_result(-1, timed_out=True),
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert not result.ok
 
     def test_report_mentions_interpreter(self):
@@ -415,7 +412,7 @@ class TestEnsureDepsPython:
                 _exec_result(0),
             ]
         )
-        result = ensure_deps(sb, _python_profile())
+        result = ensure_deps(sb, _python_profile(), as_of="2025-01-01")
         assert result.ok
         assert "python" in result.report.lower()
 
@@ -430,13 +427,13 @@ class TestEnsureDepsJS:
             _exec_result(0),   # command -v npm
             _exec_result(0, stdout="added 100 packages"),
         ])
-        result = ensure_deps(sb, _js_profile())
+        result = ensure_deps(sb, _js_profile(), as_of="2025-01-01")
         assert result.ok
         assert result.venv_python is None
 
     def test_js_npm_not_found_skips_cleanly(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _js_profile())
+        result = ensure_deps(sb, _js_profile(), as_of="2025-01-01")
         assert not result.ok
         assert result.skipped
         assert "npm" in result.report.lower()

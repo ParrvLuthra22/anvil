@@ -147,7 +147,7 @@ def _parse_requires_python(sandbox: Sandbox) -> str | None:
     return None  # no Python metadata found
 
 
-def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
+def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str | None:
     """Return the first interpreter that satisfies requires-python and can create a venv.
 
     Probes ``python3.13`` down to ``python3`` in order.
@@ -160,6 +160,14 @@ def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
         The interpreter name (e.g. ``"python3.11"``), or ``None`` if none qualifies.
     """
     spec_str = _parse_requires_python(sandbox)
+    if as_of:
+        # Python 3.13 removed cgi, imp, etc. (released Oct 2024)
+        if as_of < "2024-10-01":
+            spec_str = f"{spec_str},<3.13" if spec_str else "<3.13"
+        # Python 3.12 removed distutils (released Oct 2023)
+        if as_of < "2023-10-01":
+            spec_str = f"{spec_str},<3.12" if spec_str else "<3.12"
+            
     specifier = None
     if spec_str:
         try:
@@ -242,7 +250,7 @@ def _ensure_python_deps(
     venv_pip = f"{venv_path}/bin/pip"
 
     # Task 3: pick the right interpreter
-    interp = _pick_python_interpreter(sandbox)
+    interp = _pick_python_interpreter(sandbox, as_of=as_of)
     if interp is None:
         spec_str = _parse_requires_python(sandbox)
         reason = f"requires Python {spec_str}" if spec_str else "requires Python"
