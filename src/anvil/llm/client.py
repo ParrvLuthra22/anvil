@@ -32,6 +32,7 @@ import httpx
 
 from anvil.llm.config import LLMConfig
 from anvil.llm.errors import LLMConfigError, LLMError
+from anvil.llm.reasoning import Reply, content_text, split_message
 from anvil.llm.toolcalls import adapt_messages_for_text_mode, loads_lenient, parse_text_tool_call
 
 logger = logging.getLogger("anvil.llm")
@@ -69,6 +70,8 @@ class UsageTotals:
     completion_tokens: int = 0
     total_tokens: int = 0
     calls: int = 0
+    reasoning_tokens: int = 0  # as reported by the provider (already inside completion_tokens)
+    reasoning_replies: int = 0  # replies that carried reasoning, which was removed from the text
 
 
 class _Retryable(Exception):
@@ -109,6 +112,7 @@ class OpenAICompatClient(LLMClient):
         self._use_text = config.tool_mode == "text"
         self._native_misses = 0
         self.totals = UsageTotals()
+        self.reasoning_seen = False  # any reply so far carried <think> tags or a reasoning field
 
     def __repr__(self) -> str:
         return (
@@ -151,23 +155,25 @@ class OpenAICompatClient(LLMClient):
             payload["tools"] = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         data = self._request(payload)
         message = data["choices"][0]["message"]
-        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        reply = split_message(message, strip=self._config.strip_reasoning)
+        text = reply.text
         calls = self._native_calls(message)
         if tools and self._config.tool_mode == "auto":
             text, calls = self._rescue_native_miss(text, calls)
-        return self._finish(text, calls, payload, data)
+        return self._finish(text, calls, payload, data, reply)
 
     def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
         payload = self._payload(adapt_messages_for_text_mode(messages, tools))
         data = self._request(payload)
         message = data["choices"][0]["message"]
-        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        reply = split_message(message, strip=self._config.strip_reasoning)
+        text = reply.text
         calls: list[dict] = []
         if tools:
             call, text = parse_text_tool_call(text)
             if call is not None:
                 calls = [self._new_call(call["tool"], call["args"])]
-        return self._finish(text, calls, payload, data)
+        return self._finish(text, calls, payload, data, reply)
 
     def _native_calls(self, message: dict) -> list[dict]:
         calls = []
@@ -292,12 +298,18 @@ class OpenAICompatClient(LLMClient):
 
     # ---- usage ---------------------------------------------------------------------------
 
-    def _finish(self, text: str, calls: list[dict], payload: dict[str, Any], data: dict) -> LLMResponse:
+    def _finish(
+        self, text: str, calls: list[dict], payload: dict[str, Any], data: dict, reply: Reply | None = None
+    ) -> LLMResponse:
         usage = self._usage(data.get("usage"), payload, data["choices"][0]["message"])
         self.totals.prompt_tokens += usage["prompt_tokens"]
         self.totals.completion_tokens += usage["completion_tokens"]
         self.totals.total_tokens += usage["total_tokens"]
+        self.totals.reasoning_tokens += usage.get("reasoning_tokens", 0)
         self.totals.calls += 1
+        if reply is not None and reply.found:
+            self.reasoning_seen = True
+            self.totals.reasoning_replies += 1
         return LLMResponse(text=text, tool_calls=calls, usage=usage)
 
     @staticmethod
@@ -314,12 +326,17 @@ class OpenAICompatClient(LLMClient):
             completion = _tokens_from_chars(_completion_chars(message))
         if total is None:
             total = prompt + completion
-        return {
+        usage = {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": total,
             "estimated": estimated,
         }
+        details = reported.get("completion_tokens_details")
+        reasoning = _as_count(details.get("reasoning_tokens")) if isinstance(details, dict) else None
+        if reasoning is not None:
+            usage["reasoning_tokens"] = reasoning  # informational: providers already include it in completion_tokens
+        return usage
 
     # ---- errors --------------------------------------------------------------------------
 
@@ -419,8 +436,11 @@ def _prompt_chars(payload: dict[str, Any]) -> int:
 
 
 def _completion_chars(message: dict) -> int:
-    content = message.get("content")
-    total = len(content) if isinstance(content, str) else 0
+    """Characters the model generated, reasoning included: it is billed even though it is not kept."""
+    total = len(content_text(message.get("content")))
+    for field in ("reasoning_content", "reasoning"):
+        if isinstance(message.get(field), str):
+            total += len(message[field])
     for raw in message.get("tool_calls") or []:
         fn = raw.get("function") if isinstance(raw, dict) else None
         if isinstance(fn, dict):

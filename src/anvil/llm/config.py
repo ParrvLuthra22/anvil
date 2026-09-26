@@ -18,12 +18,14 @@ class LLMConfig:
     ``tool_mode``: ``native`` uses the provider's tool-calling API, ``text``
     describes the tools in the prompt and parses a JSON block from the reply,
     ``auto`` tries native first and falls back to text permanently.
+    ``strip_reasoning`` removes ``<think>`` blocks and reasoning fields from replies.
     """
 
     model: str
     base_url: str
     temperature: float = 0.0
     tool_mode: str = "auto"
+    strip_reasoning: bool = True
     max_attempts: int = 5
     timeout_seconds: float = 120.0
     connect_timeout_seconds: float = 10.0
@@ -58,12 +60,21 @@ class LLMConfig:
             base_url=base_url.rstrip("/"),
             temperature=_number(config, "temperature", 0.0, minimum=0.0),
             tool_mode=tool_mode,
+            strip_reasoning=_flag(config, "strip_reasoning", True),
             max_attempts=int(_number(config, "llm_max_attempts", 5, minimum=1, integer=True)),
             timeout_seconds=_number(config, "llm_timeout_seconds", 120.0, minimum=0.001),
             connect_timeout_seconds=_number(config, "llm_connect_timeout_seconds", 10.0, minimum=0.001),
             backoff_base_seconds=_number(config, "llm_backoff_base_seconds", 1.0, minimum=0.0),
             backoff_max_seconds=_number(config, "llm_backoff_max_seconds", 60.0, minimum=0.0),
         )
+
+
+def _flag(config: Mapping[str, Any], key: str, default: bool) -> bool:
+    """Read a boolean setting, rejecting anything that is not a real boolean (``"false"`` would be truthy)."""
+    value = config.get(key, default)
+    if not isinstance(value, bool):
+        raise LLMConfigError(f"'{key}' must be true or false, got {value!r}")
+    return value
 
 
 def _override(env: Mapping[str, str], name: str) -> str:
