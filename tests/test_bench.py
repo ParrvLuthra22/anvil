@@ -67,7 +67,7 @@ def test_score_instance_empty_patch(tmp_path: Path):
     run_result = {"instance_id": "test_empty", "patch_path": str(tmp_path / "missing.diff")}
     result = _score_instance(instance, run_result, tmp_path)
     assert result["resolved"] is False
-    assert result["category"] == "empty-patch"
+    assert result["category"] == "no_patch"
 
 
 def test_score_instance_patch_failed(tmp_path: Path):
@@ -93,7 +93,7 @@ def test_score_instance_patch_failed(tmp_path: Path):
     work_dir.mkdir()
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is False
-    assert result["category"] == "patch-failed"
+    assert result["category"] == "patch_does_not_apply"
 
 
 def test_score_instance_syntax_error(tmp_path: Path):
@@ -118,7 +118,7 @@ def test_score_instance_syntax_error(tmp_path: Path):
     work_dir.mkdir()
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is False
-    assert result["category"] == "syntax-error"
+    assert result["category"] == "patch_does_not_apply"
 
 
 def test_score_instance_regression(tmp_path: Path):
@@ -150,7 +150,7 @@ def test_score_instance_regression(tmp_path: Path):
     work_dir.mkdir()
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is False
-    assert result["category"] == "regression"
+    assert result["category"] == "p2p_regression"
 
 
 def test_run_bench_helpers(tmp_path: Path):
