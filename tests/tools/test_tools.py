@@ -266,11 +266,20 @@ class TestRunCmdTool:
     def test_absolute_write_blocked(self, sandbox):
         result = RunCmdTool().run({"cmd": "echo 'x' > /tmp/x"}, sandbox)
         assert not result.ok
-        assert "absolute paths" in result.output
+        assert "/tmp/x" in result.output
         assert "rejected" in result.output.lower()
         
         result2 = RunCmdTool().run({"cmd": "cat x >> /etc/hosts"}, sandbox)
         assert not result2.ok
+
+    def test_dev_null_allowed(self, sandbox):
+        result = RunCmdTool().run({"cmd": "echo 'x' 2> /dev/null"}, sandbox)
+        assert result.ok
+
+    def test_worktree_absolute_write_allowed(self, sandbox):
+        worktree_path = sandbox.root / "output.log"
+        result = RunCmdTool().run({"cmd": f"echo 'x' > {worktree_path}"}, sandbox)
+        assert result.ok
 
     def test_pip_install_without_venv_blocked(self, sandbox):
         # sandbox doesn't have .anvil_venv by default in this fixture

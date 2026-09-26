@@ -57,11 +57,16 @@ class RunCmdTool:
             )
         # Check for absolute path writes (e.g., > /tmp/foo, >> /etc/hosts)
         import re
-        if re.search(r'>\s*/', cmd) or re.search(r'>>\s*/', cmd):
-            return ToolResult(
-                ok=False,
-                output="Command rejected: writing to absolute paths outside the worktree is not allowed."
-            )
+        for match in re.finditer(r'(?:>>?|&>)\s*(/[^\s;&|]+)', cmd):
+            path = match.group(1)
+            # Allow /dev/null and paths inside the sandbox root
+            if path == "/dev/null":
+                continue
+            if not path.startswith(str(sandbox.root) + "/"):
+                return ToolResult(
+                    ok=False,
+                    output=f"Command rejected: writing to absolute path '{path}' outside the worktree is not allowed."
+                )
         if "pip install" in cmd:
             # Check if venv exists by probing the sandbox for `.anvil_venv/bin`
             # The sandbox interface has no direct venv checker on `Sandbox` protocol,
