@@ -7,6 +7,7 @@ an existing one), so the REPRODUCE phase needs this. It can only write inside
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 
 from anvil.agent.outputs import SCRATCH_DIR
@@ -63,3 +64,42 @@ def scratch_path(raw: str) -> str | None:
         return None
     parts = path.parts if path.parts[:1] == (SCRATCH_DIR,) else (SCRATCH_DIR, *path.parts)
     return "/".join(parts) if len(parts) > 1 else None
+
+
+# ---- does a failing command's output report the bug the issue describes? ---------------------------------------------
+
+# Failures that say the script or the environment is broken rather than the code under test. They only count as the
+# reported bug when the issue itself names that same error.
+_ENVIRONMENT_ERRORS = (
+    "modulenotfounderror", "importerror", "syntaxerror", "indentationerror", "taberror", "nameerror",
+    "command not found", "no such file or directory", "can't open file", "permission denied",
+    "cannot find module", "cannot find package", "undefined:",
+)
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_PATH_LIKE = re.compile(r"\S*[/\\]\S*")  # a file path in a traceback says where the script lives, not what is wrong
+_COMMON = frozenset(
+    """the and for with that this are was not but you its has have from into when then than such also can should would could
+    does doesn don instead returns return expected actual got get error errors exception traceback file files line lines most
+    recent call calls last module assert assertion assertionerror fail failed failing failure test tests true false none null
+    print python python3 anvil repro script exit code stdout stderr raise raised import def class self use using used bug issue
+    output result results value values should must shall may might will just only some any all each every been being were
+    """.split()
+)
+
+
+def _words(text: str) -> set[str]:
+    return {w.lower() for w in _WORD.findall(_PATH_LIKE.sub(" ", text))} - _COMMON
+
+
+def reports_the_issue(output: str, issue_text: str) -> bool:
+    """Whether a failing command's ``output`` looks like the failure ``issue_text`` describes.
+
+    Two conditions. The output must not be an environment or script error (a typo, a missing import, a wrong path) unless the
+    issue names that very error. And it must share at least one distinctive word with the issue (an identifier, a message
+    word; common words, tracebacks' boilerplate and file paths do not count).
+    """
+    out, issue = output.lower(), issue_text.lower()
+    if any(term in out and term not in issue for term in _ENVIRONMENT_ERRORS):
+        return False
+    return bool(_words(output) & _words(issue_text))
+

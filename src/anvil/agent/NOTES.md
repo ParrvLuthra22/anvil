@@ -96,6 +96,15 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
   Without a usable checkpoint nothing can be reverted, and the report says that instead. This exists because a real model
   fixed the bug during REPRODUCE, after which the harness's own repro run exited 0 and the model spent the rest of the phase
   trying to reproduce a bug it had fixed.
+- **A repro the model showed but never confirmed is adopted.** If REPRODUCE ends without a confirmed repro (closed at its cap,
+  the step limit, a stall or a loop; not when the model gave up) the harness looks at the model's own `run_cmd` calls, newest
+  first, and takes the first that (a) ran a script under `.anvil/`, (b) failed, not by timeout or "command not found", (c) has
+  output that reports the issue's bug (`agent/repro.py: reports_the_issue`: not a typo, missing import or wrong path unless the
+  issue names that very error; sharing at least one distinctive word with the issue, file paths and common words not counting)
+  and (d) fails again, with matching output, when the harness runs it itself on the clean tree. At most two commands are run
+  again. The result is `Reproduced before patching: yes`, the command becomes `repro_cmd` for PATCH and VERIFY, and both the
+  report and a `system` message say it was adopted. Found in real runs: a valid failing repro by call 3 to 5, then 25 calls (or a
+  forced close ignored) and "not reproduced, confidence low" for a patch that was correct.
 - A checkpoint result that is empty, `None` or starts with `error` is a failed checkpoint (a limitation is recorded and
   no rollback will be attempted). If a sandbox's checkpoint empties the working tree (a `git stash` does), the edited files
   are written back through the Sandbox interface; if that is impossible the checkpoint is undone and reported as failed.

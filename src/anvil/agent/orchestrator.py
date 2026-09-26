@@ -44,7 +44,7 @@ from anvil.agent.prompts import (
     verify_kickoff,
 )
 from anvil.agent.recovery import Checkpointer, ErrorClass
-from anvil.agent.repro import WriteReproTool
+from anvil.agent.repro import WriteReproTool, reports_the_issue
 from anvil.agent.sanity import PatchCheck, inspect_patch, issue_is_about_tests
 from anvil.agent.settings import AgentSettings
 from anvil.agent.state import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, CheckRun, RunState
@@ -55,6 +55,8 @@ from anvil.events import EventBus, Phase
 from anvil.llm.client import LLMClient, make_client
 from anvil.llm.errors import LLMError
 from anvil.sandbox.base import ExecResult
+
+MAX_ADOPTION_RERUNS = 2  # how many failing commands the harness will run again when it looks for a repro to adopt
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config.yaml"
 
@@ -300,10 +302,46 @@ class Orchestrator:
         self._reproduce_ref = self._checkpoint("reproduce-start")
         outcome = self._run_phase(Phase.REPRODUCE, phase_kickoff(Phase.REPRODUCE), gate=self._repro_gate, pin=True)
         self._undo_source_edits()
+        if not self._state.repro_confirmed and outcome.status is not PhaseStatus.GAVE_UP:
+            self._adopt_failing_command(outcome)
         if not self._state.repro_confirmed:
             self._state.limit(
                 f"The bug was not reproduced ({outcome.status.value}: {clip_head(outcome.summary, 200)}); confidence is capped at low."
             )
+
+    def _adopt_failing_command(self, outcome: PhaseOutcome) -> None:
+        """REPRODUCE ended without a confirmed repro: adopt the model's own failing command as the repro if it qualifies.
+
+        A model often shows the bug and then never says it is done (real runs: 25 calls, or the forced close ignored). The
+        command it ran is the evidence, so the harness does not throw it away. The most recent ``run_cmd`` qualifies when it
+        ran a script under ``.anvil/``, failed (not a timeout, not "command not found"), and its output reports the bug the
+        issue describes (``reports_the_issue``: not a typo or a missing import, sharing words with the issue). The harness
+        then runs it itself on the clean tree, as it does for ``phase_done``, and adopts it only if it fails again the same
+        way. A model that gave up is taken at its word and nothing is adopted.
+        """
+        issue = self._state.issue
+        issue_text = f"{issue.title}\n{issue.body}" if issue else ""
+        tried = 0
+        for record in reversed(outcome.records):
+            if record.tool != "run_cmd" or record.ok or tried == MAX_ADOPTION_RERUNS:
+                continue
+            cmd = str(record.args.get("cmd") or "").strip()
+            if not cmd or SCRATCH_DIR not in cmd or record.meta.get("timed_out") or record.meta.get("exit_code") in (126, 127):
+                continue
+            if not reports_the_issue(record.output, issue_text):
+                continue
+            tried += 1
+            result, text = self._run_repro(cmd)
+            if result.timed_out or result.exit_code in (0, 126, 127) or not reports_the_issue(text, issue_text):
+                continue
+            self._state.repro_cmd, self._state.repro_output, self._state.repro_confirmed = cmd, self._trim(text), True
+            note = (
+                f"REPRODUCE ended without the model's phase_done ({outcome.status.value}); the harness adopted its failing "
+                f"command `{cmd}` as the repro: it fails with output that matches the issue, and fails again when the harness runs it."
+            )
+            self._state.limit(note)
+            self._emitter.message("system", note)
+            return
 
     def _undo_source_edits(self) -> list[str]:
         """Revert what the model changed outside ``.anvil/`` since REPRODUCE began; returns the files it had changed.
