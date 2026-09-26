@@ -206,15 +206,34 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
                 continue
 
         # 3. Can it create a venv and does it have required modules?
-        probe_dir = f".probe_{interp.replace('.', '_')}"
-        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
-        venv_create = sandbox.exec(f"{interp} -m venv {probe_dir}", timeout=30)
-        if venv_create.exit_code != 0:
-            log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
+        temp_result = sandbox.exec(
+            f'{interp} -c "import tempfile; print(tempfile.mkdtemp(prefix=\'anvil-probe-\'))"',
+            timeout=10,
+        )
+        if temp_result.exit_code != 0 or temp_result.timed_out:
+            log.debug("Skipping %s — cannot create temporary probe directory: %s", interp, temp_result.stderr[:100])
             continue
-            
-        verify = sandbox.exec(f"{probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'", timeout=10)
-        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
+        probe_dir = temp_result.stdout.strip()
+        if not probe_dir:
+            log.debug("Skipping %s — temporary probe directory path was empty", interp)
+            continue
+
+        try:
+            quoted_probe_dir = shlex.quote(probe_dir)
+            venv_create = sandbox.exec(f"{interp} -m venv {quoted_probe_dir}", timeout=30)
+            if venv_create.exit_code != 0 or venv_create.timed_out:
+                log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
+                continue
+
+            verify = sandbox.exec(
+                f"{quoted_probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'",
+                timeout=10,
+            )
+        finally:
+            try:
+                sandbox.exec(f"rm -rf -- {shlex.quote(probe_dir)}", timeout=10)
+            except Exception:  # noqa: BLE001 - cleanup must not hide probe failures
+                log.warning("Could not remove temporary interpreter probe %s", probe_dir)
         
         if verify.exit_code != 0:
             log.debug("Skipping %s — broken interpreter (missing ensurepip, pyexpat, or ssl): %s", interp, verify.stderr[:100])

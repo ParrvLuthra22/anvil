@@ -97,10 +97,10 @@ def _py_probe_ok() -> list:
     return [
         _exec_result(0),  # command -v
         _exec_result(0, stdout="3.13\n"),  # version
-        _exec_result(0),  # rm -rf probe_dir
+        _exec_result(0, stdout="/tmp/anvil-probe-test\n"),  # tempfile.mkdtemp
         _exec_result(0),  # venv create
         _exec_result(0),  # verify python -c import
-        _exec_result(0),  # rm -rf probe_dir
+        _exec_result(0),  # finally: rm -rf temporary probe
     ]
 
 
@@ -232,10 +232,10 @@ class TestPickPythonInterpreter:
             _exec_result(1),  # python3.9 not found
             _exec_result(0),  # python3 found
             _exec_result(0, stdout="3.9\n"),  # python3 version
-            _exec_result(0),  # rm -rf
+            _exec_result(0, stdout="/tmp/anvil-probe-3\n"),  # tempfile.mkdtemp
             _exec_result(0),  # python3 venv create ok
             _exec_result(0),  # verify python -c import ok
-            _exec_result(0),  # rm -rf
+            _exec_result(0),  # finally: remove temporary probe
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3"
@@ -251,33 +251,66 @@ class TestPickPythonInterpreter:
         sb = _make_sandbox([
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # python3.13 version
-            _exec_result(0),  # rm -rf
+            _exec_result(0, stdout="/tmp/anvil-probe-13\n"),  # tempfile.mkdtemp
             _exec_result(1),  # python3.13 -m venv create fails
+            _exec_result(0),  # finally: remove failed probe
             _exec_result(0),  # python3.12 found
             _exec_result(0, stdout="3.12\n"),  # python3.12 version
-            _exec_result(0),  # rm -rf
+            _exec_result(0, stdout="/tmp/anvil-probe-12\n"),  # tempfile.mkdtemp
             _exec_result(0),  # python3.12 venv create ok
             _exec_result(0),  # verify import ok
-            _exec_result(0),  # rm -rf
+            _exec_result(0),  # finally: remove probe
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3.12"
+
+    def test_venv_failure_leaves_repo_root_clean(self, tmp_path):
+        """A failed venv probe is external to the repo and removed in finally."""
+        sb = MagicMock()
+        sb.root = tmp_path
+        probe_dir = tmp_path.parent / "anvil-probe-failure"
+        commands = []
+
+        def mock_exec(cmd, **kwargs):
+            commands.append(cmd)
+            if cmd.startswith("command -v"):
+                return _exec_result(0)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.13\n")
+            if "tempfile.mkdtemp" in cmd:
+                probe_dir.mkdir()
+                return _exec_result(0, stdout=f"{probe_dir}\n")
+            if "-m venv" in cmd:
+                target = Path(cmd.rsplit(" ", 1)[-1])
+                if not target.is_absolute():
+                    (tmp_path / target).mkdir()
+                return _exec_result(1, stderr="ensurepip unavailable")
+            if cmd.startswith("rm -rf --"):
+                probe_dir.rmdir()
+                return _exec_result(0)
+            return _exec_result(1)
+
+        sb.exec.side_effect = mock_exec
+        assert _pick_python_interpreter(sb) is None
+        assert list(tmp_path.iterdir()) == []
+        assert not probe_dir.exists()
+        assert any("-m venv" in cmd and str(probe_dir) in cmd for cmd in commands)
 
     def test_skips_when_missing_modules(self):
         """Skips interpreter that has broken ensurepip/pyexpat/ssl."""
         sb = _make_sandbox([
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # version
-            _exec_result(0),  # rm -rf
+            _exec_result(0, stdout="/tmp/anvil-probe-13\n"),  # tempfile.mkdtemp
             _exec_result(0),  # venv create ok
             _exec_result(1),  # verify import fails
-            _exec_result(0),  # rm -rf
+            _exec_result(0),  # finally: remove probe
             _exec_result(0),  # python3.12 found
             _exec_result(0, stdout="3.12\n"),  # version
-            _exec_result(0),  # rm -rf
+            _exec_result(0, stdout="/tmp/anvil-probe-12\n"),  # tempfile.mkdtemp
             _exec_result(0),  # venv create ok
             _exec_result(0),  # verify import ok
-            _exec_result(0),  # rm -rf
+            _exec_result(0),  # finally: remove probe
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3.12"
@@ -301,6 +334,8 @@ class TestPickPythonInterpreter:
                                 ver = "3.8"  # fallback
                             return _exec_result(0, stdout=f"{ver}\n")
                     return _exec_result(0, stdout="3.9\n")
+                if "tempfile.mkdtemp" in cmd:
+                    return _exec_result(0, stdout="/tmp/anvil-probe-spec\n")
                 if "venv" in cmd or "import ensurepip" in cmd or "rm -rf" in cmd:
                     return _exec_result(0)
                 if "git show" in cmd:
