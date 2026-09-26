@@ -45,7 +45,16 @@ class DepsResult:
     """True if installation was skipped (no toolchain / no install cmd)."""
 
 
-def ensure_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
+def get_commit_date(sandbox: Sandbox, ref: str = "HEAD") -> str:
+    """Return the commit date of `ref` as an ISO 8601 datetime string."""
+    result = sandbox.exec(f"git show -s --format=%cI {ref}")
+    if result.exit_code != 0:
+        log.warning("Could not get commit date for %r: %s", ref, result.stderr)
+        return ""
+    return result.stdout.strip()
+
+
+def ensure_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
     """Install dependencies required to build and test the repo.
 
     Never raises — all errors are captured in :attr:`DepsResult.report`.
@@ -53,24 +62,28 @@ def ensure_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
     Args:
         sandbox: An open :class:`~anvil.sandbox.base.Sandbox` instance.
         profile: The :class:`~anvil.repo.profile.RepoProfile` for the repo.
+        as_of: Optional ISO 8601 datetime for dependency pinning. If None, derived from HEAD.
 
     Returns:
         A :class:`DepsResult`.
     """
+    if as_of is None:
+        as_of = get_commit_date(sandbox, "HEAD")
+        
     try:
-        return _ensure_deps_inner(sandbox, profile)
+        return _ensure_deps_inner(sandbox, profile, as_of=as_of)
     except Exception as exc:  # noqa: BLE001
         return DepsResult(ok=False, report=f"ensure_deps internal error: {exc}")
 
 
-def _ensure_deps_inner(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
+def _ensure_deps_inner(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
     if not profile.install_cmd:
         return DepsResult(ok=True, report="No install command detected — skipping.", skipped=True)
 
     lang = profile.primary_language
 
     if lang == "python":
-        return _ensure_python_deps(sandbox, profile)
+        return _ensure_python_deps(sandbox, profile, as_of=as_of)
     if lang in ("javascript", "typescript"):
         return _ensure_js_deps(sandbox, profile)
     if lang == "go":
@@ -161,10 +174,23 @@ def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
                 )
                 continue
 
-        # 3. Can it create a venv?
-        venv_probe = sandbox.exec(f"{interp} -m venv --help", timeout=10)
-        if venv_probe.exit_code != 0:
-            log.debug("Skipping %s — cannot create venv", interp)
+        # 3. Can it ACTUALLY create a venv and import basic modules?
+        # On some macOS Homebrew installations, python3.13 and 3.12 have broken pyexpat/ssl.
+        # We verify by creating a probe venv and running imports.
+        probe_venv = ".probe_venv"
+        sandbox.exec(f"rm -rf {probe_venv}")
+        venv_create = sandbox.exec(f"{interp} -m venv {probe_venv}", timeout=10)
+        if venv_create.exit_code != 0:
+            log.debug("Skipping %s — failed to create venv: %s", interp, venv_create.stderr[:100])
+            continue
+            
+        import_check = sandbox.exec(
+            f"{probe_venv}/bin/python -c 'import pyexpat, ssl'", timeout=10
+        )
+        sandbox.exec(f"rm -rf {probe_venv}")
+        
+        if import_check.exit_code != 0:
+            log.debug("Skipping %s — venv created but failed to import pyexpat/ssl: %s", interp, import_check.stderr[:100])
             continue
 
         log.info("Selected Python interpreter: %s", interp)
@@ -173,7 +199,7 @@ def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
     return None
 
 
-def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
+def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
     """Create an isolated venv using the best available interpreter and install deps."""
     venv_path = _VENV_DIR
     venv_python = f"{venv_path}/bin/python"
@@ -206,13 +232,24 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
             ),
         )
 
-    # Step 2: Upgrade pip silently
-    sandbox.exec(f"{venv_pip} install --quiet --upgrade pip", timeout=60)
+    # Step 2: Upgrade pip and install uv silently
+    sandbox.exec(f"{venv_pip} install --quiet --upgrade pip uv", timeout=60)
 
-    # Step 3: Run the install command using the venv's pip
+    # Step 3: Run the install command using the venv's pip or uv
     install_cmd = profile.install_cmd
     assert install_cmd is not None
-    install_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
+    
+    # Try uv if available
+    uv_path = f"{venv_path}/bin/uv"
+    uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
+    if uv_probe.exit_code == 0:
+        uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
+        if as_of:
+            uv_cmd += f" --exclude-newer {as_of}"
+        install_cmd = install_cmd.replace("pip install", uv_cmd, 1)
+    else:
+        # Fallback to pip
+        install_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
 
     log.info("Running Python install: %s", install_cmd)
     result = sandbox.exec(install_cmd, timeout=_INSTALL_TIMEOUT)

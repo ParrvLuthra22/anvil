@@ -84,11 +84,14 @@ def _sanitized_env() -> dict[str, str]:
 
     Strips any var whose name matches ``_SECRET_KEY_RE`` (keys, tokens,
     passwords, credentials, plus AWS/GitHub/AI prefixes).
-    Also injects ``PYTHONDONTWRITEBYTECODE=1``.
+    Also injects ``PYTHONDONTWRITEBYTECODE=1``, ``PIP_REQUIRE_VIRTUALENV=1``,
+    and ``PYTHONNOUSERSITE=1``.
     """
     env = {k: v for k, v in os.environ.items()
            if not _SECRET_KEY_RE.search(k)}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PIP_REQUIRE_VIRTUALENV"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
     return env
 
 

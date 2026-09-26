@@ -44,6 +44,40 @@ class RunCmdTool:
         if not cmd:
             return ToolResult(ok=False, output="'cmd' argument is required.")
 
+        # --- Command safety layer ---
+        if "sudo " in cmd:
+            return ToolResult(
+                ok=False,
+                output="Command rejected: 'sudo' is not allowed in the sandbox."
+            )
+        if "cd .." in cmd:
+            return ToolResult(
+                ok=False,
+                output="Command rejected: navigating outside the sandbox ('cd ..') is not allowed."
+            )
+        # Check for absolute path writes (e.g., > /tmp/foo, >> /etc/hosts)
+        import re
+        if re.search(r'>\s*/', cmd) or re.search(r'>>\s*/', cmd):
+            return ToolResult(
+                ok=False,
+                output="Command rejected: writing to absolute paths outside the worktree is not allowed."
+            )
+        if "pip install" in cmd:
+            # Check if venv exists by probing the sandbox for `.anvil_venv/bin`
+            # The sandbox interface has no direct venv checker on `Sandbox` protocol,
+            # but we can check if `.anvil_venv` directory exists via file path or assume
+            # it's active. Wait, PIP_REQUIRE_VIRTUALENV=1 ensures safety, but we want
+            # a clearer message. Let's check if `.anvil_venv` exists in the sandbox root.
+            venv_path = sandbox.root / ".anvil_venv"
+            if not venv_path.exists():
+                return ToolResult(
+                    ok=False,
+                    output=(
+                        "Command rejected: 'pip install' is not allowed outside a virtual environment. "
+                        "The repository's dependencies have not been installed yet, or there is no active venv."
+                    )
+                )
+
         result = sandbox.exec(cmd, timeout=timeout)
 
         parts: list[str] = []
