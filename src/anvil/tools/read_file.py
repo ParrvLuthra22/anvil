@@ -45,6 +45,20 @@ class ReadFileTool:
         if not path:
             return ToolResult(ok=False, output="'path' argument is required.")
 
+        if start is None and end is None:
+            try:
+                size = (sandbox.root / path).stat().st_size
+                if size > 64 * 1024:
+                    return ToolResult(
+                        ok=False,
+                        output=(
+                            f"File {path!r} is too large ({size} bytes) to read entirely. "
+                            "Please specify 'start' and 'end' line ranges."
+                        ),
+                    )
+            except OSError:
+                pass
+
         try:
             content = sandbox.read_file(path, start=start, end=end)
         except PermissionError as exc:

@@ -289,7 +289,7 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     env["GIT_TERMINAL_PROMPT"] = "0"
 
     if not git_ref:
-        cmd = ["git", "clone", "--depth", "1", clone_url, str(dest)]
+        cmd = ["git", "clone", "--filter=blob:none", "--depth", "1", clone_url, str(dest)]
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -313,7 +313,7 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
         raise RuntimeError(f"git init timed out for {dest}")
 
     def _fetch(depth: int) -> subprocess.CompletedProcess:
-        fetch_args = ["git", "fetch", f"--depth={depth}", clone_url, git_ref]
+        fetch_args = ["git", "fetch", "--filter=blob:none", f"--depth={depth}", clone_url, git_ref]
         try:
             return subprocess.run(
                 fetch_args, cwd=dest, capture_output=True, text=True,
