@@ -84,6 +84,7 @@ def make_default_registry(profile=None) -> ToolRegistry:
     from anvil.tools.git_diff import GitDiffTool
     from anvil.tools.outline import OutlineTool
     from anvil.tools.find import FindSymbolTool, FindReferencesTool
+    from anvil.tools.related import RelatedTestsTool
 
     registry = ToolRegistry()
     registry.register(ListDirTool())
@@ -96,4 +97,5 @@ def make_default_registry(profile=None) -> ToolRegistry:
     registry.register(OutlineTool())
     registry.register(FindSymbolTool())
     registry.register(FindReferencesTool())
+    registry.register(RelatedTestsTool())
     return registry
