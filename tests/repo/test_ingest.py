@@ -477,6 +477,25 @@ class TestBug5IngestHardening:
             assert "--depth=1" in fetch_cmd
             assert "v2.31.0" in fetch_cmd
 
+    def test_clone_repo_parent_commit_resolution(self, tmp_path):
+        """Task 3: git_ref with ^ or ~1 strips it for fetch and uses it for checkout."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            clone_repo(ref, dest, git_ref="v2.31.0^")
+            
+            calls = mock_run.call_args_list
+            fetch_cmd = calls[1][0][0]
+            assert "fetch" in fetch_cmd
+            assert "--depth=2" in fetch_cmd
+            assert "v2.31.0" in fetch_cmd
+            assert "v2.31.0^" not in fetch_cmd
+            
+            checkout_cmd = calls[2][0][0]
+            assert "checkout" in checkout_cmd
+            assert "FETCH_HEAD^" in checkout_cmd
+
     def test_clone_repo_real_sha(self, tmp_path):
         """Task 1: clone_repo(git_ref=<SHA>) on a real local repo should work via fetch."""
         import subprocess
