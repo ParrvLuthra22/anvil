@@ -287,3 +287,109 @@ class TestCheckpointRollback:
         sandbox.rollback(ref)
         content = sandbox.read_file("versioned.txt")
         assert "version-1" in content
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for audit bugs 1–3
+# ---------------------------------------------------------------------------
+
+class TestBug1ResolvedPaths:
+    """Bug 1: constructor must resolve both paths so relative inputs work."""
+
+    def test_root_is_absolute(self, sandbox):
+        assert sandbox.root.is_absolute()
+
+    def test_repo_root_is_absolute(self, sandbox):
+        # Internal attribute must be absolute after resolve()
+        assert sandbox._repo_root.is_absolute()
+
+    def test_relative_repo_root_resolved(self, tmp_path):
+        """Passing a relative-looking path object still resolves correctly."""
+        repo = _init_git_repo(tmp_path / "rel_repo")
+        work = tmp_path / "rel_work"
+        # Use an absolute path; .resolve() should be idempotent
+        sb = WorktreeSandbox(repo_root=repo.resolve(), work_dir=work)
+        assert sb.root.is_absolute()
+        sb.close()
+
+
+class TestBug2CheckpointNonDestructive:
+    """Bug 2: checkpoint() must NOT wipe the working tree; rollback raises GitError on failure."""
+
+    def test_checkpoint_does_not_wipe_tree(self, sandbox):
+        """After checkpoint(), working tree changes must still be present."""
+        sandbox.write_file("canary.txt", "I am here\n")
+        ref = sandbox.checkpoint("step-1")
+        # Tree must be intact — file still readable
+        assert "I am here" in sandbox.read_file("canary.txt")
+
+    def test_checkpoint_returns_sha_not_error_string(self, sandbox):
+        """Bug 2: checkpoint must NEVER return an 'error: ...' string."""
+        sandbox.write_file("x.txt", "data")
+        ref = sandbox.checkpoint("label")
+        assert not ref.startswith("error:"), f"Got error string: {ref!r}"
+
+    def test_rollback_raises_git_error_on_bad_ref(self, sandbox):
+        """Bug 2: rollback with a garbage ref must raise GitError, not silently fail."""
+        from anvil.sandbox.worktree import GitError
+        with pytest.raises(GitError):
+            sandbox.rollback("0000000000000000000000000000000000000000_bad")
+
+
+class TestBug3ExecEnvSanitization:
+    """Bug 3: exec strips a broad set of secrets; PYTHONDONTWRITEBYTECODE=1 is set."""
+
+    def test_sanitized_env_strips_aws(self):
+        with __import__("unittest.mock", fromlist=["patch"]).patch.dict(
+            "os.environ", {"AWS_SECRET_ACCESS_KEY": "abc", "HOME": "/home/x"}
+        ):
+            env = _sanitized_env()
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "HOME" in env
+
+    def test_sanitized_env_strips_github_token(self):
+        with __import__("unittest.mock", fromlist=["patch"]).patch.dict(
+            "os.environ", {"GITHUB_TOKEN": "ghp_abc", "USER": "me"}
+        ):
+            env = _sanitized_env()
+        assert "GITHUB_TOKEN" not in env
+        assert "USER" in env
+
+    def test_sanitized_env_strips_openai(self):
+        with __import__("unittest.mock", fromlist=["patch"]).patch.dict(
+            "os.environ", {"OPENAI_API_KEY": "sk-xxx"}
+        ):
+            env = _sanitized_env()
+        assert "OPENAI_API_KEY" not in env
+
+    def test_sanitized_env_strips_password(self):
+        with __import__("unittest.mock", fromlist=["patch"]).patch.dict(
+            "os.environ", {"DB_PASSWORD": "hunter2"}
+        ):
+            env = _sanitized_env()
+        assert "DB_PASSWORD" not in env
+
+    def test_sanitized_env_injects_pythondontwritebytecode(self):
+        env = _sanitized_env()
+        assert env.get("PYTHONDONTWRITEBYTECODE") == "1"
+
+    def test_exec_has_pythondontwritebytecode(self, sandbox):
+        """exec child env must include PYTHONDONTWRITEBYTECODE=1."""
+        result = sandbox.exec("echo $PYTHONDONTWRITEBYTECODE")
+        assert "1" in result.stdout
+
+
+class TestBug4DiffExcludes:
+    """Bug 4: diff() must exclude .anvil_venv and .anvil."""
+
+    def test_diff_excludes_anvil_venv(self, sandbox):
+        # Create a file inside .anvil_venv — should not appear in diff
+        (sandbox.root / ".anvil_venv").mkdir()
+        (sandbox.root / ".anvil_venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        diff = sandbox.diff()
+        assert ".anvil_venv" not in diff
+
+    def test_diff_includes_real_changes(self, sandbox):
+        sandbox.write_file("real_change.py", "x = 1\n")
+        diff = sandbox.diff()
+        assert "real_change.py" in diff

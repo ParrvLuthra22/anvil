@@ -136,7 +136,9 @@ class TestFetchIssue:
 
         ref = fetch_issue(self._ref())
 
-        assert "rate-limit" in ref.body.lower() or "403" in ref.body
+        # Bug 5: error goes to fetch_error, body stays empty
+        assert ref.body == ""
+        assert "rate" in ref.fetch_error.lower() or "403" in ref.fetch_error
         assert ref.title == ""  # not filled in
 
     @patch("anvil.repo.ingest._http_client")
@@ -150,7 +152,9 @@ class TestFetchIssue:
 
         ref = fetch_issue(self._ref())
 
-        assert "404" in ref.body or "not found" in ref.body.lower()
+        # Bug 5: error goes to fetch_error, body stays empty
+        assert ref.body == ""
+        assert "404" in ref.fetch_error or "not found" in ref.fetch_error.lower()
 
     @patch("anvil.repo.ingest._http_client")
     def test_network_error_returns_ref(self, mock_client_factory):
@@ -163,7 +167,9 @@ class TestFetchIssue:
 
         ref = fetch_issue(self._ref())
 
-        assert "network error" in ref.body.lower() or "connection" in ref.body.lower()
+        # Bug 5: error goes to fetch_error, body stays empty
+        assert ref.body == ""
+        assert ref.fetch_error != ""
 
     @patch("anvil.repo.ingest._http_client")
     def test_timeout_returns_ref(self, mock_client_factory):
@@ -176,7 +182,8 @@ class TestFetchIssue:
 
         ref = fetch_issue(self._ref())
 
-        assert "timeout" in ref.body.lower()
+        assert "timeout" in ref.fetch_error.lower()
+        assert ref.body == ""
 
     @patch("anvil.repo.ingest._http_client")
     def test_empty_body_normalised(self, mock_client_factory):
@@ -248,3 +255,147 @@ class TestCloneRepo:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             clone_repo(parse_issue_url("https://github.com/psf/requests/issues/1"), dest)
         assert dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Bug 5 (ingest hardening)
+# ---------------------------------------------------------------------------
+
+class TestBug5IngestHardening:
+    """Bug 5: structured errors, GITHUB_TOKEN, GIT_TERMINAL_PROMPT, clone timeout."""
+
+    # -- fetch_issue: structured error field --
+
+    def test_403_sets_fetch_error_not_body(self):
+        """Bug 5: 403 must set fetch_error, not contaminate body."""
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest._http_client") as mock_factory:
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=cm)
+            cm.__exit__ = MagicMock(return_value=False)
+            resp = MagicMock()
+            resp.status_code = 403
+            cm.get.return_value = resp
+            mock_factory.return_value = cm
+            out = fetch_issue(ref)
+        assert out.body == ""          # body must be clean
+        assert "403" in out.fetch_error or "rate" in out.fetch_error.lower()
+
+    def test_404_sets_fetch_error_not_body(self):
+        """Bug 5: 404 must set fetch_error, not contaminate body."""
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest._http_client") as mock_factory:
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=cm)
+            cm.__exit__ = MagicMock(return_value=False)
+            resp = MagicMock()
+            resp.status_code = 404
+            cm.get.return_value = resp
+            mock_factory.return_value = cm
+            out = fetch_issue(ref)
+        assert out.body == ""
+        assert "404" in out.fetch_error or "not found" in out.fetch_error.lower()
+
+    def test_network_error_sets_fetch_error(self):
+        """Bug 5: network error sets fetch_error cleanly."""
+        import httpx
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest._http_client") as mock_factory:
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=cm)
+            cm.__exit__ = MagicMock(return_value=False)
+            cm.get.side_effect = httpx.ConnectError("connection refused")
+            mock_factory.return_value = cm
+            out = fetch_issue(ref)
+        assert out.body == ""
+        assert out.fetch_error != ""
+
+    def test_github_token_attached_as_bearer(self):
+        """Bug 5: GITHUB_TOKEN env var is used as Bearer auth header, never logged."""
+        import os
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_testtokenxyz"}):
+            with patch("anvil.repo.ingest.httpx.Client") as mock_client_cls:
+                mock_client_cls.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+                from anvil.repo.ingest import _http_client
+                _http_client()
+                _, kwargs = mock_client_cls.call_args
+                headers = kwargs.get("headers", {})
+                # Must attach Authorization header
+                assert "Authorization" in headers
+                assert "ghp_testtokenxyz" in headers["Authorization"]
+                # Token must NOT appear in Accept or version headers (no logging)
+                assert "ghp_testtokenxyz" not in str(kwargs.get("timeout", ""))
+
+    def test_no_github_token_no_auth_header(self):
+        """Without GITHUB_TOKEN, no Authorization header is sent."""
+        import os
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("anvil.repo.ingest.httpx.Client") as mock_client_cls:
+                mock_client_cls.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+                from anvil.repo.ingest import _http_client
+                _http_client()
+                _, kwargs = mock_client_cls.call_args
+                headers = kwargs.get("headers", {})
+                assert "Authorization" not in headers
+
+    # -- clone_repo: GIT_TERMINAL_PROMPT, timeout, git_ref --
+
+    def test_clone_sets_git_terminal_prompt_zero(self, tmp_path):
+        """Bug 5: GIT_TERMINAL_PROMPT=0 must be in subprocess env."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            clone_repo(ref, dest)
+            _, kwargs = mock_run.call_args
+            env = kwargs.get("env", {})
+            assert env.get("GIT_TERMINAL_PROMPT") == "0"
+
+    def test_clone_passes_timeout(self, tmp_path):
+        """Bug 5: subprocess.run must be called with a timeout."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            clone_repo(ref, dest)
+            _, kwargs = mock_run.call_args
+            assert kwargs.get("timeout") is not None
+
+    def test_clone_timeout_raises_runtime_error(self, tmp_path):
+        """Bug 5: TimeoutExpired must surface as RuntimeError (not hang)."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=60)
+            with pytest.raises(RuntimeError, match="timed out"):
+                clone_repo(ref, dest)
+
+    def test_clone_repo_with_git_ref(self, tmp_path):
+        """Bug 5: git_ref kwarg passes --branch to git clone."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            clone_repo(ref, dest, git_ref="v2.31.0")
+            call_args = mock_run.call_args[0][0]
+            assert "--branch" in call_args
+            assert "v2.31.0" in call_args
+
+    def test_clone_no_git_ref_no_branch_flag(self, tmp_path):
+        """Without git_ref, --branch must not appear in the command."""
+        dest = tmp_path / "r"
+        ref = parse_issue_url("https://github.com/psf/requests/issues/1")
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            clone_repo(ref, dest)
+            call_args = mock_run.call_args[0][0]
+            assert "--branch" not in call_args
+
+    def test_issue_ref_has_fetch_error_field(self):
+        """IssueRef dataclass must have a fetch_error field (default empty string)."""
+        ref = IssueRef(owner="a", repo="b", number=1, url="http://x")
+        assert hasattr(ref, "fetch_error")
+        assert ref.fetch_error == ""
