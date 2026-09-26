@@ -355,6 +355,53 @@ class TestPickPythonInterpreter:
         assert run_with_spec(">=3.13") == "python3.13"
         assert run_with_spec(">=4.0") is None
 
+    @pytest.mark.parametrize(
+        ("as_of", "available", "expected"),
+        [
+            ("2021-10-03", {"python3.13", "python3.10", "python3.9"}, "python3.9"),
+            ("2021-10-04", {"python3.13", "python3.10", "python3.9"}, "python3.10"),
+            ("2022-10-23", {"python3.13", "python3.11", "python3.10"}, "python3.10"),
+            ("2022-10-24", {"python3.13", "python3.11", "python3.10"}, "python3.11"),
+        ],
+    )
+    def test_release_date_caps_are_preferences(self, tmp_path, as_of, available, expected):
+        sb = MagicMock()
+        sb.root = tmp_path
+
+        def mock_exec(cmd, **kwargs):
+            if cmd.startswith("command -v "):
+                return _exec_result(0 if cmd.rsplit(" ", 1)[-1] in available else 1)
+            interpreter = cmd.split(" -c ", 1)[0]
+            if "import sys" in cmd:
+                return _exec_result(0, stdout=f"{interpreter.removeprefix('python')}\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout=f"/tmp/{interpreter.replace('.', '_')}-probe\n")
+            if "-m venv" in cmd or "import ensurepip" in cmd or cmd.startswith("rm -rf"):
+                return _exec_result(0)
+            return _exec_result(1)
+
+        sb.exec.side_effect = mock_exec
+        assert _pick_python_interpreter(sb, as_of=as_of) == expected
+
+    def test_newest_working_interpreter_fallback_when_date_cap_unavailable(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        available = {"python3.13"}
+
+        def mock_exec(cmd, **kwargs):
+            if cmd.startswith("command -v "):
+                return _exec_result(0 if cmd.rsplit(" ", 1)[-1] in available else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.13\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/python313-probe\n")
+            if "-m venv" in cmd or "import ensurepip" in cmd or cmd.startswith("rm -rf"):
+                return _exec_result(0)
+            return _exec_result(1)
+
+        sb.exec.side_effect = mock_exec
+        assert _pick_python_interpreter(sb, as_of="2021-05-13") == "python3.13"
+
 
 # ---------------------------------------------------------------------------
 # ensure_deps — Python repos
@@ -362,21 +409,23 @@ class TestPickPythonInterpreter:
 
 class TestEnsureDepsPython:
     def test_successful_python_install(self):
-        """Happy path: probe ok + venv + pip upgrade + pip install + framework."""
+        """A commit-dated install pins both the project and test framework."""
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),   # interp -m venv .anvil_venv
-                _exec_result(0),   # pip upgrade
-                _exec_result(1),   # test -x uv (fail, use pip) for project
-                _exec_result(0),   # pip install -e '.[dev]'
-                _exec_result(1),   # test -x uv for framework
-                _exec_result(0),   # pytest install
+                _exec_result(0),   # bootstrap pip, uv, setuptools, wheel
+                _exec_result(0),   # test -x uv for project
+                _exec_result(0),   # date-pinned project install
+                _exec_result(0),   # test -x uv for framework
+                _exec_result(0),   # date-pinned pytest install
             ]
         )
         result = ensure_deps(sb, _python_profile())
         assert result.ok
         assert result.venv_python is not None
         assert _VENV_DIR in result.venv_python
+        commands = [call.args[0] for call in sb.exec.call_args_list]
+        assert any("--exclude-newer 2025-01-01T00:00:00Z --no-build-isolation" in cmd for cmd in commands)
 
     def test_as_of_creates_venv_and_installs_pinned_pytest_without_project_command(self):
         profile = RepoProfile(
@@ -421,6 +470,30 @@ class TestEnsureDepsPython:
         assert all(not cmd.lstrip().startswith("pip install") for cmd in install_commands)
         assert "2024-11-01T20:35:12Z" in result.report
 
+    def test_failed_pinned_install_warns_and_never_falls_back_to_unpinned_pip(self, caplog):
+        sb = _make_sandbox(
+            [_exec_result(1)] * 4 + [
+                _exec_result(0),  # python3.9 found
+                _exec_result(0, stdout="3.9\n"),  # version
+                _exec_result(0, stdout="/tmp/anvil-probe-39\n"),  # tempfile.mkdtemp
+                _exec_result(0),  # venv probe succeeds
+                _exec_result(0),  # required imports succeed
+                _exec_result(0),  # finally: cleanup probe
+                _exec_result(0),  # create venv
+                _exec_result(0),  # bootstrap pip, uv, setuptools, wheel
+                _exec_result(0),  # uv available
+                _exec_result(1, stderr="legacy backend has no build_editable"),
+            ]
+        )
+
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        commands = [call.args[0] for call in sb.exec.call_args_list]
+        assert not result.ok
+        assert "date pin NOT applied" in result.report
+        assert "date pin NOT applied" in caplog.text
+        assert any("--no-build-isolation" in cmd and "--exclude-newer" in cmd for cmd in commands)
+        assert not any(".anvil_venv/bin/pip install -e" in cmd for cmd in commands)
+
     def test_no_interpreter_found_skips(self):
         """Task 3: all candidates fail → skipped with clear reason."""
         sb = _make_sandbox([_exec_result(1)] * (len(_PYTHON_CANDIDATES)*6 + 1))
@@ -440,7 +513,8 @@ class TestEnsureDepsPython:
         assert not result.ok
         assert "venv" in result.report.lower()
 
-    def test_pip_install_failure(self):
+    def test_pip_install_failure_without_cutoff(self, monkeypatch):
+        monkeypatch.setattr("anvil.repo.deps.get_commit_date", lambda *_: "")
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
@@ -454,7 +528,8 @@ class TestEnsureDepsPython:
         assert "failed" in result.report.lower()
         assert result.venv_python is not None
 
-    def test_install_timeout(self):
+    def test_install_timeout_without_cutoff(self, monkeypatch):
+        monkeypatch.setattr("anvil.repo.deps.get_commit_date", lambda *_: "")
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
@@ -467,8 +542,9 @@ class TestEnsureDepsPython:
         assert not result.ok
         assert "timed out" in result.report.lower()
 
-    def test_uses_venv_pip_not_bare_pip(self):
-        """The install command must use the venv-scoped pip."""
+    def test_uses_venv_pip_not_bare_pip(self, monkeypatch):
+        """Without a cutoff, the plain pip fallback remains venv-scoped."""
+        monkeypatch.setattr("anvil.repo.deps.get_commit_date", lambda *_: "")
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
@@ -495,10 +571,8 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
-                _exec_result(1), 
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(1), 
                 _exec_result(0),
                 _exec_result(0),
                 _exec_result(0),
