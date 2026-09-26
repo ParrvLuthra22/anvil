@@ -305,13 +305,13 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
         # Let's try a full clone and checkout.
         import shutil
         shutil.rmtree(dest)
-        subprocess.run(["git", "clone", clone_url, str(dest)], check=True, capture_output=True, env=env)
-        res = subprocess.run(["git", "checkout", git_ref], cwd=dest, capture_output=True, text=True, env=env)
+        subprocess.run(["git", "clone", clone_url, str(dest)], check=True, capture_output=True, env=env, timeout=_CLONE_TIMEOUT)
+        res = subprocess.run(["git", "checkout", git_ref], cwd=dest, capture_output=True, text=True, env=env, timeout=_CLONE_TIMEOUT)
         if res.returncode != 0:
             raise RuntimeError(f"git checkout {git_ref} failed:\nstderr: {res.stderr[:500]}")
         return dest
         
-    checkout_res = subprocess.run(["git", "checkout", "FETCH_HEAD"], cwd=dest, capture_output=True, text=True, env=env)
+    checkout_res = subprocess.run(["git", "checkout", "FETCH_HEAD"], cwd=dest, capture_output=True, text=True, env=env, timeout=_CLONE_TIMEOUT)
     if checkout_res.returncode != 0:
         raise RuntimeError(f"git checkout FETCH_HEAD failed for {git_ref}:\nstderr: {checkout_res.stderr[:500]}")
     
