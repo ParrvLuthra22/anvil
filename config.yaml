@@ -53,5 +53,7 @@ output_dir: output
 cost_per_million_prompt_tokens: 0
 cost_per_million_completion_tokens: 0
 
-# Sandbox backend: auto (docker if available, else worktree) | worktree | docker
-sandbox: auto
+# Sandbox backend: worktree | docker | auto (docker if its daemon is up, else worktree).
+# worktree is the default: commands run in a git worktree with the repo's dependencies in a venv.
+# docker is opt-in: its containers have no network, so dependencies cannot be installed in them.
+sandbox: worktree
