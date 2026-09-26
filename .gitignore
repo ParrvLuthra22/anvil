@@ -1,0 +1,24 @@
+# Secrets (only .env.example is tracked)
+.env
+.env.local
+
+# Environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+
+# Harness output (patch.diff, report.md, trace.jsonl, cloned repos)
+output/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

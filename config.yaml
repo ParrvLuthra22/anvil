@@ -1,0 +1,20 @@
+# ANVIL configuration. Never put secrets here: the API key comes only from the
+# AI_API_KEY environment variable. AI_BASE_URL and AI_MODEL override the two
+# provider settings below without editing this file.
+
+# Provider (any OpenAI-compatible chat-completions endpoint).
+model: gemini-2.0-flash
+base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+temperature: 0
+
+# Budgets: the run stops gracefully (still emitting patch + report) when any is hit.
+max_steps_per_phase: 25
+max_total_steps: 120
+max_tokens_total: 1500000
+wall_clock_seconds: 1800
+
+# Maximum characters of any single tool/shell output fed back to the model.
+tool_output_char_cap: 8000
+
+# Sandbox backend: auto (docker if available, else worktree) | worktree | docker
+sandbox: auto
