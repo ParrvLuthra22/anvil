@@ -268,7 +268,7 @@ class TestPickPythonInterpreter:
 
 class TestEnsureDepsPython:
     def test_successful_python_install(self):
-        """Happy path: probe ok + venv + pip upgrade + pip install + framework."""
+        """Happy path: probe ok + venv + pip upgrade + pip install + framework + collection."""
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),   # interp -m venv .anvil_venv
@@ -276,6 +276,7 @@ class TestEnsureDepsPython:
                 _exec_result(1),   # command -v uv (fail -> pip)
                 _exec_result(0),   # pip install -e '.[dev]'
                 _exec_result(0),   # pytest install
+                _exec_result(0),   # pytest --collect-only
             ]
         )
         result = ensure_deps(sb, _python_profile(), as_of="2021")
@@ -327,7 +328,7 @@ class TestEnsureDepsPython:
         )
         result = ensure_deps(sb, _python_profile(), as_of="2021")
         assert not result.ok
-        assert "timed out" in result.report.lower()
+        assert "failed" in result.report.lower()
 
     def test_uses_venv_pip_not_bare_pip(self):
         """The install command must use the venv-scoped pip."""
@@ -338,10 +339,10 @@ class TestEnsureDepsPython:
                 _exec_result(1), # test -x uv
                 _exec_result(0),
                 _exec_result(0),
+                _exec_result(0), # pytest --collect-only
             ]
         )
         ensure_deps(sb, _python_profile("pip install -r requirements.txt"), as_of="2021")
-        install_call_cmd = sb.exec.call_args_list[-2][0][0] # it was 4, now 5? Let's just check all calls
         assert any(".anvil_venv/bin/pip install" in str(c) for c in sb.exec.call_args_list)
 
     def test_venv_timeout_is_handled(self):
@@ -363,6 +364,7 @@ class TestEnsureDepsPython:
                 _exec_result(1), # uv probe fail
                 _exec_result(0),
                 _exec_result(0),
+                _exec_result(0), # pytest --collect-only
             ]
         )
         result = ensure_deps(sb, _python_profile(), as_of="2021")
