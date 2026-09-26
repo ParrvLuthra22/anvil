@@ -33,12 +33,12 @@ from anvil.agent.loop import Gate, PhaseOutcome, PhaseRunner, PhaseStatus, RunAb
 from anvil.agent.outputs import SCRATCH_DIR, changed_files, filter_diff, render_report, write_outputs
 from anvil.agent.pipeline import Checkout, Ingested, Pipeline, RepoPipeline, Workspace
 from anvil.agent.prompts import (
-    PHASE_SPECS,
     environment_note,
     finalize_kickoff,
     issue_brief,
     patch_kickoff,
     phase_kickoff,
+    phase_spec,
     phase_summary,
     verify_kickoff,
 )
@@ -499,7 +499,7 @@ class Orchestrator:
             raise RuntimeError("the LLM phases cannot run before PROFILE")
         self._enter(phase)
         self._ctx.set_diff(self._patch_text())
-        outcome = self._runner.run(PHASE_SPECS[phase], kickoff, gate)
+        outcome = self._runner.run(phase_spec(phase, self._settings.weak_model_prompts), kickoff, gate)
         if outcome.forced:
             self._state.limit(
                 f"{phase.value.upper()} used its {self._settings.call_cap(phase.value)}-call cap and was closed by the "
@@ -568,7 +568,9 @@ class Orchestrator:
         if self._runner is None:
             return
         try:
-            outcome = self._runner.run(PHASE_SPECS[Phase.FINALIZE], finalize_kickoff(self._facts(patch)))
+            outcome = self._runner.run(
+                phase_spec(Phase.FINALIZE, self._settings.weak_model_prompts), finalize_kickoff(self._facts(patch))
+            )
         except (BudgetExceeded, RunAborted) as exc:
             self._state.limit(f"The closing summary could not be written: {exc}")
         except Exception as exc:  # noqa: BLE001
