@@ -52,13 +52,13 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
         return run_result
 
     if not patch_path or not patch_path.exists():
-        run_result["category"] = "empty-patch"
+        run_result["category"] = "no_patch"
         run_result["resolved"] = False
         return run_result
 
     patch_text = patch_path.read_text(encoding="utf-8").strip()
     if not patch_text:
-        run_result["category"] = "empty-patch"
+        run_result["category"] = "empty_patch"
         run_result["resolved"] = False
         return run_result
 
@@ -97,11 +97,19 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
         return run_result
 
     # 3. Apply agent's patch
+    check_agent = _run_cmd(
+        ["git", "apply", "--check", "--allow-empty", str(patch_path.resolve())], cwd=repo_dir
+    )
+    if check_agent.returncode != 0:
+        run_result["category"] = "patch_does_not_apply"
+        run_result["resolved"] = False
+        return run_result
+
     apply_agent = _run_cmd(
         ["git", "apply", "--allow-empty", str(patch_path.resolve())], cwd=repo_dir
     )
     if apply_agent.returncode != 0:
-        run_result["category"] = "patch-failed"
+        run_result["category"] = "patch_does_not_apply"
         run_result["resolved"] = False
         return run_result
 
@@ -112,7 +120,7 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
         try:
             py_compile.compile(str(py_file), doraise=True)
         except py_compile.PyCompileError:
-            run_result["category"] = "syntax-error"
+            run_result["category"] = "patch_does_not_apply"
             run_result["resolved"] = False
             return run_result
 
@@ -130,25 +138,27 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
     if profile.install_cmd:
         _run_cmd(profile.install_cmd.split(), cwd=repo_dir, timeout=300)
 
-    # 7. Run PASS_TO_PASS and FAIL_TO_PASS with pytest -q
+    # 7. Run PASS_TO_PASS and FAIL_TO_PASS with the recorded test_cmd
     f2p = instance.get("FAIL_TO_PASS", [])
     p2p = instance.get("PASS_TO_PASS", [])
 
+    base_test_cmd = profile.test_cmd.split() if profile.test_cmd else [sys.executable, "-m", "pytest", "-q"]
+
     # Run PASS_TO_PASS first
     if p2p:
-        cmd = [sys.executable, "-m", "pytest", "-q"] + p2p
+        cmd = base_test_cmd + p2p
         res = _run_cmd(cmd, cwd=repo_dir)
         if res.returncode != 0:
-            run_result["category"] = "regression"
+            run_result["category"] = "p2p_regression"
             run_result["resolved"] = False
             return run_result
 
     # Run FAIL_TO_PASS
     if f2p:
-        cmd = [sys.executable, "-m", "pytest", "-q"] + f2p
+        cmd = base_test_cmd + f2p
         res = _run_cmd(cmd, cwd=repo_dir)
         if res.returncode != 0:
-            run_result["category"] = "unresolved"
+            run_result["category"] = "f2p_fail"
             run_result["resolved"] = False
             return run_result
 

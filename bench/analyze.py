@@ -63,6 +63,48 @@ def main() -> None:
         print(f"  Duration: {avg_dur:.1f}s")
         print(f"  Tokens:   {avg_tokens:,.0f}")
         print(f"  Steps:    {avg_steps:.1f}")
+
+    # Trace analysis
+    print("\nTrace Analysis (from bench/runs/*/trace.jsonl):")
+    total_recoveries = 0
+    phase_counts = {}
+    traces_found = 0
+
+    for r in results:
+        iid = r.get("instance_id")
+        if not iid: continue
+        trace_file = Path(f"bench/runs/{iid}/trace.jsonl")
+        if not trace_file.exists():
+            continue
+        traces_found += 1
+        phases_reached = set()
+        run_recoveries = 0
+
+        try:
+            for line in trace_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip(): continue
+                ev = json.loads(line)
+                etype = ev.get("type")
+                if etype == "phase" and ev.get("data", {}).get("name"):
+                    phases_reached.add(ev["data"]["name"])
+                elif etype == "error":
+                    run_recoveries += 1
+            
+            for p in phases_reached:
+                phase_counts[p] = phase_counts.get(p, 0) + 1
+            total_recoveries += run_recoveries
+        except Exception:
+            pass
+
+    if traces_found:
+        print(f"  Traces analyzed: {traces_found}")
+        print(f"  Total recovery events (errors caught): {total_recoveries}")
+        print("  Instances reaching phase:")
+        for p, count in sorted(phase_counts.items(), key=lambda x: x[1], reverse=True):
+            pct = count / traces_found
+            print(f"    {p.ljust(15)} {count} ({pct:.1%})")
+    else:
+        print("  No trace files found.")
     print()
 
 
