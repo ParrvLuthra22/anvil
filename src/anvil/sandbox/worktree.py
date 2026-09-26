@@ -27,7 +27,17 @@ _MAX_READ_BYTES = 2 * 1024 * 1024   # 2 MB
 _BINARY_SNIFF_BYTES = 8192
 
 # Paths excluded from diff() — venv and anvil internals are never patch-relevant.
-_DIFF_EXCLUDE = (".anvil_venv", ".anvil")
+# These are passed as ``:(exclude)`` pathspecs to git-diff AND filtered from
+# untracked file listings, so *.egg-info, __pycache__, *.pyc, and the venv
+# never appear in what the model sees or in the generated patch.
+_DIFF_EXCLUDE = (
+    ".anvil_venv",
+    ".anvil",
+    "*.egg-info",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+)
 
 # Regex that matches *any* env var name carrying a secret.
 # Covers: anything ending with KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL,
@@ -96,6 +106,26 @@ def _git_env() -> dict[str, str]:
     env.setdefault("GIT_COMMITTER_NAME", "anvil-agent")
     env.setdefault("GIT_COMMITTER_EMAIL", "anvil@localhost")
     return env
+
+
+def _is_excluded(path: str) -> bool:
+    """Return True if *path* matches any entry in ``_DIFF_EXCLUDE``.
+
+    Handles both plain prefix directories (e.g. ``.anvil_venv``) and glob
+    patterns (e.g. ``*.pyc``, ``__pycache__``).
+    """
+    import fnmatch
+    parts = path.replace("\\", "/").split("/")
+    for exc in _DIFF_EXCLUDE:
+        if "*" in exc:
+            # Match any segment of the path against the glob
+            if any(fnmatch.fnmatch(part, exc) for part in parts):
+                return True
+        else:
+            # Plain prefix directory or exact match
+            if path == exc or path.startswith(exc + "/") or exc in parts:
+                return True
+    return False
 
 
 def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -340,16 +370,22 @@ class WorktreeSandbox:
     def diff(self) -> str:
         """Return a unified diff of all changes versus the baseline commit.
 
-        Excludes ``.anvil_venv`` and ``.anvil`` directories which are never
-        part of the patch.
+        Excludes ``.anvil_venv``, ``.anvil``, ``*.egg-info``, ``__pycache__``,
+        ``*.pyc`` and ``*.pyo`` so those never appear in what the model sees
+        or in the generated patch.
         """
         if not self._baseline_sha:
             return "(no baseline — diff unavailable)"
 
-        # Build exclusion pathspecs
+        # Build exclusion pathspecs for git diff.
+        # Prefix-style dirs use a plain prefix; glob patterns use :!glob syntax.
         exclude_args: list[str] = []
         for exc in _DIFF_EXCLUDE:
-            exclude_args += [":(exclude)" + exc]
+            if "*" in exc:
+                # Glob — must use the glob: magic signature
+                exclude_args += [f":(exclude,glob)**/{exc}"]
+            else:
+                exclude_args += [f":(exclude){exc}"]
 
         tracked = _run_git(
             ["diff", self._baseline_sha, "--", "."] + exclude_args,
@@ -362,8 +398,8 @@ class WorktreeSandbox:
             cwd=self._work_dir,
         )
         for new_file in untracked.stdout.splitlines():
-            # Skip excluded dirs
-            if any(new_file.startswith(exc) for exc in _DIFF_EXCLUDE):
+            # Skip paths that match any exclusion pattern
+            if _is_excluded(new_file):
                 continue
             nf_path = self._work_dir / new_file
             if nf_path.exists():

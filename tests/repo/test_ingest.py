@@ -469,22 +469,79 @@ class TestBug5IngestHardening:
             # Since git_ref was used, the first call should be git init
             calls = mock_run.call_args_list
             assert len(calls) >= 3
-            assert ["git", "init"] == calls[0][0][0][:2]
+            assert ["git", "init", str(dest)] == calls[0][0][0]
             
-            # Second call should be git fetch --depth 1
+            # Second call should be git fetch --depth=1
             fetch_cmd = calls[1][0][0]
             assert "fetch" in fetch_cmd
-            assert "--depth" in fetch_cmd
+            assert "--depth=1" in fetch_cmd
             assert "v2.31.0" in fetch_cmd
 
+    def test_clone_repo_real_sha(self, tmp_path):
+        """Task 1: clone_repo(git_ref=<SHA>) on a real local repo should work via fetch."""
+        import subprocess
+        
+        # Setup a local source repo
+        src = tmp_path / "src_repo"
+        src.mkdir()
+        subprocess.run(["git", "init"], cwd=src, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=src, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=src, check=True)
+        (src / "file.txt").write_text("v1")
+        subprocess.run(["git", "add", "file.txt"], cwd=src, check=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=src, check=True)
+        
+        # Get the commit SHA
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=src, capture_output=True, text=True, check=True)
+        sha = r.stdout.strip()
+        
+        # We need a fake IssueRef that maps to our local repo URL for clone_url
+        # Actually clone_repo hardcodes https://github.com/...
+        # So we patch clone_url specifically inside clone_repo for this test.
+        ref = parse_issue_url("https://github.com/owner/repo/issues/1")
+        dest = tmp_path / "dest_repo"
+        
+        # We use unittest.mock to intercept the clone_url assignment
+        with patch("anvil.repo.ingest.subprocess.run") as mock_run:
+            pass # We want a real run, so we patch the URL instead
+
+        # Easiest way to test real clone_repo with local path: patch the string literal
+        with patch("anvil.repo.ingest.f", create=True):
+            pass # wait, we can't easily patch f-strings
+            
+        # Let's mock out only the clone_url construction in ingest.py if we could.
+        # But ingest.py hardcodes: clone_url = f"https://github.com/{ref.owner}/{ref.repo}.git"
+        # We can create a local server? No.
+        # Let's patch subprocess.run, but forward calls to the real subprocess.run EXCEPT we replace the clone_url with our src path.
+        
+        real_run = subprocess.run
+        def side_effect(*args, **kwargs):
+            # Replace github URL with our local src repo
+            new_args = []
+            if isinstance(args[0], list):
+                new_cmd = [x.replace(f"https://github.com/{ref.owner}/{ref.repo}.git", str(src)) for x in args[0]]
+                new_args.append(new_cmd)
+            else:
+                new_args.append(args[0])
+            return real_run(*new_args, **kwargs)
+            
+        with patch("anvil.repo.ingest.subprocess.run", side_effect=side_effect):
+            # Call clone_repo with real SHA
+            clone_repo(ref, dest, git_ref=sha)
+            
+        # Verify it fetched and checked out correctly
+        assert (dest / "file.txt").read_text() == "v1"
+        assert (dest / ".git").exists()
+
     def test_clone_no_git_ref_no_branch_flag(self, tmp_path):
-        """Without git_ref, --branch must not appear in the command."""
+        """Without git_ref, no init/fetch, just clone --depth 1."""
         dest = tmp_path / "r"
         ref = parse_issue_url("https://github.com/psf/requests/issues/1")
         with patch("anvil.repo.ingest.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             clone_repo(ref, dest)
             call_args = mock_run.call_args[0][0]
+            assert call_args[:4] == ["git", "clone", "--depth", "1"]
             assert "--branch" not in call_args
 
     def test_issue_ref_has_fetch_error_field(self):
