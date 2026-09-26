@@ -248,45 +248,114 @@ _CLONE_TIMEOUT = 60   # seconds — tight so missing/private repos fail fast
 def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     """Shallow-clone the issue's repository into ``dest`` and return the repo root.
 
-    Uses ``git clone --depth 1`` for speed.
+    When *git_ref* is **None** a plain ``git clone --depth 1`` of the remote
+    default branch is performed.
 
-    ``GIT_TERMINAL_PROMPT=0`` is set in the subprocess env so that git never
-    hangs waiting for a username/password prompt on private repos.
+    When *git_ref* is provided (e.g. a full 40-character SHA or a branch name)
+    the function attempts three strategies in order:
+
+    1. ``git fetch --depth 1 origin <sha>`` — fastest, works when the server
+       advertises that commit (most GitHub repos allow single-SHA fetches).
+    2. ``git fetch --depth 50 origin <sha>`` — deeper fetch for repos that
+       require some history before serving the commit.
+    3. **Raise** :class:`RuntimeError` with a clear message.  The caller
+       (agent cycle) can then fall back to ``HEAD`` if desired.
+
+    The subprocess environment always has ``GIT_TERMINAL_PROMPT=0`` to prevent
+    interactive prompts from hanging the process, and all secret env vars
+    are stripped.
 
     Args:
         ref:     The parsed issue reference (owner/repo must be set).
         dest:    Destination directory for the clone (created if absent).
-        git_ref: Optional branch/tag/SHA to clone.  If *None* the remote's
-                 default branch (usually ``main`` or ``master``) is used.
-                 Example: ``"v2.31.0"`` or ``"fix/my-branch"``.
+        git_ref: Optional full SHA or branch/tag.  If *None* the remote default
+                 branch is used.
+
+    Returns:
+        The repo root path (*dest*).
 
     Raises:
-        RuntimeError: If ``git clone`` exits with a non-zero code or times out.
+        RuntimeError: If any git operation fails or times out.
     """
+    import os
+    import subprocess
+    
     clone_url = f"https://github.com/{ref.owner}/{ref.repo}.git"
     dest.mkdir(parents=True, exist_ok=True)
 
-    cmd = ["git", "clone", "--depth", "1"]
-    if git_ref:
-        cmd += ["--branch", git_ref]
-    cmd += [clone_url, str(dest)]
-
-    # Disable interactive prompts so private/missing repos fail immediately.
-    env = os.environ.copy()
+    # Sanitize environment: no secrets, no interactive prompts.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("AI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")}
     env["GIT_TERMINAL_PROMPT"] = "0"
-    for key in list(env):
-        if key in ("AI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
-            del env[key]
 
     if not git_ref:
         cmd = ["git", "clone", "--depth", "1", clone_url, str(dest)]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env,
+            )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"git clone timed out for {clone_url}")
         if result.returncode != 0:
-            raise RuntimeError(f"git clone failed (exit {result.returncode}) for {clone_url}:\nstderr: {result.stderr[:500]}")
+            raise RuntimeError(
+                f"git clone failed (exit {result.returncode}) for {clone_url}:\n"
+                f"stderr: {result.stderr[:500]}"
+            )
         return dest
+
+    try:
+        subprocess.run(
+            ["git", "init", str(dest)], check=True, capture_output=True,
+            timeout=15, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git init timed out for {dest}")
+
+    def _fetch(depth: int) -> subprocess.CompletedProcess:
+        fetch_args = ["git", "fetch", f"--depth={depth}", clone_url, git_ref]
+        try:
+            return subprocess.run(
+                fetch_args, cwd=dest, capture_output=True, text=True,
+                timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"git fetch --depth={depth} timed out for {clone_url} ref={git_ref!r}"
+            )
+
+    # Step 1: shallow fetch
+    res = _fetch(1)
+    if res.returncode != 0:
+        # Step 2: deeper fetch (catches repos that need some history)
+        res = _fetch(50)
+
+    if res.returncode != 0:
+        # Step 3: clear error — let the caller fall back to HEAD
+        raise RuntimeError(
+            f"git fetch failed for {clone_url} ref={git_ref!r} "
+            f"(both --depth=1 and --depth=50 failed).\n"
+            f"Caller should fall back to HEAD.\n"
+            f"stderr: {res.stderr[:500]}"
+        )
+
+    # Checkout the fetched commit
+    try:
+        co = subprocess.run(
+            ["git", "checkout", "FETCH_HEAD"],
+            cwd=dest, capture_output=True, text=True,
+            timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git checkout FETCH_HEAD timed out for {git_ref!r}")
+
+    if co.returncode != 0:
+        raise RuntimeError(
+            f"git checkout FETCH_HEAD failed for {git_ref!r}:\n"
+            f"stderr: {co.stderr[:500]}"
+        )
+
+    return dest
         
     # If git_ref is provided, init an empty repo and fetch that specific ref
     subprocess.run(["git", "init", str(dest)], check=True, capture_output=True)
