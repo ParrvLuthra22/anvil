@@ -45,7 +45,7 @@ def repo_functions(monkeypatch):
     monkeypatch.setattr(pipeline_module, "fetch_issue", fetch)
     monkeypatch.setattr(pipeline_module, "clone_repo", clone)
     monkeypatch.setattr(pipeline_module, "profile_repo", lambda root: calls.append(("profile", root)) or PROFILE)
-    monkeypatch.setattr(pipeline_module, "repo_map", lambda root, label=None: f"map of {label} at {root.name}")
+    monkeypatch.setattr(pipeline_module, "repo_map", lambda root, max_chars=6000, label=None: f"map of {label} at {root.name}")
     return calls
 
 
@@ -133,3 +133,62 @@ def test_the_repo_map_header_names_the_repository_not_the_clone_directory(tmp_pa
     assert workspace.repo_map.splitlines()[0] == "# repo: acme/calc"
     assert "acme__calc" not in workspace.repo_map and "1790000000" not in workspace.repo_map
     assert "calc.py" in workspace.repo_map
+
+
+# ---- the size of the repository map (features.token_budgets) ------------------------------------------------
+
+
+def workspace_for(tmp_path, config, monkeypatch=None, recorded=None):
+    """PROFILE with the real profile_repo on a tiny repository; ``recorded`` (a list) captures repo_map's arguments."""
+    root = tmp_path / "repo"
+    root.mkdir(exist_ok=True)
+    (root / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    if recorded is not None:
+        real = pipeline_module.repo_map
+
+        def spy(root, max_chars=6000, label=None):
+            recorded.append({"max_chars": max_chars, "label": label})
+            return real(root, max_chars=max_chars, label=label)
+
+        monkeypatch.setattr(pipeline_module, "repo_map", spy)
+    pipeline = RepoPipeline(
+        config, tmp_path, sandbox_factory=lambda config, root, profile: object(), registry_factory=lambda profile: object(),
+        deps_installer=no_deps,
+    )
+    return pipeline.profile(Ingested(IssueRef("acme", "calc", 7, URL), root))
+
+
+def test_the_repo_map_is_3000_characters_by_default(tmp_path, monkeypatch):
+    seen: list = []
+    workspace_for(tmp_path, {}, monkeypatch, seen)
+    assert seen == [{"max_chars": 3000, "label": "acme/calc"}]
+
+
+def test_with_token_budgets_off_the_map_keeps_its_own_default_of_6000(tmp_path, monkeypatch):
+    seen: list = []
+    workspace_for(tmp_path, {"features": {"token_budgets": False}}, monkeypatch, seen)
+    assert seen[0]["max_chars"] == 6000
+
+
+def test_the_size_can_be_set_in_the_config(tmp_path, monkeypatch):
+    seen: list = []
+    workspace_for(tmp_path, {"token_saving": {"repo_map_chars": 1500}}, monkeypatch, seen)
+    assert seen[0]["max_chars"] == 1500
+
+
+def test_a_config_that_does_not_validate_still_gives_a_map_of_the_default_size(tmp_path, monkeypatch):
+    seen: list = []
+    workspace_for(tmp_path, {"features": "nonsense", "token_saving": {"repo_map_chars": "big"}}, monkeypatch, seen)
+    assert seen[0]["max_chars"] == 3000, "the run must not fail in PROFILE over a bad optional setting"
+
+
+def test_the_real_map_of_a_big_repository_fits_the_size(tmp_path):
+    root = tmp_path / "repo"
+    for i in range(400):
+        package = root / "src" / f"pkg_{i % 20}"
+        package.mkdir(parents=True, exist_ok=True)
+        (package / f"module_{i}.py").write_text("".join(f"def function_{i}_{j}(x):\n    return x\n" for j in range(6)))
+    small = workspace_for(tmp_path, {}).repo_map
+    big = workspace_for(tmp_path, {"features": {"token_budgets": False}}).repo_map
+    assert len(small) <= 3000 and small.startswith("# repo: acme/calc")
+    assert 3000 < len(big) <= 6000, "the full map is the larger one"

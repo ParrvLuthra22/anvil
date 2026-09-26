@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from anvil.agent.outputs import DEPS_VENV_DIR, SCRATCH_DIR
 from anvil.agent.prepared_sandbox import PreparedSandbox
+from anvil.agent.settings import AgentSettings
 from anvil.agent.text import clip_head
 from anvil.repo.ingest import IssueRef, clone_repo, fetch_issue, parse_issue_url
 from anvil.repo.profile import RepoProfile, profile_repo, repo_map
@@ -42,6 +43,7 @@ BaseRefResolver = Callable[[IssueRef], Any]
 _REPORT_CHARS = 600
 _REF_FIELDS = ("ref", "base_ref", "base_sha", "sha")
 _DEFAULT_BRANCH = "default branch"
+_FULL_REPO_MAP_CHARS = 6000  # repo_map's own default, kept when features.token_budgets is off
 
 
 class IssueFetchError(RuntimeError):
@@ -224,11 +226,19 @@ class RepoPipeline:
         return Workspace(
             issue=ingested.issue,
             profile=profile,
-            repo_map=repo_map(root, label=f"{ingested.issue.owner}/{ingested.issue.repo}"),
+            repo_map=repo_map(root, max_chars=self._repo_map_chars(), label=f"{ingested.issue.owner}/{ingested.issue.repo}"),
             sandbox=PreparedSandbox(inner, venv_dir=venv_dir),
             tools=self._registry_factory(profile),
             deps=deps,
         )
+
+    def _repo_map_chars(self) -> int:
+        """Size of the repository map: ``token_saving.repo_map_chars`` while ``features.token_budgets`` is on."""
+        try:
+            settings = AgentSettings.from_mapping(self._config)
+        except ValueError:
+            settings = AgentSettings.fallback(self._config)
+        return settings.repo_map_chars if settings.token_budgets else _FULL_REPO_MAP_CHARS
 
     def _install_dependencies(self, sandbox: Sandbox, profile: RepoProfile) -> tuple[str | None, str]:
         """Run the installer; returns the venv directory to put first on PATH (or ``None``) and a status line."""
