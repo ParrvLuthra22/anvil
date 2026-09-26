@@ -145,7 +145,8 @@ def test_every_prompt_of_a_wandering_run_fits_max_context_tokens(tmp_path):
 
 def test_old_tool_output_is_shown_as_one_line_summaries(tmp_path):
     run = execute(
-        None, tmp_path, llm=RecordingLLM(wandering_script(12)), pipeline=big_project_pipeline(), context_keep_steps=3
+        None, tmp_path, llm=RecordingLLM(wandering_script(12)), pipeline=big_project_pipeline(), context_keep_steps=3,
+        features={"token_budgets": False},  # this test scripts a 12-call LOCALIZE: the classic phase limits
     )
     last_localize = [m for m in calls_in_phase(run, "localize")][-1]
     results = [m["content"] for m in last_localize if m["role"] == "tool"]
@@ -168,7 +169,7 @@ def test_the_summariser_is_a_real_llm_call_charged_to_the_run(tmp_path):
     llm = SummarisingLLM(wandering_script(20))
     run = execute(
         None, tmp_path, llm=llm, pipeline=big_project_pipeline(),
-        max_context_tokens=2500, context_keep_steps=8, tool_output_char_cap=1500,
+        max_context_tokens=2500, context_keep_steps=8, tool_output_char_cap=1500, features={"token_budgets": False},
     )
     assert llm.summary_transcripts, "the context never filled up"
     assert "big.py" in llm.summary_transcripts[0]
@@ -187,7 +188,7 @@ def test_a_failing_summariser_costs_nothing_but_a_warning_and_the_run_still_succ
     llm = SummarisingLLM(wandering_script(20), fail=True)
     run = execute(
         None, tmp_path, llm=llm, pipeline=big_project_pipeline(),
-        max_context_tokens=2500, context_keep_steps=8, tool_output_char_cap=1500,
+        max_context_tokens=2500, context_keep_steps=8, tool_output_char_cap=1500, features={"token_budgets": False},
     )
     assert llm.summary_transcripts
     errors = run.of("error")

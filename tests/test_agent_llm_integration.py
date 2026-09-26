@@ -142,6 +142,7 @@ def test_a_compacted_history_is_still_accepted_by_a_strict_provider(tmp_path, mo
         "max_context_tokens": budget,
         "context_keep_steps": 8,
         "tool_output_char_cap": 1500,
+        "features": {"token_budgets": False},  # the script wanders through 20 calls: no per-phase call caps here
     }
     transport = _server(wandering_script(20), tool_mode, problems, requests, summaries)
     client = make_client(config, transport=transport)
