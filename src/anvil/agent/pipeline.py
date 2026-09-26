@@ -174,6 +174,16 @@ class RepoPipeline:
             self._notify("warning", f"Installing dependencies crashed ({type(exc).__name__}: {exc}); continuing without them.")
             return None, "not installed (the installer crashed): imports of third-party packages may fail."
         report = clip_head(str(getattr(result, "report", "")).strip(), _REPORT_CHARS)
+        if getattr(result, "skipped", False):
+            # Nothing was installed, but it is not a failure of the install: say what happened, not "installed".
+            reason = " ".join(report.split()) or "no reason given"
+            if getattr(result, "ok", False):
+                self._notify("info", f"Dependencies skipped: {reason}")
+                return None, f"skipped ({reason}); nothing was installed."
+            self._notify("warning", f"Dependencies skipped: {reason}")
+            return None, (
+                f"NOT installed (skipped: {reason}): imports of third-party packages may fail; the tests may not run."
+            )
         if not getattr(result, "ok", False):
             self._notify("warning", f"Installing dependencies failed; continuing without them. {report}")
             return None, "NOT installed (the install failed): imports of third-party packages may fail; the tests may not run."

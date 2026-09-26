@@ -198,6 +198,46 @@ def test_a_failed_install_is_a_warning_and_the_run_goes_on_without_the_venv(tmp_
     assert workspace.deps.startswith("NOT installed")
 
 
+SKIP_REASON = "No install command detected — skipping."
+
+
+def test_a_skipped_install_is_reported_as_skipped_with_its_reason_never_as_installed(tmp_path, monkeypatch):
+    """Regression: ok=True, skipped=True (nothing to install) was announced as 'installed' to the user and the model."""
+    workspace, notes = profile_with(
+        monkeypatch, tmp_path, lambda s, p: SimpleNamespace(ok=True, report=SKIP_REASON, venv_python=None, skipped=True)
+    )
+    assert notes.levels() == ["info", "info"]
+    assert notes.notes[1][1] == f"Dependencies skipped: {SKIP_REASON}"
+    assert workspace.deps == f"skipped ({SKIP_REASON}); nothing was installed."
+    assert "installed" not in notes.notes[1][1] and not workspace.deps.startswith("installed")
+    assert ".anvil_venv" not in workspace.sandbox.prepare("pytest")
+
+
+def test_a_missing_toolchain_is_skipped_not_a_failed_install(tmp_path, monkeypatch):
+    reason = "npm not found on PATH — skipping JS dependency install."
+    workspace, notes = profile_with(
+        monkeypatch, tmp_path, lambda s, p: SimpleNamespace(ok=False, report=reason, venv_python=None, skipped=True)
+    )
+    assert notes.levels() == ["info", "warning"], "it is a warning: the tests probably cannot run"
+    assert notes.notes[1][1] == f"Dependencies skipped: {reason}" and "failed" not in notes.notes[1][1]
+    assert workspace.deps == f"NOT installed (skipped: {reason}): imports of third-party packages may fail; the tests may not run."
+
+
+def test_a_multi_line_skip_reason_stays_on_one_line_for_the_model(tmp_path, monkeypatch):
+    workspace, _ = profile_with(
+        monkeypatch, tmp_path, lambda s, p: SimpleNamespace(ok=True, report="line one\n  line two\n", venv_python=None, skipped=True)
+    )
+    assert "\n" not in workspace.deps and "line one line two" in workspace.deps
+
+
+def test_a_result_without_a_skipped_attribute_is_an_ordinary_install(tmp_path, monkeypatch):
+    """Older installers return no `skipped`: they must keep working exactly as before."""
+    workspace, notes = profile_with(
+        monkeypatch, tmp_path, lambda s, p: SimpleNamespace(ok=True, report="Dependencies installed. (npm install)", venv_python=None)
+    )
+    assert workspace.deps == "installed." and notes.notes[1][1].startswith("Dependencies installed")
+
+
 def test_an_installer_that_crashes_is_a_warning_not_a_failed_run(tmp_path, monkeypatch):
     def installer(sandbox, profile):
         raise RuntimeError("pip exploded")
@@ -279,6 +319,19 @@ def test_run_tests_uses_the_pytest_from_the_dependency_venv(tmp_path, monkeypatc
     assert any("Python deps installed" in text for text in progress)
     system = run.llm.calls[0][0][0]["content"]
     assert "Dependencies: installed into .anvil_venv, which is first on PATH." in system
+
+
+def test_a_skipped_install_is_described_to_the_model_as_skipped(tmp_path, monkeypatch):
+    rr.prepare(tmp_path, monkeypatch)
+    skipped = lambda sandbox, profile: SimpleNamespace(ok=True, report=SKIP_REASON, venv_python=None, skipped=True)  # noqa: E731
+    monkeypatch.setattr(pipeline_module, "_default_installer", lambda: skipped)
+    run = rr.run_real(FULL_RUN, install_dependencies=True)
+
+    system = run.llm.calls[0][0][0]["content"]
+    assert f"Dependencies: skipped ({SKIP_REASON}); nothing was installed." in system
+    assert "installed into" not in system
+    progress = [e.data["text"] for e in run.events if e.type == "message" and e.data["role"] == "system"]
+    assert f"Dependencies skipped: {SKIP_REASON}" in progress and run.errors() == []
 
 
 def test_a_failed_install_is_announced_as_a_deps_error_event_and_the_run_still_finishes(tmp_path, monkeypatch):
