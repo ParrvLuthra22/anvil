@@ -82,6 +82,8 @@ def make_default_registry(profile=None) -> ToolRegistry:
     from anvil.tools.run_cmd import RunCmdTool
     from anvil.tools.run_tests import RunTestsTool
     from anvil.tools.git_diff import GitDiffTool
+    from anvil.tools.outline import OutlineTool
+    from anvil.tools.find import FindSymbolTool, FindReferencesTool
 
     registry = ToolRegistry()
     registry.register(ListDirTool())
@@ -91,4 +93,7 @@ def make_default_registry(profile=None) -> ToolRegistry:
     registry.register(RunCmdTool())
     registry.register(RunTestsTool(profile=profile))
     registry.register(GitDiffTool())
+    registry.register(OutlineTool())
+    registry.register(FindSymbolTool())
+    registry.register(FindReferencesTool())
     return registry

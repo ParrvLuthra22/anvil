@@ -430,4 +430,4 @@ class TestToolRegistry:
 
     def test_make_default_registry_schemas_count(self):
         reg = make_default_registry()
-        assert len(reg.schemas()) == 7
+        assert len(reg.schemas()) == 10
