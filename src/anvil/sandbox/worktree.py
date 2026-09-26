@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Maximum raw bytes to read from a file before truncating to avoid OOM.
+_MAX_READ_BYTES = 2 * 1024 * 1024   # 2 MB
+# Bytes threshold above which we check for binary content.
+_BINARY_SNIFF_BYTES = 8192
 
 from anvil.sandbox.base import ExecResult, Sandbox
 
@@ -108,15 +116,30 @@ class WorktreeSandbox:
         return self._work_dir
 
     def _safe_path(self, path: str) -> Path:
-        """Resolve *path* relative to root and reject any path-traversal attempt."""
-        resolved = (self._work_dir / path).resolve()
+        """Resolve *path* (including symlinks) relative to root and reject escapes.
+
+        Uses ``os.path.realpath`` so that a symlink pointing outside the sandbox
+        root is caught, not just ``..``-based traversal.
+
+        Raises:
+            PermissionError: If *path* resolves to a location outside the sandbox root.
+        """
+        # Reject absolute paths outright
+        if os.path.isabs(path):
+            raise PermissionError(
+                f"Absolute path {path!r} is not allowed inside the sandbox."
+            )
+        candidate = self._work_dir / path
+        # realpath follows all symlinks; resolve() doesn't on all Python versions
+        real_candidate = Path(os.path.realpath(candidate))
+        real_root = Path(os.path.realpath(self._work_dir))
         try:
-            resolved.relative_to(self._work_dir.resolve())
+            real_candidate.relative_to(real_root)
         except ValueError:
             raise PermissionError(
-                f"Path {path!r} escapes the sandbox root {self._work_dir}"
+                f"Path {path!r} escapes the sandbox root (resolves to {real_candidate})."
             )
-        return resolved
+        return real_candidate
 
     def exec(self, cmd: str, timeout: int = 120) -> ExecResult:
         """Run *cmd* in the sandbox root with a hard timeout.
@@ -175,6 +198,9 @@ class WorktreeSandbox:
     def read_file(self, path: str, start: int | None = None, end: int | None = None) -> str:
         """Read a file, optionally restricted to a 1-indexed inclusive line range.
 
+        Handles binary files, large files (capped at 2 MB), CRLF line endings
+        and unicode (invalid bytes replaced with the U+FFFD replacement character).
+
         Args:
             path:  Path relative to sandbox root.
             start: First line to return (1-indexed, inclusive).
@@ -186,9 +212,39 @@ class WorktreeSandbox:
         Raises:
             FileNotFoundError: If the path does not exist.
             PermissionError:   If the path escapes the sandbox root.
+            IsADirectoryError: If *path* points to a directory.
         """
         abs_path = self._safe_path(path)
-        lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+        if not abs_path.exists():
+            raise FileNotFoundError(f"No such file: {path!r}")
+        if abs_path.is_dir():
+            raise IsADirectoryError(f"{path!r} is a directory, not a file.")
+
+        # Read raw bytes so we can detect binary content and cap size.
+        raw_bytes = abs_path.read_bytes()
+        truncated = False
+        if len(raw_bytes) > _MAX_READ_BYTES:
+            raw_bytes = raw_bytes[:_MAX_READ_BYTES]
+            truncated = True
+
+        # Binary detection: look for null bytes in the first sniff window.
+        sniff = raw_bytes[:_BINARY_SNIFF_BYTES]
+        if b"\x00" in sniff:
+            size_kb = abs_path.stat().st_size // 1024
+            return f"(binary file — {size_kb} KB, cannot display as text)"
+
+        text = raw_bytes.decode("utf-8", errors="replace")
+        # Normalise CRLF → LF so line counting is consistent cross-platform.
+        text = text.replace("\r\n", "\n")
+
+        if truncated:
+            text += (
+                f"\n... [file truncated — showing first {_MAX_READ_BYTES // 1024} KB; "
+                "use start/end to read later sections] ..."
+            )
+
+        lines = text.splitlines(keepends=True)
 
         if start is None and end is None:
             return "".join(lines)

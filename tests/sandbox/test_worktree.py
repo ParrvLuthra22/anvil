@@ -178,6 +178,7 @@ class TestReadWriteFile:
         sandbox.write_file("x.txt", "new")
         assert sandbox.read_file("x.txt") == "new"
 
+
     def test_read_missing_file_raises(self, sandbox):
         with pytest.raises(FileNotFoundError):
             sandbox.read_file("does_not_exist.txt")
@@ -189,6 +190,57 @@ class TestReadWriteFile:
     def test_write_traversal_rejected(self, sandbox):
         with pytest.raises(PermissionError):
             sandbox.write_file("../../tmp/evil.txt", "bad")
+
+    # --- New edge-case tests (hardening) ---
+
+    def test_absolute_path_rejected_read(self, sandbox):
+        with pytest.raises(PermissionError):
+            sandbox.read_file("/etc/passwd")
+
+    def test_absolute_path_rejected_write(self, sandbox):
+        with pytest.raises(PermissionError):
+            sandbox.write_file("/tmp/evil.txt", "bad")
+
+    def test_binary_file_returns_placeholder(self, sandbox):
+        # Write raw null bytes to simulate a binary file
+        (sandbox.root / "binary.bin").write_bytes(b"\x00\x01\x02\x03" * 100)
+        content = sandbox.read_file("binary.bin")
+        assert "binary file" in content.lower()
+
+    def test_large_file_is_capped(self, sandbox):
+        # Write a file larger than _MAX_READ_BYTES (2MB)
+        big = b"A" * (2 * 1024 * 1024 + 1024)  # 2MB + 1KB
+        (sandbox.root / "big.txt").write_bytes(big)
+        content = sandbox.read_file("big.txt")
+        assert "truncated" in content.lower() or len(content) < len(big)
+
+    def test_crlf_normalised(self, sandbox):
+        (sandbox.root / "crlf.txt").write_bytes(b"line1\r\nline2\r\nline3\r\n")
+        content = sandbox.read_file("crlf.txt")
+        assert "\r\n" not in content
+        assert "line1" in content and "line2" in content
+
+    def test_unicode_replacement(self, sandbox):
+        # Write bytes that are invalid UTF-8
+        (sandbox.root / "bad_utf8.txt").write_bytes(b"hello \xff\xfe world")
+        content = sandbox.read_file("bad_utf8.txt")
+        assert "hello" in content  # readable parts preserved
+
+    def test_file_without_trailing_newline(self, sandbox):
+        sandbox.write_file("no_newline.txt", "last line no newline")
+        content = sandbox.read_file("no_newline.txt")
+        assert content == "last line no newline"
+
+    def test_symlink_outside_sandbox_rejected(self, sandbox, tmp_path):
+        # Create a symlink that points outside the sandbox root
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        link = sandbox.root / "escape_link.txt"
+        link.symlink_to(outside)
+        with pytest.raises(PermissionError):
+            sandbox.read_file("escape_link.txt")
+
+
 
 
 # ---------------------------------------------------------------------------
