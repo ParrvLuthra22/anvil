@@ -196,6 +196,58 @@ async def test_new_phase_clears_error_banner():
         assert "visible" not in banner.classes
 
 
+# ===========================================================================
+# 4b. Severity mapping (Item 5)
+# ===========================================================================
+
+def test_is_fatal_for_unknown_kind():
+    """An unknown error kind is treated as fatal."""
+    from anvil.tui.app import _is_fatal
+    assert _is_fatal("unknown_kind") is True
+    assert _is_fatal("crash") is True
+
+
+def test_is_fatal_false_for_benign_kinds():
+    """All benign/recovery kinds are not fatal."""
+    from anvil.tui.app import _is_fatal
+    for kind in ("edit", "loop", "rollback", "retry", "truncate", "context", "timeout_retry"):
+        assert _is_fatal(kind) is False, f"Expected {kind!r} to be non-fatal"
+
+
+@pytest.mark.asyncio
+async def test_benign_error_does_not_show_banner():
+    """A benign 'loop' error must NOT show the ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.PATCH, {"kind": "loop", "message": "loop detected"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" not in banner.classes, "Benign 'loop' error should not show red banner"
+
+
+@pytest.mark.asyncio
+async def test_benign_error_does_not_show_banner_rollback():
+    """A benign 'rollback' error must NOT show the ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.PATCH, {"kind": "rollback", "message": "rolling back"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" not in banner.classes
+
+
+@pytest.mark.asyncio
+async def test_fatal_error_shows_banner():
+    """A fatal error (unknown kind) MUST show the ErrorBanner."""
+    app = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        ev = _ev("error", Phase.PATCH, {"kind": "fatal_crash", "message": "something broke"})
+        app._handle_event(ev)
+        banner = app.query_one("#error-banner", ErrorBanner)
+        assert "visible" in banner.classes, "Fatal error must show red banner"
+
+
+
 @pytest.mark.asyncio
 async def test_done_event_shows_result_banner():
     """A 'done' event makes the ResultBanner visible with correct data."""

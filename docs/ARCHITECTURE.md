@@ -239,3 +239,70 @@ ANVIL is designed to be stateless between runs:
 
 - **Repo-map caching:** `repo_map()` output can be cached by repo SHA so
   re-runs on the same commit skip the profiling step.
+
+---
+
+## 7. Context Manager
+
+`src/anvil/context/` (owned by Parrv) manages the LLM's token budget across
+a run by maintaining a sliding window of messages.
+
+### Strategy
+
+```
+┌─────────────────────────────────────────────────────┐
+│ SYSTEM prompt (issue + phase instructions)          │  ← always present
+│ ISSUE body + comments                               │  ← always present
+├─────────────────────────────────────────────────────┤
+│ Summary of dropped turns  (compressed via LLM call) │  ← grows slowly
+├─────────────────────────────────────────────────────┤
+│ Last K assistant / tool turns   (rolling window)    │  ← rotated out
+└─────────────────────────────────────────────────────┘
+```
+
+Key properties:
+
+- **File:line references are never compressed** — the summariser preserves
+  every `path:lineno` token verbatim so the agent never hallucinates locations.
+- **Pruning is triggered** when `estimated_tokens > max_tokens_total × 0.8`.
+- **Summarisation is a separate short LLM call** that emits an
+  `error{kind="context"}` event (benign — yellow notice in TUI only).
+
+### Recovery strategies
+
+The orchestrator integrates the following recovery strategies to ensure every
+run terminates with a patch even under adverse conditions:
+
+| Condition | Detection | Recovery |
+|-----------|-----------|----------|
+| Failed `edit_file` str_replace | `ToolResult.ok == False` | Emit `error{kind="edit"}` (yellow); retry with closest-match hint |
+| Identical LLM output × 3 | Hamming distance on last 3 completions | Emit `error{kind="loop"}` (yellow); advance to next phase |
+| Patch makes tests worse | VERIFY step count > N | `sandbox.rollback()` to checkpoint; emit `error{kind="rollback"}` (yellow); re-enter PATCH |
+| Tool call timed out | `ExecResult.timed_out` | Emit `error{kind="timeout_retry"}` (yellow); LLM retries |
+| Token budget exhausted | `max_tokens_total` counter | Emit `error{kind="budget"}` (fatal); flush FINALIZE immediately |
+| Hard wall-clock limit | `time.time()` at each step | Same as token budget |
+| GitHub API 403/429 | HTTP status check in `fetch_issue` | Retry with backoff; fall back to `--repo + --issue-text` |
+
+Benign/recovery error kinds (`edit`, `loop`, `rollback`, `retry`, `truncate`,
+`context`, `timeout_retry`) appear as **yellow notices** in the TUI log only.
+Fatal kinds trigger the **red ErrorBanner**.  The run always continues and
+always produces `output/patch.diff` and `output/report.md`.
+
+---
+
+## 8. Future Work
+
+The following items are **not yet implemented** (stubs raise `NotImplementedError`
+or are planned for the next integration cycle):
+
+| Item | Status | Owner |
+|------|--------|-------|
+| `run_harness()` full phase cycle | Stub — raises `NotImplementedError` | Parrv |
+| `context/manager.py` full pruning | Interface defined; implementation pending | Parrv |
+| `repo/ingest.py` — `fetch_issue`, `clone_repo` | Stub | Akshat |
+| `repo/profile.py` — `profile_repo`, `repo_map` | Stub | Akshat |
+| `sandbox/base.py` — `WorktreeSandbox` | Stub | Akshat |
+| `tools/` — all 7 required tools | Stubs | Akshat |
+| Benchmark results | No real runs yet; `bench/issues.yaml` awaits verified candidates | Sneha / Akshat |
+| Docker sandbox backend | Auto-detection ready; container logic pending | Akshat |
+| Parallel benchmark workers | Architecture supports it; not wired yet | Sneha |

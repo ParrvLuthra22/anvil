@@ -1,17 +1,21 @@
 # ANVIL benchmark issue list
-# Each entry is run headlessly; the agent must resolve it within budget.
+#
+# Each entry will be run headlessly by `make bench` once the real pipeline
+# is available.  Issues listed here must be VERIFIED by Akshat from his
+# candidates.yaml — do NOT add fabricated entries or guessed issue numbers.
 #
 # Fields:
 #   url:          GitHub issue URL (required)
-#   test_cmd:     optional shell command; exit-0 = resolved (overrides auto-detect)
 #   description:  human-readable label for the results table
+#   test_cmd:     optional shell command; exit-0 = resolved (overrides auto-detect)
+#
+# Status: awaiting Akshat's verified candidates.yaml.
+# Add entries here only after confirming the issue URL, title, and
+# reproduction steps actually match a real open/closed GitHub issue.
 
-issues:
-  - url: https://github.com/psf/requests/issues/6667
-    description: "requests — Session.resolve_redirects drops body on 307"
-
-  - url: https://github.com/pallets/flask/issues/5511
-    description: "flask — Blueprint static_url_path collision"
-
-  - url: https://github.com/encode/httpx/issues/3208
-    description: "httpx — AsyncClient does not honour timeout on redirects"
+issues: []
+  # Example format (do not uncomment until verified by Akshat):
+  #
+  # - url: https://github.com/owner/repo/issues/NNN
+  #   description: "repo — short description of the bug"
+  #   test_cmd: "python -m pytest tests/test_specific.py -x -q"
