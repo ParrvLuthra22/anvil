@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from anvil.agent.prepared_sandbox import PreparedSandbox
 from anvil.repo.ingest import IssueRef, clone_repo, fetch_issue, parse_issue_url
 from anvil.repo.profile import RepoProfile, profile_repo, repo_map
 from anvil.sandbox.base import Sandbox
@@ -59,6 +60,10 @@ class RepoPipeline:
 
     Clones go to ``<output_dir>/workspace/<owner>__<repo>__<number>__<timestamp>``, so
     repeated runs never collide and ``make clean`` removes them with the rest of ``output/``.
+
+    Every path handed on is absolute. ``output_dir`` defaults to the relative ``output``, and a
+    sandbox that runs ``git worktree add <relative>`` from inside the clone puts the worktree
+    somewhere other than where it later looks for it, leaving the model an empty repository.
     """
 
     def __init__(
@@ -70,7 +75,7 @@ class RepoPipeline:
         registry_factory: RegistryFactory | None = None,
     ) -> None:
         self._config = config
-        self._workspace_dir = output_dir / "workspace"
+        self._workspace_dir = Path(output_dir).resolve() / "workspace"
         self._sandbox_factory = sandbox_factory or _default_sandbox
         self._registry_factory = registry_factory or _default_registry
 
@@ -78,18 +83,18 @@ class RepoPipeline:
         """Parse the URL, fetch the issue over the GitHub API and shallow-clone its repository."""
         issue = fetch_issue(parse_issue_url(issue_url))
         self._workspace_dir.mkdir(parents=True, exist_ok=True)
-        dest = self._workspace_dir / f"{issue.owner}__{issue.repo}__{issue.number}__{int(time.time())}"
-        return Ingested(issue, clone_repo(issue, dest))
+        dest = (self._workspace_dir / f"{issue.owner}__{issue.repo}__{issue.number}__{int(time.time())}").resolve()
+        return Ingested(issue, Path(clone_repo(issue, dest)).resolve())
 
     def profile(self, ingested: Ingested) -> Workspace:
         """Detect languages and commands, map the repo, then open the sandbox and the tool registry."""
-        root = ingested.repo_root
+        root = Path(ingested.repo_root).resolve()
         profile = profile_repo(root)
         return Workspace(
             issue=ingested.issue,
             profile=profile,
             repo_map=repo_map(root),
-            sandbox=self._sandbox_factory(self._config, root, profile),
+            sandbox=PreparedSandbox(self._sandbox_factory(self._config, root, profile)),
             tools=self._registry_factory(profile),
         )
 
