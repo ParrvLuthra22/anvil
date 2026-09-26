@@ -533,8 +533,7 @@ class Orchestrator:
         outcome = self._run_phase(Phase.VERIFY, verify_kickoff(repro_cmd=state.repro_cmd))
         for record in outcome.records:
             if record.tool == "run_tests":
-                target = str(record.args.get("target") or "").strip()
-                state.checks.append(CheckRun(f"run_tests {target}".strip(), record.ok))
+                state.checks.append(CheckRun(f"run_tests {_test_targets(record.args)}".strip(), record.ok))
         if outcome.done:
             return _Verdict(True)
         return _Verdict(False, self._trim(outcome.summary or f"verification did not finish ({outcome.status.value})"))
@@ -723,6 +722,13 @@ class Orchestrator:
                 close()
             except Exception:  # noqa: BLE001 - nothing useful left to do at shutdown
                 pass
+
+
+def _test_targets(args: dict) -> str:
+    """What a run_tests call was narrowed to, for the report: ``targets`` (a list) or the older single ``target``."""
+    targets = args.get("targets") or args.get("target") or ""
+    joined = " ".join(str(t) for t in targets) if isinstance(targets, (list, tuple)) else str(targets)
+    return joined.strip()
 
 
 def _describe(result: ExecResult, timeout: int) -> str:
