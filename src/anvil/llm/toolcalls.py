@@ -155,14 +155,38 @@ def _scan(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
         if calls:
             found.append(_Found(fence.start(), fence.end(), calls))
     found += _bare_calls(text, index, found)
+    found += _function_block_calls(text, index, found)
     if not found:
         found = _python_syntax_calls(text, index)
     return sorted(found, key=lambda item: item.start)
 
 
+_FUNCTION_BLOCK_RE = re.compile(r"<function=([^>\s]+)>(.*?)</function\s*>", re.DOTALL | re.IGNORECASE)
+_TOOL_TAG_AFTER_RE = re.compile(r"\s*</(?:tool_call|function_call|tool_use)\s*>", re.IGNORECASE)
 _ORPHAN_FENCE_RE = re.compile(r"\s*(?:`{1,3}\w*\s*)?")
 _OPENING_FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\n?[ \t]*\Z")
 _QUOTES = ("\"\"\"", "'''", "\"", "'")
+
+
+def _function_block_calls(text: str, index: Mapping[str, Mapping[str, str]], taken: list[_Found]) -> list[_Found]:
+    """Qwen3-Coder ``<function=NAME>...</function>`` blocks that lost their ``<tool_call>`` wrapper.
+
+    Seen from a real provider whose own parser consumed the opening tag and left the rest in the reply. Only known
+    tools, and only blocks that were closed: without the wrapper nothing else says the model meant the call, so half
+    of an edit is never acted on. A closing tool-call tag right after the block is part of it (an opening one before
+    it would have made the block a wrapped call, read by ``_tag_calls``).
+    """
+    found: list[_Found] = []
+    for block in _FUNCTION_BLOCK_RE.finditer(text):
+        name = block.group(1).strip()
+        if _overlaps(block.start(), block.end(), taken) or (index and name not in index):
+            continue
+        call = _xml_call(name, block.group(2), index)
+        if call is None:
+            continue
+        after = _TOOL_TAG_AFTER_RE.match(text, block.end())
+        found.append(_Found(block.start(), after.end() if after else block.end(), [call]))
+    return found
 
 
 def _python_syntax_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:

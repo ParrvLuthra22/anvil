@@ -522,3 +522,69 @@ def test_the_client_rescues_a_python_syntax_call_from_a_native_reply_and_counts_
     assert first.text == "" and client.active_tool_mode == "native"
     client.chat(USER, tools)
     assert client.active_tool_mode == "text", "two misses in a row: the endpoint is not doing native tool calls"
+
+
+# ---- Qwen3-Coder XML with a missing wrapper --------------------------------------------------------------------
+# Captured from a real run: the reply had <function=...> and a closing </tool_call>, but no opening <tool_call>
+# (the provider's own parser had consumed it). Every phase stalled on replies like this one.
+
+XML_TOOLS = PHASE_TOOLS + [schema("list_dir", path="string")]
+
+NO_OPENING_TAG = (
+    "I'll start by examining the repository structure and locating the problematic code.\n\n"
+    "<function=list_dir>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_a_function_block_without_its_opening_tool_call_tag_is_a_call():
+    parsed = parse_text_tool_calls(NO_OPENING_TAG, XML_TOOLS)
+    assert parsed.calls == [{"tool": "list_dir", "args": {"path": "."}}]
+    assert parsed.text == "I'll start by examining the repository structure and locating the problematic code."
+
+
+def test_the_stray_closing_tag_goes_with_the_call():
+    assert parse_text_tool_calls("<function=git_diff>\n</function>\n</tool_call>", XML_TOOLS).text == ""
+    assert parse_text_tool_calls("<function=git_diff></function></function_call>", XML_TOOLS).text == ""
+    assert parse_text_tool_calls("<function=git_diff></function>", XML_TOOLS).calls == [{"tool": "git_diff", "args": {}}]
+
+
+def test_a_bare_function_blocks_parameters_are_typed_by_the_schema():
+    reply = "<function=read_file>\n<parameter=path>\ncalc.py\n</parameter>\n<parameter=start>\n1\n</parameter>\n</function>"
+    assert calls(reply, XML_TOOLS) == [("read_file", {"path": "calc.py", "start": 1})]
+
+
+def test_several_bare_function_blocks_are_several_calls():
+    reply = "<function=git_diff></function>\n<function=list_dir><parameter=path>src</parameter></function>"
+    assert calls(reply, XML_TOOLS) == [("git_diff", {}), ("list_dir", {"path": "src"})]
+
+
+def test_a_bare_function_block_for_something_that_is_not_a_tool_is_text():
+    reply = "<function=frobnicate>\n<parameter=x>1</parameter>\n</function>"
+    assert calls(reply, XML_TOOLS) == []
+    assert parse_text_tool_calls(reply, XML_TOOLS).text == reply
+
+
+def test_a_bare_function_block_that_was_cut_off_is_not_run():
+    """Unlike a wrapped call, there is nothing to say the model meant it: never act on half of an edit."""
+    assert calls("<function=edit_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=old>\nreturn a - b", XML_TOOLS) == []
+
+
+def test_a_lone_opening_tag_is_no_call_and_does_not_crash():
+    parsed = parse_text_tool_calls("<tool_call>", XML_TOOLS)
+    assert parsed.calls == []
+
+
+def test_a_wrapped_call_is_still_read_by_the_wrapper_path():
+    reply = "<tool_call>\n<function=list_dir>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+    parsed = parse_text_tool_calls(reply, XML_TOOLS)
+    assert parsed.calls == [{"tool": "list_dir", "args": {"path": "."}}] and parsed.text == ""
+
+
+def test_the_client_rescues_a_wrapperless_function_block_from_a_native_reply():
+    from tests.test_llm_client import ok
+
+    server = Server(ok(NO_OPENING_TAG))
+    client, _ = build(server)
+    response = client.chat(USER, XML_TOOLS)
+    assert response.tool_calls[0]["tool"] == "list_dir" and response.tool_calls[0]["args"] == {"path": "."}
+    assert response.text.startswith("I'll start by examining")
