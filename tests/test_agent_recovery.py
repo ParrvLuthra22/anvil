@@ -476,7 +476,7 @@ def test_a_rollback_resets_the_tree_announces_itself_and_the_model_learns_what_w
 
     assert run_kinds(run) == ["rollback"]
     (event,) = run.of("error")
-    assert "ckpt-1" in event.data["message"] and "2 approach(es)" in event.data["message"]
+    assert "ckpt-2" in event.data["message"] and "2 approach(es)" in event.data["message"], "back to patch-start, not reproduce-start"
     rollback_at = run.events.index(event)
     before = run.events[rollback_at - 2 : rollback_at]
     assert [(e.type, e.data["tool"]) for e in before] == [("tool_call", "rollback"), ("tool_result", "rollback")]
@@ -494,7 +494,8 @@ def test_a_sandbox_that_cannot_checkpoint_is_reported_and_the_run_goes_on_withou
     pipeline = FakePipeline(NoCheckpoints(project_files(), on_exec=project_exec))
     script = understand() + localize() + reproduce() + good_patch() + verify() + review_ok() + finalize()
     run = execute(script, tmp_path, pipeline=pipeline)
-    assert run_kinds(run) == ["sandbox"] and "not a git repository" in run.of("error")[0].data["message"]
+    assert run_kinds(run) == ["sandbox", "sandbox"], "one report for the checkpoint at the start of REPRODUCE, one for PATCH"
+    assert all("not a git repository" in e.data["message"] for e in run.of("error"))
     assert "Checkpointing failed, so rolling back was not possible." in run.report
     assert "+    return a + b" in run.patch
 
@@ -582,7 +583,7 @@ def test_a_sandbox_that_reports_checkpoint_failure_as_a_string_is_never_rolled_b
 
     assert sandbox.rollbacks == [], "no rollback may be attempted with a ref that is really an error message"
     assert "a * b" in sandbox.files["calc.py"], "the model's work is still there"
-    assert run_kinds(run) == ["sandbox"]
+    assert run_kinds(run) == ["sandbox", "sandbox"]
     checkpoint_result = next(e for e in run.of("tool_result") if e.data["tool"] == "checkpoint")
     assert checkpoint_result.data["ok"] is False
     assert "Checkpointing failed, so rolling back was not possible." in run.report

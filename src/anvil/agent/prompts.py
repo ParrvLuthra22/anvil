@@ -50,11 +50,11 @@ Phase: LOCALIZE. Find the code responsible for the issue. Tools: list_dir, grep,
 Finish with phase_done(summary): the suspected file:line locations ranked by likelihood, the root-cause hypothesis in one or two sentences, and the relevant test files. Call give_up only after a thorough search found nothing."""
 
 _REPRODUCE = """\
-Phase: REPRODUCE. Prove the bug exists before fixing it. Tools: read_file, grep, edit_file, run_cmd, write_repro.
-1. Write a minimal script that exercises the behaviour from the issue and EXITS NON-ZERO with a clear message while the bug is present (and would exit 0 once fixed). Create it with write_repro under .anvil/, for example .anvil/repro.py. Use the repository's own language and tooling (python, node, go run, ...); if the code cannot be reached from a standalone script, write a small test for the repository's test runner instead.
+Phase: REPRODUCE. Prove the bug exists before fixing it. Tools: read_file, grep, run_cmd, write_repro.
+1. Write a minimal script that exercises the behaviour from the issue and EXITS NON-ZERO with a clear message while the bug is present (and would exit 0 once fixed). Create it with write_repro under .anvil/, for example .anvil/repro.py. Use the repository's own language and tooling (python, node, go run, ...); if the code cannot be reached from a standalone script, write a small test with write_repro (for example .anvil/test_repro.py) and run it with the repository's test runner.
 2. Run it with run_cmd and check that it fails for the reason given in the issue, not because of a typo, missing import or wrong path. Fix the script until it does.
 3. Call phase_done(summary, repro_cmd), where repro_cmd is the exact shell command that runs the repro. The harness runs that command itself and accepts it only if it fails.
-Do not fix the bug in this phase. If the bug cannot be reproduced in this environment, call give_up(reason)."""
+Do not fix the bug in this phase, and do not change any repository file: the harness reverts every change made outside .anvil/ before it runs your repro. If the bug cannot be reproduced in this environment, call give_up(reason)."""
 
 _PATCH = """\
 Phase: PATCH. Fix the root cause with the smallest correct change. Tools: read_file, grep, edit_file, run_cmd, git_diff.
@@ -106,7 +106,7 @@ PHASE_SPECS: dict[Phase, PhaseSpec] = {
     for spec in (
         _spec(Phase.UNDERSTAND, _UNDERSTAND),
         _spec(Phase.LOCALIZE, _LOCALIZE, "list_dir", "grep", "read_file"),
-        _spec(Phase.REPRODUCE, _REPRODUCE, "read_file", "grep", "edit_file", "run_cmd", WRITE_REPRO),
+        _spec(Phase.REPRODUCE, _REPRODUCE, "read_file", "grep", "run_cmd", WRITE_REPRO),
         _spec(Phase.PATCH, _PATCH, "read_file", "grep", "edit_file", "run_cmd", "git_diff"),
         _spec(Phase.VERIFY, _VERIFY, "run_tests", "run_cmd", "read_file", "git_diff"),
         _spec(Phase.REVIEW, _REVIEW, "git_diff", "read_file"),

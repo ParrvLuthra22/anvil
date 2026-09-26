@@ -27,7 +27,7 @@ from tests.fakes import FakeSandbox
 ALLOWLISTS = {
     Phase.UNDERSTAND: set(),
     Phase.LOCALIZE: {"list_dir", "grep", "read_file"},
-    Phase.REPRODUCE: {"read_file", "grep", "edit_file", "run_cmd"},
+    Phase.REPRODUCE: {"read_file", "grep", "run_cmd"},
     Phase.PATCH: {"read_file", "grep", "edit_file", "run_cmd", "git_diff"},
     Phase.VERIFY: {"run_tests", "run_cmd", "read_file", "git_diff"},
     Phase.REVIEW: {"git_diff", "read_file"},
@@ -53,9 +53,10 @@ def test_only_understand_and_finalize_are_text_only():
     assert {p for p, s in PHASE_SPECS.items() if s.text_only} == {Phase.UNDERSTAND, Phase.FINALIZE}
 
 
-def test_only_reproduce_can_write_files_from_scratch_and_only_patch_and_reproduce_can_edit():
+def test_only_reproduce_can_write_files_from_scratch_and_only_patch_can_edit_the_repository():
+    """REPRODUCE proves the bug under .anvil/; a real model given edit_file there fixed the bug instead of reproducing it."""
     editors = {p for p, s in PHASE_SPECS.items() if "edit_file" in s.tools}
-    assert editors == {Phase.REPRODUCE, Phase.PATCH}
+    assert editors == {Phase.PATCH}
     assert {p for p, s in PHASE_SPECS.items() if "write_repro" in s.tools} == {Phase.REPRODUCE}
 
 

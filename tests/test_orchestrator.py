@@ -182,10 +182,10 @@ def test_events_cover_every_type_and_usage_matches_the_steps(tmp_path):
     assert {"grep", "write_repro", "edit_file", "run_tests", "git_diff", "phase_done", "repro", "checkpoint"} <= tools_called
 
 
-def test_a_checkpoint_is_taken_at_the_start_of_patch_and_the_sandbox_is_closed(tmp_path):
+def test_checkpoints_are_taken_at_the_start_of_reproduce_and_of_patch_and_the_sandbox_is_closed(tmp_path):
     run = execute(happy(), tmp_path)
     events = run.pipeline.sandbox.events
-    assert events[0] == ("checkpoint", "patch-start", "ckpt-1")
+    assert events[:2] == [("checkpoint", "reproduce-start", "ckpt-1"), ("checkpoint", "patch-start", "ckpt-2")]
     assert events[-1] == ("close",)
     assert not any(e[0] == "rollback" for e in events)
 
@@ -302,8 +302,9 @@ def test_failing_verification_retries_then_rolls_back_and_asks_for_a_different_h
 
     sandbox_events = run.pipeline.sandbox.events
     assert [e for e in sandbox_events if e[0] in ("checkpoint", "rollback")] == [
-        ("checkpoint", "patch-start", "ckpt-1"),
-        ("rollback", "ckpt-1"),
+        ("checkpoint", "reproduce-start", "ckpt-1"),
+        ("checkpoint", "patch-start", "ckpt-2"),
+        ("rollback", "ckpt-2"),
     ]
     assert run.llm.remaining == 0
     assert len(run.llm.calls) == len(script), "failed verifications must not cost an LLM call"
@@ -398,7 +399,9 @@ def test_a_review_that_requests_changes_triggers_exactly_one_rework_round(tmp_pa
     assert "one rework round was made and was not re-reviewed" in run.report
     assert "Review: changes requested" in run.report
     assert run.done.data["resolved_confidence"] == pytest.approx(0.6)
-    assert [e[1] for e in run.pipeline.sandbox.events if e[0] == "checkpoint"] == ["patch-start", "before-rework"]
+    assert [e[1] for e in run.pipeline.sandbox.events if e[0] == "checkpoint"] == [
+        "reproduce-start", "patch-start", "before-rework"
+    ]
     assert run.llm.remaining == 0
 
 
@@ -412,7 +415,7 @@ def test_a_rework_that_fails_verification_restores_the_reviewed_patch(tmp_path):
     run = execute(script, tmp_path, max_patch_attempts=1)
 
     assert "+    return a + b" in run.patch and "a * b" not in run.patch
-    assert ("rollback", "ckpt-2") in run.pipeline.sandbox.events
+    assert ("rollback", "ckpt-3") in run.pipeline.sandbox.events, "the checkpoint taken before the rework"
     assert "the reviewed patch was restored" in run.report
     assert "Verified after patching: yes" in run.report
     assert run.done.data["resolved_confidence"] == pytest.approx(0.6)

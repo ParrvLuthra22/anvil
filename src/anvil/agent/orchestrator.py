@@ -156,6 +156,7 @@ class Orchestrator:
         self._runner: PhaseRunner | None = None
         self._repro_tool = WriteReproTool()
         self._checkpointer: Checkpointer | None = None
+        self._reproduce_ref: str | None = None  # the clean tree REPRODUCE started from, to undo edits made in it
 
     def run(self) -> None:
         """Execute the run; see ``run_harness`` for the guarantees."""
@@ -286,14 +287,46 @@ class Orchestrator:
             self._state.limit(f"The fault was not localized ({outcome.status.value}: {outcome.summary}).")
 
     def _reproduce(self) -> None:
+        self._enter(Phase.REPRODUCE)  # so the checkpoint's events belong to this phase, not LOCALIZE
+        self._reproduce_ref = self._checkpoint("reproduce-start")
         outcome = self._run_phase(Phase.REPRODUCE, phase_kickoff(Phase.REPRODUCE), gate=self._repro_gate, pin=True)
+        self._undo_source_edits()
         if not self._state.repro_confirmed:
             self._state.limit(
                 f"The bug was not reproduced ({outcome.status.value}: {outcome.summary}); confidence is capped at low."
             )
 
+    def _undo_source_edits(self) -> list[str]:
+        """Revert what the model changed outside ``.anvil/`` since REPRODUCE began; returns the files it had changed.
+
+        REPRODUCE proves the bug and must not fix it: a fixed tree makes the harness's own repro run exit 0, and a
+        real model that has fixed the bug then spends the phase trying to reproduce it against its own fix. The phase
+        offers no edit tool, but a shell command can still edit, so the tree is checked and reset here.
+        """
+        try:
+            changed = [change.path for change in changed_files(filter_diff(self._ws.sandbox.diff()))]
+        except Exception:  # noqa: BLE001 - without a readable diff there is nothing to undo
+            return []
+        if not changed:
+            return []
+        if not self._rollback(self._reproduce_ref):
+            self._state.limit(
+                f"The model changed source files during REPRODUCE ({', '.join(changed)}) and they could not be reverted."
+            )
+            return []
+        self._state.limit(f"The model changed source files during REPRODUCE ({', '.join(changed)}); the harness reverted them.")
+        return changed
+
     def _repro_gate(self, args: dict) -> str | None:
         """Accept REPRODUCE's ``phase_done`` only if the repro really fails when the harness runs it."""
+        reverted = self._undo_source_edits()
+        if reverted:
+            return (
+                f"You changed source files in this phase ({', '.join(reverted)}) and the harness has reverted them: "
+                "this phase only proves the bug exists, it must not fix it. Your repro script is still in place. Run "
+                "it, check that it now fails, and call phase_done again with a summary of the bug you reproduced, "
+                "not of a fix."
+            )
         cmd = str(args.get("repro_cmd") or "").strip()
         if not cmd:
             return "phase_done needs repro_cmd: the exact shell command that runs your repro script."

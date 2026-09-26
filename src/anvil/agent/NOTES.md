@@ -86,6 +86,14 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
   (up to `max_rollbacks`, 2) and the model is told the approaches already tried plus the last failing output.
   When both are used up the last patch is kept, unverified, at low confidence.
 - The repro script (written with `write_repro` under `.anvil/`) is saved and restored around every checkpoint and rollback.
+- **REPRODUCE must not fix the bug.** A checkpoint (`reproduce-start`) is taken when the phase begins, and the phase has no
+  `edit_file` (only `read_file`, `grep`, `run_cmd`, `write_repro`). A shell command can still edit, so when the model calls
+  `phase_done`, and again when the phase ends any other way, everything changed outside `.anvil/` is rolled back to that
+  checkpoint. At `phase_done` the call is then refused with a message saying so, so the model re-confirms on the original
+  code and does not hand a summary of a fix to the later phases; the report lists the reverted files under known limitations.
+  Without a usable checkpoint nothing can be reverted, and the report says that instead. This exists because a real model
+  fixed the bug during REPRODUCE, after which the harness's own repro run exited 0 and the model spent the rest of the phase
+  trying to reproduce a bug it had fixed.
 - A checkpoint result that is empty, `None` or starts with `error` is a failed checkpoint (a limitation is recorded and
   no rollback will be attempted). If a sandbox's checkpoint empties the working tree (a `git stash` does), the edited files
   are written back through the Sandbox interface; if that is impossible the checkpoint is undone and reported as failed.
@@ -118,7 +126,23 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
   the dependency state.
 - Default sandbox is `worktree`; Docker is opt-in and has been tested only with mocks (its containers have no network).
 
-## 4. Not implemented (do not document as features)
+## 4. What the LLM client absorbs (`src/anvil/llm/`), and why
+
+Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no other provider or model family has been run yet.
+
+- **Swallowed replies.** The provider bills tokens and returns `content: null` and no `tool_calls`, with `tools` attached and
+  also without them. In auto mode a swallowed native reply is repeated once in text mode; two of them in a run keep the client
+  in text mode. In text mode an empty but billed reply is asked again up to twice, with a reminder added for that call only and
+  a temperature of at least 0.5 (a greedy repeat is swallowed the same way). Cut-off replies, replies with no tokens billed
+  and reasoning-only replies are not retried. The tokens of every attempt are added to the response's usage and to the
+  budget, so the agent loop sees at most one reply and never a provider glitch. Explicit `tool_mode: native` stays strict.
+- **Call dialects read from text:** a fenced JSON block, Hermes/Qwen `<tool_call>` tags, Qwen3-Coder `<function=...>` XML
+  (also when the opening `<tool_call>` is missing, if the block is closed), bare JSON, and `tool_name(key="value")` as the last
+  thing in a reply for a known tool (read with `ast.literal_eval`; nothing is executed). Only the first call of a reply runs;
+  the model is told how many more there were.
+- Reasoning (`<think>` blocks, `reasoning_content`) is removed before parsing and never enters the history; its tokens are counted.
+
+## 5. Not implemented (do not document as features)
 
 - Installing dependencies for non-Python repositories beyond running the profile's `install_cmd` once; no venv-like isolation.
 - Scrubbing secrets from the environment of model-run commands beyond the sandbox's fixed list of API-key variables.
