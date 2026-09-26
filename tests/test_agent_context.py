@@ -217,7 +217,7 @@ def test_context_settings_have_sensible_defaults_and_come_from_config_yaml():
 
     settings = AgentSettings.from_mapping(load_config())
     assert settings.max_context_tokens == 32_000
-    assert settings.context_keep_steps == 6
+    assert settings.context_keep_steps == 3, "the token_saving value: features.token_budgets is on by default"
     assert settings.context_summarize_threshold == 0.75
     assert AgentSettings.from_mapping({}) == AgentSettings()
 
