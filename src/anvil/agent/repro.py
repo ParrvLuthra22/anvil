@@ -15,7 +15,10 @@ from anvil.tools.base import ToolResult
 
 
 class WriteReproTool:
-    """Create or overwrite a repro script inside the sandbox's ``.anvil/`` directory."""
+    """Create or overwrite a repro script inside the sandbox's ``.anvil/`` directory.
+
+    ``written`` lists, in order, the paths successfully written through this tool.
+    """
 
     name = "write_repro"
     description = (
@@ -31,6 +34,9 @@ class WriteReproTool:
         "required": ["path", "content"],
     }
 
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
     def run(self, args: dict, sandbox: Sandbox) -> ToolResult:
         """Write the script; failures come back as ``ok=False`` results, never exceptions."""
         raw, content = args.get("path"), args.get("content")
@@ -38,11 +44,15 @@ class WriteReproTool:
             return ToolResult(ok=False, output="Both 'path' and 'content' are required strings.")
         path = scratch_path(raw)
         if path is None:
-            return ToolResult(ok=False, output=f"Invalid path {raw!r}: it must be a relative file path inside {SCRATCH_DIR}/.")
+            return ToolResult(
+                ok=False, output=f"Invalid path {raw!r}: it must be a relative file path inside {SCRATCH_DIR}/."
+            )
         try:
             sandbox.write_file(path, content)
         except (OSError, ValueError) as exc:
             return ToolResult(ok=False, output=f"Could not write {path}: {exc}")
+        if path not in self.written:
+            self.written.append(path)
         return ToolResult(ok=True, output=f"Wrote {len(content)} characters to {path}.", meta={"path": path})
 
 

@@ -229,7 +229,8 @@ class PhaseRunner:
     def _run_tool(self, spec: PhaseSpec, call: _Call) -> tuple[bool, str, dict]:
         if call.name not in spec.tools:
             offered = ", ".join([*spec.tools, PHASE_DONE, GIVE_UP])
-            return False, f"Tool '{call.name}' is not available in the {spec.phase.value} phase. Use one of: {offered}.", {}
+            message = f"Tool '{call.name}' is not available in the {spec.phase.value} phase. Use one of: {offered}."
+            return False, message, {}
         try:
             tool = self._registry.get(call.name)
         except LookupError:

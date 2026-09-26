@@ -54,6 +54,18 @@ class AgentSettings:
             ),
         )
 
+    @classmethod
+    def fallback(cls, config: Mapping[str, Any]) -> AgentSettings:
+        """Defaults for a config that failed validation, keeping ``output_dir`` if that one is usable.
+
+        Where the results go matters even when some other key is broken: the run still owes
+        the caller its patch and report.
+        """
+        output_dir = config.get("output_dir")
+        if isinstance(output_dir, str) and output_dir.strip():
+            return cls(output_dir=output_dir.strip())
+        return cls()
+
     def cost_estimate(self, prompt_tokens: int, completion_tokens: int) -> float:
         """Estimated USD cost of one model call (0.0 unless prices are configured)."""
         return (

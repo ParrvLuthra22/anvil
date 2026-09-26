@@ -48,6 +48,14 @@ def test_invalid_values_raise_naming_the_key(bad):
         AgentSettings.from_mapping(bad)
 
 
+def test_fallback_is_the_defaults_but_keeps_a_usable_output_dir():
+    assert AgentSettings.fallback({"max_total_steps": "lots", "output_dir": " results "}).output_dir == "results"
+    assert AgentSettings.fallback({"output_dir": ""}) == AgentSettings()
+    assert AgentSettings.fallback({"output_dir": 3}) == AgentSettings()
+    assert AgentSettings.fallback({}) == AgentSettings()
+    assert AgentSettings.fallback({"max_total_steps": "lots"}).max_total_steps == AgentSettings().max_total_steps
+
+
 def test_cost_estimate_uses_configured_prices():
     settings = AgentSettings.from_mapping(
         {"cost_per_million_prompt_tokens": 2, "cost_per_million_completion_tokens": 10}

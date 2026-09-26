@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from anvil.agent.pipeline import Ingested, Workspace
 from anvil.llm.client import LLMResponse
+from anvil.repo.ingest import IssueRef
+from anvil.repo.profile import RepoProfile
 from anvil.sandbox.base import ExecResult
 from anvil.tools.base import ToolResult
 from tests.mock_llm import MockLLM
@@ -279,3 +282,61 @@ def project_exec(cmd: str, files: dict[str, str]) -> ExecResult:
 
 def project_sandbox() -> FakeSandbox:
     return FakeSandbox(project_files(), on_exec=project_exec)
+
+
+class StashStyleSandbox(FakeSandbox):
+    """A sandbox that behaves like the git-stash based one: it is deliberately *not* contract-clean.
+
+    ``checkpoint`` empties the working tree back to the baseline (untracked files such as the
+    repro vanish until a rollback), and ``rollback`` consumes the ref (a second rollback to it
+    just resets to the baseline). The orchestrator must keep the repro alive through both.
+    """
+
+    def checkpoint(self, label: str) -> str:
+        ref = super().checkpoint(label)
+        self.files = dict(self._baseline)
+        return ref
+
+    def rollback(self, ref: str) -> None:
+        snapshot = self._snapshots.pop(ref, None)
+        self.files = dict(snapshot if snapshot is not None else self._baseline)
+        self.events.append(("rollback", ref))
+
+
+# ---- pipeline -------------------------------------------------------------------------------
+
+ISSUE_URL = "https://github.com/acme/calc/issues/7"
+
+
+def project_issue() -> IssueRef:
+    return IssueRef(
+        "acme", "calc", 7, ISSUE_URL,
+        title="add() returns the wrong sum", body="add(2, 3) returns -1 instead of 5.",
+    )
+
+
+class FakePipeline:
+    """A ``Pipeline`` that hands out a prepared sandbox and registry; either step can be made to fail."""
+
+    def __init__(
+        self,
+        sandbox: FakeSandbox | None = None,
+        registry: FakeRegistry | None = None,
+        *,
+        fail_ingest: Exception | None = None,
+        fail_profile: Exception | None = None,
+    ) -> None:
+        self.sandbox = sandbox or project_sandbox()
+        self.registry = registry or FakeRegistry()
+        self.fail_ingest, self.fail_profile = fail_ingest, fail_profile
+
+    def ingest(self, issue_url: str) -> Ingested:
+        if self.fail_ingest:
+            raise self.fail_ingest
+        return Ingested(project_issue(), self.sandbox.root)
+
+    def profile(self, ingested: Ingested) -> Workspace:
+        if self.fail_profile:
+            raise self.fail_profile
+        profile = RepoProfile(["python"], "python", "pip install -e .", "pytest", "pytest")
+        return Workspace(ingested.issue, profile, "calc.py\ntests/test_calc.py", self.sandbox, self.registry)
