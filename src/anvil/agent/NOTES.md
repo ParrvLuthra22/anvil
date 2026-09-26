@@ -151,3 +151,40 @@ Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no othe
 - A wall-clock check in the middle of a tool call.
 - Any model other than through an OpenAI-compatible chat-completions endpoint.
 - Checking out a commit SHA (see the revision paragraph above), and the command-line flag for `git_ref` (the entry point's job).
+
+## 6. Feature switches (`features:` in `config.yaml`)
+
+Each switch is on unless set to `false`, and off restores the behaviour from before it existed. The numbers behind
+`token_budgets` are under `token_saving:`.
+
+- **`token_budgets`** (spend fewer tokens per model call)
+  - A `read_file` result of more than `token_saving.read_file_max_lines` (150) lines becomes its first 60 lines, an outline
+    of the definitions in the rest (`line: signature`, at most 80) and a hint to call `read_file` with a line range. Only
+    numbered file text is treated so; short reads and other tools' output are untouched. Flask's `blueprints.py` went from
+    about 6,400 tokens to about 900.
+  - Each phase has a call cap (UNDERSTAND 1, LOCALIZE 8, REPRODUCE 10, PATCH 15, VERIFY 8, REVIEW 3; per PATCH attempt). The
+    call after the cap is a forced close: only `phase_done` and `give_up` are offered, with a phase-specific instruction to
+    summarise the best findings so far, any other tool is refused, and `phase_done` still goes through the phase's gate. The
+    report lists the phases closed this way. A cap at or above `max_steps_per_phase` never comes up.
+  - `context_keep_steps` and `tool_output_char_cap` are only ever tightened (to 3 and 4000), and the repository map is
+    `token_saving.repo_map_chars` (3000) instead of 6000 characters.
+  - `report.md` gets a "Tokens by phase" table (calls, prompt and completion tokens, prompt tokens per call, and a total).
+- **`weak_model_prompts`**: every phase gets a shorter system prompt (a third fewer characters overall): one shared list of
+  rules (exactly ONE tool call per turn, read a file before editing it, smallest change that fixes the issue, never edit
+  tests, end with `phase_done`) and one example call per phase, which a test parses against the real tool schemas. PATCH and
+  REVIEW add how errors are raised: the most specific built-in exception with a clear message, never `assert` for input
+  validation, and follow how the module already reports similar errors. Same tools and the same `Phase: NAME` marker as the
+  original prompts, which come back unchanged with the switch off.
+- **`patch_sanity`**: before FINALIZE the patch is built from the diff without `.anvil/`, `.anvil_venv/`, `*.egg-info`, bytecode
+  and binary sections; changes to test files are taken out of it unless the issue is about tests (the title mentions tests,
+  testing, coverage or flakiness, or the text asks to add or write tests); it must not be empty; and `git apply --check` must
+  accept it in a scratch worktree at the base commit (created outside the repository and removed again; skipped, and said
+  so, outside a git checkout or when git cannot make the worktree). An empty or non-applying patch gets ONE forced-fix retry:
+  a PATCH attempt whose prompt carries the reason, then the usual verification (test edits are undone first when they were
+  the problem). The outcome (`passed`, `passed after one forced-fix retry`, `FAILED ...`, or a skipped check) is a line in
+  the Outcome section of `report.md` and a fact in the closing summary. A patch that still fails is delivered anyway,
+  flagged, with confidence capped at low. A run the budget stopped is checked without a retry.
+- **`nav_tools`**: the `outline(path)` and `find_symbol(name)` tools are offered in LOCALIZE and PATCH only, with a line in
+  the prompt; `find_references` is never offered. A tool the registry does not have is skipped, so the switch does nothing
+  until those tools are merged. Its effect on tokens has not been measured yet; if the per-call total does not drop on the
+  Flask instance the default should become `false`.

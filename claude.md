@@ -16,7 +16,7 @@ Round 1: AI evaluation — the evaluator runs our repo unattended and feeds it a
 - Parrv (lead/integrator): src/anvil/llm/, src/anvil/agent/, src/anvil/context/, src/anvil/events.py, config.yaml, pyproject.toml
 - Akshat: src/anvil/repo/, src/anvil/tools/, src/anvil/sandbox/, tests for those
 - Sneha: Makefile, src/anvil/tui/, src/anvil/trace/, src/anvil/__main__.py, bench/, tests/mock_llm.py, README.md, docs/
-Git: one branch per person (parrv/…, akshat/…, sneha/…); rebase on main and merge to main about every hour; small commits; never force-push main. Feature freeze 12:30 AM; final tag by 2:00 AM.
+Git: one branch per person (parrv/…, akshat/…, sneha/…); rebase on main and merge to main about every hour; small commits; never force-push main. Feature freeze 8:00 AM on 27 Sep 2026; submission deadline 10:00 AM on 27 Sep 2026.
 
 ## Tech stack
 Python 3.11, Textual (TUI), httpx (HTTP), pyyaml, pytest, rich. ripgrep (`rg`) preferred for search, falling back to grep. macOS is the dev machine (M3 8GB dev, M4 16GB final test). Docker is OPTIONAL (auto-detected); the default sandbox is a plain-subprocess + git-worktree sandbox.
