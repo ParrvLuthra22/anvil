@@ -19,7 +19,8 @@ DEFAULT_READ_FILE_HEAD_LINES = 60
 DEFAULT_TOKEN_SAVING_KEEP_STEPS = 3
 DEFAULT_TOKEN_SAVING_OUTPUT_CAP = 4000
 DEFAULT_REPO_MAP_CHARS = 3000
-_FEATURES = ("token_budgets", "weak_model_prompts", "patch_sanity", "nav_tools")
+# The features and whether each is on when ``config.yaml`` does not say. nav_tools is off until its token effect is measured.
+_FEATURE_DEFAULTS = {"token_budgets": True, "weak_model_prompts": True, "patch_sanity": True, "nav_tools": False}
 _LEGACY_OUTPUT_CAP = 8000  # the value used for tool_output_char_cap when it is absent and token_budgets is off
 
 
@@ -48,7 +49,7 @@ class AgentSettings:
     token_budgets: bool = True
     weak_model_prompts: bool = True
     patch_sanity: bool = True
-    nav_tools: bool = True
+    nav_tools: bool = False
     read_file_max_lines: int = DEFAULT_READ_FILE_MAX_LINES
     read_file_head_lines: int = DEFAULT_READ_FILE_HEAD_LINES
     repo_map_chars: int = DEFAULT_REPO_MAP_CHARS
@@ -129,15 +130,15 @@ class AgentSettings:
 
 
 def _features(config: Mapping[str, Any]) -> dict[str, bool]:
-    """The ``features`` switches: each is on unless set to false; anything but a true/false value is an error."""
+    """The ``features`` switches, each at its default (``_FEATURE_DEFAULTS``) unless set; anything but true/false is an error."""
     section = config.get("features")
     if section is None:
         section = {}
     if not isinstance(section, Mapping):
         raise ValueError(f"'features' must be a mapping of switches, got {section!r}")
     flags = {}
-    for name in _FEATURES:
-        value = section.get(name, True)
+    for name, default in _FEATURE_DEFAULTS.items():
+        value = section.get(name, default)
         if not isinstance(value, bool):
             raise ValueError(f"'features.{name}' must be true or false, got {value!r}")
         flags[name] = value

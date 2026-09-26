@@ -154,7 +154,7 @@ Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no othe
 
 ## 6. Feature switches (`features:` in `config.yaml`)
 
-Each switch is on unless set to `false`, and off restores the behaviour from before it existed. The numbers behind
+Each switch is on unless set to `false` (except `nav_tools`, which is off until measured), and off restores the behaviour from before it existed. The numbers behind
 `token_budgets` are under `token_saving:`.
 
 - **`token_budgets`** (spend fewer tokens per model call)
@@ -184,7 +184,6 @@ Each switch is on unless set to `false`, and off restores the behaviour from bef
   the problem). The outcome (`passed`, `passed after one forced-fix retry`, `FAILED ...`, or a skipped check) is a line in
   the Outcome section of `report.md` and a fact in the closing summary. A patch that still fails is delivered anyway,
   flagged, with confidence capped at low. A run the budget stopped is checked without a retry.
-- **`nav_tools`**: the `outline(path)` and `find_symbol(name)` tools are offered in LOCALIZE and PATCH only, with a line in
-  the prompt; `find_references` is never offered. A tool the registry does not have is skipped, so the switch does nothing
-  until those tools are merged. Its effect on tokens has not been measured yet; if the per-call total does not drop on the
-  Flask instance the default should become `false`.
+- **`nav_tools`** (**off by default**): with it on, the `outline(path)` and `find_symbol(name)` tools are offered in LOCALIZE and
+  PATCH only, with a line in the prompt; `find_references` is never offered. A tool the registry does not have is skipped. Its
+  effect on tokens has not been measured, so it stays off until a real run shows tokens per call dropping.
