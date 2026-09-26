@@ -276,7 +276,7 @@ def _xml_call(name: str, body: str, index: Mapping[str, Mapping[str, str]]) -> d
 
 def _coerce(raw: str, declared: str | None) -> Any:
     """An XML parameter's text as the value it stands for: by the schema's type if known, else by how it looks."""
-    value = re.sub(r"^\r?\n|\r?\n$", "", raw)
+    value = re.sub(r"\A\r?\n|\r?\n\Z", "", raw)  # the template's own newlines; \Z, since $ also matches before a final "\n"
     if declared == "string":
         return value
     looks_json = value.strip()[:1] in ("{", "[") or value.strip() in ("true", "false", "null") or re.fullmatch(

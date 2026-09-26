@@ -179,6 +179,17 @@ def test_xml_multiline_values_keep_their_inner_newlines_and_indentation():
     assert calls(reply) == [("edit_file", {"new": "def f():\n    return 1"})]
 
 
+def test_xml_strips_exactly_the_templates_own_newline_so_a_files_final_newline_survives():
+    # the template writes "\n" + value + "\n": a value that itself ends in "\n" arrives with a blank line before the closer
+    reply = "<tool_call><function=edit_file><parameter=new>\ndef f():\n    return 1\n\n</parameter></function></tool_call>"
+    assert calls(reply) == [("edit_file", {"new": "def f():\n    return 1\n"})]
+
+
+def test_xml_value_of_only_newlines_is_not_eaten_whole():
+    reply = "<tool_call><function=edit_file><parameter=new>\n\n\n</parameter></function></tool_call>"
+    assert calls(reply) == [("edit_file", {"new": "\n"})]
+
+
 # ---- bare JSON --------------------------------------------------------------------------------------
 
 

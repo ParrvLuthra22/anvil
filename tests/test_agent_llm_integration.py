@@ -161,3 +161,99 @@ def test_a_compacted_history_is_still_accepted_by_a_strict_provider(tmp_path, mo
         events.append(queue.get_nowait())
     assert not [e for e in events if e.type == "error"]
     assert events[-1].type == "done" and events[-1].data["resolved_confidence"] == pytest.approx(0.9)
+
+
+# ---- DeepSeek- and Qwen-shaped endpoints, whole runs ----------------------------------------------------------
+
+THOUGHT = "Let me think about what the next step should be."
+
+
+def _text_violations(messages: list[dict]) -> list[str]:
+    """What a Mistral/Gemma/Qwen chat template rejects, checked on a text-mode request."""
+    problems = []
+    for i, m in enumerate(messages):
+        if m["role"] == "system" and i != 0:
+            problems.append("system message that is not first")
+        if m["role"] not in ("system", "user", "assistant") or "tool_calls" in m or "tool_call_id" in m:
+            problems.append(f"tool-calling fields or role {m['role']!r} in a text-mode request")
+        if not m.get("content"):
+            problems.append(f"empty {m['role']} message")
+    turns = [m["role"] for m in messages if m["role"] != "system"]
+    if turns[:1] != ["user"] or any(a == b for a, b in zip(turns, turns[1:])):
+        problems.append(f"roles do not alternate: {turns}")
+    return problems
+
+
+def _dialect_server(script, dialect: str, problems: list[str], requests: list[dict]) -> httpx.MockTransport:
+    replies = iter(script)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if "tools" not in payload:
+            problems.extend(_text_violations(payload["messages"]))
+        elif payload["messages"][0]["role"] != "system":
+            problems.append("native request without a leading system message")
+        scripted = next(replies)
+        call = scripted.tool_calls[0]
+        usage = dict(scripted.usage)
+        message: dict = {"role": "assistant", "content": scripted.text}
+        if dialect == "qwen-hermes":  # vLLM without a tool parser: the call arrives as text, `tools` is ignored
+            arguments = json.dumps({"name": call["tool"], "arguments": call["args"]})
+            message["content"] = f"<think>\n{THOUGHT}\n</think>\n\n{scripted.text}\n<tool_call>\n{arguments}\n</tool_call>".strip()
+        elif dialect == "qwen-xml":  # Qwen3-Coder
+            params = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in call["args"].items())
+            message["content"] = f"<think>{THOUGHT}</think>\n<tool_call>\n<function={call['tool']}>\n{params}</function>\n</tool_call>"
+        elif dialect == "deepseek-native":
+            message["tool_calls"] = [
+                {"id": call["id"], "type": "function", "function": {"name": call["tool"], "arguments": json.dumps(call["args"])}}
+            ]
+            message["reasoning_content"] = THOUGHT
+            usage["completion_tokens_details"] = {"reasoning_tokens": 7}
+        return httpx.Response(200, json={"choices": [{"message": message}], "usage": usage})
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize(
+    "dialect, tool_mode",
+    [
+        ("qwen-hermes", "auto"),
+        ("qwen-hermes", "text"),
+        ("qwen-xml", "text"),
+        ("deepseek-native", "auto"),
+        ("deepseek-native", "native"),
+    ],
+)
+def test_a_whole_run_through_a_deepseek_or_qwen_shaped_endpoint(tmp_path, monkeypatch, dialect, tool_mode):
+    monkeypatch.setenv("AI_API_KEY", "test-key-not-a-secret")
+    problems: list[str] = []
+    requests: list[dict] = []
+    model = "deepseek-chat" if dialect.startswith("deepseek") else "Qwen/Qwen2.5-Coder-32B-Instruct"
+    config = {
+        "model": model, "base_url": "http://provider.invalid/v1", "tool_mode": tool_mode, "output_dir": str(tmp_path / "out"),
+    }
+    client = make_client(config, transport=_dialect_server(happy(), dialect, problems, requests))
+    bus = EventBus()
+    queue = bus.subscribe()
+
+    run_harness(ISSUE_URL, config, bus, llm=client, pipeline=FakePipeline())
+
+    assert problems == []
+    assert len(requests) == HAPPY_STEPS
+    assert "+    return a + b" in (tmp_path / "out" / "patch.diff").read_text()
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [e.data for e in events if e.type == "error"] == []
+    done = events[-1]
+    assert done.type == "done" and done.data["resolved_confidence"] == pytest.approx(0.9)
+    assert done.data["tokens"] == 100 * HAPPY_STEPS, "usage is the provider's, reasoning included"
+
+    sent = " ".join(json.dumps(r["messages"]) for r in requests)
+    assert THOUGHT not in sent and "<think>" not in sent, "reasoning must not travel back to the model in the history"
+    assert requests[0]["model"] == model and requests[0]["max_tokens"] == 8192, "the DeepSeek/Qwen profile's output cap is sent"
+    if dialect == "qwen-hermes" and tool_mode == "auto":
+        assert client.active_tool_mode == "text", "two calls arrived as text, so the client moved to text mode for good"
+        assert "tools" not in requests[-1]
+    assert client.reasoning_seen
