@@ -82,6 +82,62 @@ def test_deleting_a_scratch_file_is_filtered_too():
     assert filter_diff(deletion + SRC_DIFF) == SRC_DIFF
 
 
+# ---- generated junk and binary sections -----------------------------------------------------
+
+
+def _new_file(path: str, body: str = "+x\n") -> str:
+    return f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n{body}"
+
+
+def _binary_file(path: str) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..bac5460\n"
+        f"Binary files /dev/null and b/{path} differ\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "__pycache__/calc.cpython-311.pyc",
+        "tests/__pycache__/test_calc.cpython-311-pytest-9.1.1.pyc",
+        "pkg/mod.pyc",
+        ".pytest_cache/README.md",
+        ".mypy_cache/3.11/meta.json",
+        ".ruff_cache/CACHEDIR.TAG",
+        ".tox/py311/log.txt",
+        ".venv/lib/site.py",
+        "venv/bin/activate",
+        "node_modules/left-pad/index.js",
+        "src/calc.egg-info/PKG-INFO",
+    ],
+)
+def test_generated_artefacts_never_reach_the_patch(path):
+    assert filter_diff(SRC_DIFF + _new_file(path)) == SRC_DIFF
+
+
+def test_a_binary_section_is_dropped_because_git_apply_cannot_take_it():
+    assert filter_diff(SRC_DIFF + _binary_file("assets/logo.png")) == SRC_DIFF
+    literal = "diff --git a/x.bin b/x.bin\nnew file mode 100644\nGIT binary patch\nliteral 3\nKcmZQzKmY\n\n"
+    assert filter_diff(literal + SRC_DIFF) == SRC_DIFF
+
+
+def test_a_diff_of_only_junk_is_empty_so_it_cannot_pass_for_a_patch():
+    assert filter_diff(_binary_file("__pycache__/a.pyc") + _new_file(".pytest_cache/README.md")) == ""
+
+
+@pytest.mark.parametrize(
+    "path", ["my__pycache__/mod.py", "src/venv_utils/tools.py", "docs/node_modules_guide.md", "src/calc_egg_info.py"]
+)
+def test_lookalike_paths_are_kept(path):
+    assert filter_diff(_new_file(path)) == _new_file(path)
+
+
+def test_real_source_changes_survive_alongside_every_kind_of_junk():
+    junk = _binary_file("__pycache__/calc.pyc") + REPRO_DIFF + _new_file(".pytest_cache/README.md")
+    assert filter_diff(junk + SRC_DIFF + junk) == SRC_DIFF
+
+
 # ---- changed_files --------------------------------------------------------------------------
 
 

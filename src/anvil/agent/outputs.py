@@ -9,6 +9,13 @@ from pathlib import Path
 from anvil.agent.state import RunState
 
 SCRATCH_DIR = ".anvil"
+# Directories that tools and test runs generate inside a checkout. A sandbox diff lists untracked
+# files, so in a repo without a matching .gitignore they would otherwise end up in the patch.
+ARTEFACT_DIRS = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".venv", "venv", "node_modules"}
+)
+_ARTEFACT_SUFFIXES = (".pyc", ".pyo")
+_BINARY_MARKERS = ("Binary files ", "GIT binary patch")
 _DEV_NULL = "/dev/null"
 _GIT_HEADER = "diff --git "
 
@@ -23,13 +30,16 @@ class FileChange:
 
 
 def filter_diff(diff: str) -> str:
-    """Return ``diff`` without the sections that touch ``.anvil/`` (the repro scripts).
+    """Return ``diff`` reduced to the changes a maintainer would want.
 
-    Understands ``git diff`` output and plain unified diffs. Text that is not part
-    of any file section (a stray status line from a sandbox, say) is dropped, so
-    the result is either empty or a patch ``git apply`` can take.
+    Dropped: the sections that touch ``.anvil/`` (the repro scripts), generated artefacts
+    (``__pycache__``, ``.pytest_cache``, ``*.egg-info``, ...) and binary sections. The
+    model works in text, so a binary change is always an artefact, and it would make
+    ``git apply`` reject the whole patch. Understands ``git diff`` output and plain
+    unified diffs; text outside any file section (a stray status line from a sandbox,
+    say) is dropped too, so the result is either empty or a patch ``git apply`` can take.
     """
-    kept = ["".join(section) for section in _sections(diff) if not _is_scratch(section)]
+    kept = ["".join(section) for section in _sections(diff) if not _is_excluded(section)]
     patch = "".join(kept)
     return patch if not patch or patch.endswith("\n") else patch + "\n"
 
@@ -131,5 +141,22 @@ def _clean(path: str) -> str:
     return path.strip().strip('"')
 
 
-def _is_scratch(section: list[str]) -> bool:
-    return any(p == SCRATCH_DIR or p.startswith(SCRATCH_DIR + "/") for p in _paths(section))
+def _is_excluded(section: list[str]) -> bool:
+    paths = [p for p in _paths(section) if p != _DEV_NULL]
+    return any(_is_scratch(p) or _is_artefact(p) for p in paths) or _is_binary(section)
+
+
+def _is_scratch(path: str) -> bool:
+    return path == SCRATCH_DIR or path.startswith(SCRATCH_DIR + "/")
+
+
+def _is_artefact(path: str) -> bool:
+    parts = path.split("/")
+    return (
+        any(part in ARTEFACT_DIRS or part.endswith(".egg-info") for part in parts[:-1])
+        or path.endswith(_ARTEFACT_SUFFIXES)
+    )
+
+
+def _is_binary(section: list[str]) -> bool:
+    return any(line.startswith(_BINARY_MARKERS) for line in section)
