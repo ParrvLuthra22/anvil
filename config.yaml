@@ -7,6 +7,19 @@ model: gemini-2.0-flash
 base_url: https://generativelanguage.googleapis.com/v1beta/openai/
 temperature: 0
 
+# How tools are offered to the model.
+#   native: use the provider's tool-calling API
+#   text:   describe the tools in the prompt and parse a fenced JSON block from the reply
+#   auto:   try native, fall back to text permanently if the provider can't do it
+tool_mode: auto
+
+# LLM transport: retries on 429 / 5xx / network errors use exponential backoff with jitter.
+llm_max_attempts: 5             # total tries per request, including the first
+llm_timeout_seconds: 120        # per-request read/write timeout
+llm_connect_timeout_seconds: 10
+llm_backoff_base_seconds: 1.0
+llm_backoff_max_seconds: 60     # cap on any single wait, including a Retry-After header
+
 # Budgets: the run stops gracefully (still emitting patch + report) when any is hit.
 max_steps_per_phase: 25
 max_total_steps: 120
