@@ -145,6 +145,8 @@ class Orchestrator:
             keep_steps=self._settings.context_keep_steps,
             summarize_threshold=self._settings.context_summarize_threshold,
             summarizer=HistorySummarizer(lambda: self._llm, self._budget, self._emitter, self._settings),
+            read_file_max_lines=self._settings.read_file_max_lines if self._settings.token_budgets else None,
+            read_file_head_lines=self._settings.read_file_head_lines,
         )
         self._state = RunState(issue_url)
         self._llm = llm
