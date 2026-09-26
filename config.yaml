@@ -45,6 +45,10 @@ context_summarize_threshold: 0.75
 max_patch_attempts: 3
 max_rollbacks: 2
 
+# Install the repository's dependencies after profiling (Python: into a venv in .anvil_venv, put first on
+# PATH for every command). Without them the tests usually cannot import the code. Set false to skip.
+install_dependencies: true
+
 # Timeout for commands the harness itself runs (repro checks) and where run artifacts go.
 command_timeout_seconds: 120
 output_dir: output
