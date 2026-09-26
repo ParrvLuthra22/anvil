@@ -20,6 +20,7 @@ written and a ``done`` event is emitted.
 from __future__ import annotations
 
 import os
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ from anvil.agent.prompts import (
 )
 from anvil.agent.recovery import Checkpointer, ErrorClass
 from anvil.agent.repro import WriteReproTool
+from anvil.agent.sanity import PatchCheck, inspect_patch, issue_is_about_tests
 from anvil.agent.settings import AgentSettings
 from anvil.agent.state import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, CheckRun, RunState
 from anvil.agent.summarizer import HistorySummarizer
@@ -159,6 +161,10 @@ class Orchestrator:
         self._repro_tool = WriteReproTool()
         self._checkpointer: Checkpointer | None = None
         self._reproduce_ref: str | None = None  # the clean tree REPRODUCE started from, to undo edits made in it
+        self._sanity_done = False
+        self._sanity_retried = False  # the one forced-fix retry of features.patch_sanity has been spent
+        self._sanity_first_problem = ""
+        self._sanity_patch: str | None = None  # the patch as delivered, after the sanity check took test files out
 
     def run(self) -> None:
         """Execute the run; see ``run_harness`` for the guarantees."""
@@ -208,6 +214,7 @@ class Orchestrator:
         self._localize()
         self._reproduce()
         self._solve()
+        self._sanity(allow_retry=True)
 
     # ---- INGEST / PROFILE ---------------------------------------------------------------------
 
@@ -419,6 +426,89 @@ class Orchestrator:
         else:
             state.limit("The reviewer's requested rework failed verification and could not be rolled back.")
 
+    # ---- the patch sanity check (features.patch_sanity) -----------------------------------------
+
+    def _deliverable_patch(self) -> str:
+        """The patch that goes into the outputs: the diff, after the sanity check has taken test files out of it."""
+        self._sanity(allow_retry=False)
+        return self._sanity_patch if self._sanity_patch is not None else self._patch_text()
+
+    def _sanity(self, *, allow_retry: bool) -> None:
+        """Check the patch before it is delivered; an empty or non-applying one gets one forced-fix retry.
+
+        Runs once. With ``allow_retry`` false (the run is already over) it only looks and records. The outcome
+        goes to ``report.md``; a patch that still fails is delivered anyway, with the confidence capped at low.
+        """
+        if not self._settings.patch_sanity or self._sanity_done or self._workspace is None:
+            return
+        try:
+            check = self._inspect_patch()
+            if check.problem and allow_retry:
+                self._sanity_retried = True
+                self._sanity_first_problem = check.problem
+                self._emitter.message("system", f"Patch sanity: {check.problem} One forced-fix retry follows.")
+                self._forced_fix(check)
+                check = self._inspect_patch()
+        except (BudgetExceeded, RunAborted):
+            raise  # the run ends as it would anywhere else; _finalize records what the patch looked like then
+        except Exception as exc:  # noqa: BLE001 - the check is a safeguard, never a reason to lose the run
+            self._sanity_done = True
+            self._state.sanity = f"not run ({type(exc).__name__}: {exc})"
+            return
+        self._record_sanity(check)
+
+    def _inspect_patch(self) -> PatchCheck:
+        issue = self._state.issue
+        about_tests = bool(issue and issue_is_about_tests(issue.title, issue.body))
+        return inspect_patch(self._ws.sandbox, self._patch_text(), allow_tests=about_tests)
+
+    def _forced_fix(self, check: PatchCheck) -> None:
+        """The one retry: a PATCH attempt told why the patch cannot be delivered, then the usual verification."""
+        state = self._state
+        self._revert_files(check.removed_tests)  # the retry starts without the test edits it was told not to make
+        state.patch_attempts += 1
+        kickoff = patch_kickoff(
+            attempt=state.patch_attempts,
+            repro_cmd=state.repro_cmd,
+            repro_output=state.repro_output,
+            feedback=check.problem,
+            kind="sanity",
+        )
+        self._run_phase(Phase.PATCH, kickoff, gate=self._patch_gate)
+        state.verified = self._verify().passed
+
+    def _revert_files(self, paths: Sequence[str]) -> None:
+        """Put ``paths`` back as they are in the base commit (a file that is not tracked is removed)."""
+        for path in paths:
+            quoted = shlex.quote(path)
+            self._exec(f"git checkout HEAD -- {quoted} 2>/dev/null || rm -f -- {quoted}")
+
+    def _record_sanity(self, check: PatchCheck) -> None:
+        state = self._state
+        self._sanity_done = True
+        self._sanity_patch = check.patch
+        retried = self._sanity_retried
+        if check.ok:
+            outcome = "passed"
+            if retried:
+                outcome += f" after one forced-fix retry (the first patch was refused: {self._sanity_first_problem})"
+            if check.removed_tests:
+                outcome += f". Changes to test files were taken out of the patch: {', '.join(check.removed_tests)}"
+            if not check.apply_checked:
+                outcome += f". git apply --check was skipped: {check.skipped or 'not run'}"
+        else:
+            state.sanity_failed = True
+            outcome = f"FAILED{' after one forced-fix retry' if retried else ''}: {check.problem}"
+            if state.halted:
+                outcome += (
+                    f" (the retry was cut short: the run stopped: {state.halted})"
+                    if retried
+                    else f" (no retry: the run had already stopped: {state.halted})"
+                )
+            state.limit(f"The patch failed its sanity check: {check.problem}")
+        state.sanity = outcome
+        self._emitter.message("system", f"Patch sanity: {outcome}")
+
     def _patch_gate(self, args: dict) -> str | None:
         if self._patch_text():
             return None
@@ -549,7 +639,7 @@ class Orchestrator:
         patch = ""
         try:
             self._enter(Phase.FINALIZE)
-            patch = self._patch_text()
+            patch = self._deliverable_patch()
             if patch and not self._state.halted:
                 self._write_summary(patch)
         except Exception as exc:  # noqa: BLE001
@@ -590,6 +680,8 @@ class Orchestrator:
             f"- Review: {state.review}",
             f"- Files changed: {', '.join(f.path for f in changed_files(patch)) or 'none'}",
         ]
+        if state.sanity:
+            lines.append(f"- Patch sanity: {state.sanity}")
         if state.warnings:
             lines.append("- Warnings: " + "; ".join(state.warnings))
         if state.limitations:

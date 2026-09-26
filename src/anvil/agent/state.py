@@ -44,6 +44,8 @@ class RunState:
     limitations: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # things a reader of the report must not miss
     halted: str = ""  # why the run was cut short (budget, aborted, error, interrupted), if it was
+    sanity: str = ""  # the outcome of the pre-delivery patch check, one line for report.md ("" when it did not run)
+    sanity_failed: bool = False  # the patch is empty or does not apply even after the one forced-fix retry
 
     def limit(self, note: str) -> None:
         """Record a known limitation for the report (duplicates are ignored)."""
@@ -66,6 +68,8 @@ class RunState:
         """
         if not has_patch:
             return "none"
+        if self.sanity_failed:
+            return "low"  # a patch that cannot be applied cannot be trusted whatever else is true of it
         if not (self.repro_confirmed and self.verified):
             return "low"
         clean = self.review == REVIEW_APPROVED and all(c.passed for c in self.checks) and not self.halted
