@@ -66,7 +66,7 @@ Finish with phase_done(summary): what you changed and why. If no fix is possible
 
 _VERIFY = """\
 Phase: VERIFY. Check the patch for real. Tools: run_tests, run_cmd, read_file, git_diff.
-The harness has already re-run the repro; its result is in the message below. Now run the relevant tests: first those near the changed code (run_tests with a target), then the wider suite if it is fast. A failure caused by the patch means verification failed. A failure that plainly exists without the patch (unrelated, pre-existing) should be mentioned in the summary but is not a failure of the patch.
+The harness has already re-run the repro; its result is in the message below. Now run the relevant tests: first those near the changed code (run_tests with targets), then the wider suite if it is fast. A failure caused by the patch means verification failed. A failure that plainly exists without the patch (unrelated, pre-existing) should be mentioned in the summary but is not a failure of the patch.
 Call phase_done(summary) if the repro and the relevant tests pass. Otherwise call give_up(reason), where reason is the essential failing output (test names and the key assertion or traceback lines, at most 30 lines) plus your diagnosis."""
 
 _REVIEW = """\
@@ -122,7 +122,7 @@ _WEAK_VERIFY = """\
 Phase: VERIFY. The harness already re-ran the repro; its result is below. Tools: run_tests, run_cmd, read_file, git_diff.
 Run the tests near the changed code, then the wider suite if it is fast. A failure caused by the patch fails verification; a plainly pre-existing, unrelated failure is only mentioned.
 phase_done(summary) if the repro and the relevant tests pass. Otherwise give_up(reason) with the essential failing output (at most 30 lines) and your diagnosis.
-Example call: run_tests(target="tests/test_calc.py")"""
+Example call: run_tests(targets=["tests/test_calc.py"])"""
 
 _WEAK_REVIEW = """\
 Phase: REVIEW. Review the patch as a strict maintainer. Tools: git_diff, read_file.
@@ -328,7 +328,7 @@ def environment_note(profile: RepoProfile, deps: str = "") -> str:
     elif interpreter:
         lines.append(f"- Toolchain: `{interpreter}`.")
     lines.append(
-        f"- Test command: `{profile.test_cmd}` (the run_tests tool runs it; pass a target to narrow it)."
+        f"- Test command: `{profile.test_cmd}` (the run_tests tool runs it; pass targets to narrow it)."
         if profile.test_cmd
         else "- No test command was detected; find how the tests are run before relying on them."
     )
