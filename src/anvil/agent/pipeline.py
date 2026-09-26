@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from anvil.agent.outputs import DEPS_VENV_DIR, SCRATCH_DIR
 from anvil.agent.prepared_sandbox import PreparedSandbox
@@ -35,11 +36,28 @@ RegistryFactory = Callable[[RepoProfile], ToolRegistry]
 # (``anvil.repo.deps.ensure_deps`` is the real one). Notify takes a level ("info" or "warning") and a message.
 DepsInstaller = Callable[[Sandbox, RepoProfile], Any]
 Notify = Callable[[str, str], None]
+# Says which revision an issue was reported against: ``anvil.repo.ingest.resolve_base_ref(issue_ref)``. It may return
+# ``None``, a ref string, or something with ``ref``, ``reason`` and ``already_fixed`` (an object or a mapping).
+BaseRefResolver = Callable[[IssueRef], Any]
 _REPORT_CHARS = 600
+_REF_FIELDS = ("ref", "base_ref", "base_sha", "sha")
+_DEFAULT_BRANCH = "default branch"
 
 
 class IssueFetchError(RuntimeError):
     """GitHub did not give us the issue (rate limit, not found, network), so there is nothing to work from."""
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """Which revision of the repository was checked out, and why."""
+
+    ref: str | None
+    """The branch, tag or commit checked out; ``None`` is the repository's default branch."""
+    reason: str
+    """One line saying where the ref came from, or why the default branch was used."""
+    already_fixed: bool = False
+    """The fix for the issue is already merged, so a checkout of the default branch may not contain the bug."""
 
 
 @dataclass
@@ -48,6 +66,7 @@ class Ingested:
 
     issue: IssueRef
     repo_root: Path
+    checkout: Checkout | None = None  # ``None`` when the pipeline does not report it (fakes)
 
 
 @dataclass
@@ -65,11 +84,18 @@ class Workspace:
 class Pipeline(Protocol):
     """The two setup phases, as the orchestrator sees them. Either may raise; the orchestrator copes."""
 
-    def ingest(self, issue_url: str, *, repo_url: str | None = None, issue_text: str | None = None) -> Ingested:
+    def ingest(
+        self,
+        issue_url: str,
+        *,
+        repo_url: str | None = None,
+        issue_text: str | None = None,
+        git_ref: str | None = None,
+    ) -> Ingested:
         """Resolve ``issue_url`` to the issue text and a local clone of the repository.
 
         ``issue_text`` (with ``repo_url``, or an ``issue_url`` that names the repository) replaces the
-        GitHub fetch: it is used as the issue body.
+        GitHub fetch: it is used as the issue body. ``git_ref`` is the branch, tag or commit to check out.
         """
         ...
 
@@ -97,27 +123,76 @@ class RepoPipeline:
         sandbox_factory: SandboxFactory | None = None,
         registry_factory: RegistryFactory | None = None,
         deps_installer: DepsInstaller | None = None,
+        base_ref_resolver: BaseRefResolver | None = None,
         notify: Notify | None = None,
     ) -> None:
         self._config = config
         self._deps_installer = deps_installer
+        self._base_ref_resolver = base_ref_resolver
         self._notify = notify or (lambda level, message: None)
         self._workspace_dir = Path(output_dir).resolve() / "workspace"
         self._sandbox_factory = sandbox_factory or _default_sandbox
         self._registry_factory = registry_factory or _default_registry
 
-    def ingest(self, issue_url: str, *, repo_url: str | None = None, issue_text: str | None = None) -> Ingested:
-        """Get the issue and shallow-clone its repository.
+    def ingest(
+        self,
+        issue_url: str,
+        *,
+        repo_url: str | None = None,
+        issue_text: str | None = None,
+        git_ref: str | None = None,
+    ) -> Ingested:
+        """Get the issue and shallow-clone its repository at the revision the issue was reported against.
 
         With ``issue_text`` the issue is the text given: the GitHub API is not asked, and the repository comes
         from ``repo_url`` (or from ``issue_url``, which may be an issue URL or a repository URL). Otherwise the
         issue is fetched, and a fetch that failed raises ``IssueFetchError`` rather than passing GitHub's error
         note on as if it were the issue. Raises ``ValueError`` for a URL that is not a GitHub one.
+
+        The revision is, in order: ``git_ref`` if given, the one ``resolve_base_ref`` finds for the issue, the
+        default branch. A ref that cannot be checked out is reported and replaced by the default branch, so the
+        run still has a repository. ``Ingested.checkout`` says which was used and why.
         """
         issue = self._issue(issue_url, repo_url, issue_text)
         self._workspace_dir.mkdir(parents=True, exist_ok=True)
         dest = (self._workspace_dir / f"{issue.owner}__{issue.repo}__{issue.number}__{int(time.time())}").resolve()
-        return Ingested(issue, Path(clone_repo(issue, dest)).resolve())
+        root, checkout = self._clone(issue, dest, self._choose_ref(issue, git_ref))
+        return Ingested(issue, root.resolve(), checkout)
+
+    def _choose_ref(self, issue: IssueRef, git_ref: str | None) -> Checkout:
+        """The explicit ref, else what ``resolve_base_ref`` finds, else the default branch."""
+        explicit = (git_ref or "").strip()
+        if explicit:
+            return Checkout(explicit, "the ref you asked for (git_ref)")
+        if issue.number <= 0:
+            return Checkout(None, f"{_DEFAULT_BRANCH} (the issue text was supplied, so there is no issue to look up)")
+        resolver = self._base_ref_resolver or _default_base_ref_resolver()
+        if resolver is None:
+            return Checkout(None, f"{_DEFAULT_BRANCH} (anvil.repo.ingest.resolve_base_ref is not available)")
+        try:
+            return _as_checkout(resolver(issue))
+        except Exception as exc:  # noqa: BLE001 - a resolver that fails must not stop the run
+            self._notify(
+                "warning",
+                f"Could not work out which revision the issue was reported against ({type(exc).__name__}: {exc}); "
+                f"using the {_DEFAULT_BRANCH}.",
+            )
+            return Checkout(None, f"{_DEFAULT_BRANCH} (resolve_base_ref failed: {type(exc).__name__})")
+
+    def _clone(self, issue: IssueRef, dest: Path, choice: Checkout) -> tuple[Path, Checkout]:
+        """Clone at ``choice.ref``; if that ref cannot be checked out, clone the default branch and say so."""
+        if choice.ref is None:
+            return Path(clone_repo(issue, dest)), choice
+        try:
+            return Path(clone_repo(issue, dest, git_ref=choice.ref)), choice
+        except Exception as exc:  # noqa: BLE001 - any clone failure: try the default branch before giving up
+            why = clip_head(" ".join(str(exc).split()), _REPORT_CHARS)
+            self._notify("warning", f"Could not check out {choice.ref!r} ({why}); cloning the {_DEFAULT_BRANCH} instead.")
+            shutil.rmtree(dest, ignore_errors=True)
+            fallback = Checkout(
+                None, f"{_DEFAULT_BRANCH} (checking out {choice.ref!r} failed: {why})", choice.already_fixed
+            )
+            return Path(clone_repo(issue, dest)), fallback
 
     @staticmethod
     def _issue(issue_url: str, repo_url: str | None, issue_text: str | None) -> IssueRef:
@@ -191,6 +266,31 @@ class RepoPipeline:
         venv = _venv_dir(getattr(result, "venv_python", None), sandbox)
         where = f"installed into {venv}, which is first on PATH" if venv else "installed"
         return venv, where + "."
+
+
+def _default_base_ref_resolver() -> BaseRefResolver | None:
+    """``anvil.repo.ingest.resolve_base_ref`` if this checkout of the code has it, else ``None``."""
+    try:
+        from anvil.repo.ingest import resolve_base_ref  # noqa: PLC0415 - optional: it may not be merged yet
+    except ImportError:
+        return None
+    return resolve_base_ref
+
+
+def _as_checkout(found: Any) -> Checkout:
+    """Normalise what ``resolve_base_ref`` returned (``None``, a ref, or an object or mapping with fields)."""
+    ref: Any = None
+    reason, already_fixed = "", False
+    if isinstance(found, str):
+        ref = found
+    elif found is not None:
+        get = found.get if isinstance(found, Mapping) else lambda name, default=None: getattr(found, name, default)
+        ref = next((get(name) for name in _REF_FIELDS if get(name)), None)
+        reason, already_fixed = str(get("reason") or "").strip(), bool(get("already_fixed"))
+    ref = str(ref).strip() if ref else None
+    if ref:
+        return Checkout(ref, reason or "the revision the issue was reported against (resolve_base_ref)", already_fixed)
+    return Checkout(None, reason or f"{_DEFAULT_BRANCH} (no base revision was found for the issue)", already_fixed)
 
 
 def _supplied_issue(issue_url: str, repo_url: str | None, text: str) -> IssueRef:
