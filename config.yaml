@@ -51,6 +51,27 @@ wall_clock_seconds: 1800
 # keeps its head and tail with a "[N lines omitted]" marker.
 tool_output_char_cap: 8000
 
+# Feature switches. Each is on unless set to false, and off gives exactly the behaviour from before it existed.
+features:
+  # Spend fewer tokens per model call: read_file results over token_saving.read_file_max_lines are cut to their first
+  # lines plus an outline; every phase gets a call cap, after which the harness forces its phase_done; old tool output
+  # is dropped sooner and output is capped lower; the repository map is smaller; report.md lists tokens per phase.
+  token_budgets: true
+  # Extra PATCH and REVIEW rules for models that are careless about conventions: raise the most specific built-in
+  # exception with a clear message (never assert), follow how the module reports similar errors, keep changes minimal.
+  weak_model_prompts: true
+
+# Numbers for features.token_budgets. The two below only ever tighten context_keep_steps and tool_output_char_cap above.
+token_saving:
+  read_file_max_lines: 150      # a read_file result longer than this is shortened (ask for a line range for more)
+  read_file_head_lines: 60      # ... to this many leading lines plus an outline of the whole file
+  context_keep_steps: 3
+  tool_output_char_cap: 4000
+  repo_map_chars: 3000          # size of the repository map in every prompt (the map itself defaults to 6000)
+  # Model calls a phase may make before the harness makes it close with phase_done (the call after the cap is the
+  # closing one). Order of the phases is UNDERSTAND, LOCALIZE, REPRODUCE, PATCH (per attempt), VERIFY, REVIEW.
+  phase_calls: {understand: 1, localize: 8, reproduce: 10, patch: 15, verify: 8, review: 3}
+
 # Context window management: the prompt is kept under max_context_tokens (estimated at
 # chars/4; leave headroom for the tool schemas, which are sent separately).
 #   context_keep_steps: tool output from earlier steps is replaced by a one-line summary

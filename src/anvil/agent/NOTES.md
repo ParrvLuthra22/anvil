@@ -13,8 +13,10 @@ The system message (phase prompt + environment note) is counted. The tool *schem
 descriptions are added by the LLM client afterwards, so leave headroom below the model's real window. There is no
 per-model tokenizer.
 
-**Config** (`config.yaml`): `max_context_tokens` 32000 (minimum 1000), `context_keep_steps` 6,
-`context_summarize_threshold` 0.75 (0.1 to 1.0), `tool_output_char_cap` 8000 (minimum 200).
+**Config** (`config.yaml`): `max_context_tokens` 32000 (minimum 1000), `context_keep_steps` 3,
+`context_summarize_threshold` 0.75 (0.1 to 1.0), `tool_output_char_cap` 4000 (minimum 200). Those two are the `token_saving`
+values that `features.token_budgets` (on by default) applies; they only ever tighten the top-level keys, and with the feature
+switched off the settings are the top-level ones, 6 and 8000 when absent (see section 6).
 
 **Compaction, in this order, on every `build_messages` call:**
 
