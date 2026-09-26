@@ -13,6 +13,12 @@ from anvil.repo.ingest import IssueRef
 from anvil.repo.profile import RepoProfile
 
 URL = "https://github.com/acme/calc/issues/7"
+
+
+def no_deps(sandbox, profile):
+    """A dependency installer that does nothing, so no test here ever runs pip."""
+    return types.SimpleNamespace(ok=True, report="", venv_python=None)
+
 PROFILE = RepoProfile(["python"], "python", "pip install -e .", "pytest", "pytest")
 
 
@@ -74,7 +80,7 @@ def test_profile_builds_the_workspace_from_the_injected_factories(tmp_path, repo
         return registry
 
     config = {"sandbox": "worktree"}
-    pipeline = RepoPipeline(config, tmp_path, sandbox_factory=make_sandbox, registry_factory=make_registry)
+    pipeline = RepoPipeline(config, tmp_path, sandbox_factory=make_sandbox, registry_factory=make_registry, deps_installer=no_deps)
     issue = IssueRef("acme", "calc", 7, URL, title="t")
     workspace = pipeline.profile(Ingested(issue, tmp_path / "repo"))
 
@@ -92,7 +98,7 @@ def test_default_factories_delegate_to_the_sandbox_and_tools_packages(tmp_path, 
     monkeypatch.setitem(sys.modules, "anvil.sandbox", sandbox_pkg)
     monkeypatch.setattr("anvil.tools.registry.make_default_registry", lambda profile: ("registry", profile), raising=False)
 
-    workspace = RepoPipeline({"k": 1}, tmp_path).profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
+    workspace = RepoPipeline({"k": 1}, tmp_path, deps_installer=no_deps).profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
 
     assert workspace.sandbox.inner == ("sandbox", {"k": 1}, Path("/r"), PROFILE)
     assert workspace.tools == ("registry", PROFILE)
@@ -102,11 +108,11 @@ def test_a_missing_sandbox_backend_is_a_clear_error(tmp_path, repo_functions, mo
     monkeypatch.setitem(sys.modules, "anvil.sandbox", types.ModuleType("anvil.sandbox"))  # no make_sandbox
     monkeypatch.setattr("anvil.tools.registry.make_default_registry", lambda profile: object(), raising=False)
     with pytest.raises(RuntimeError, match="no sandbox backend"):
-        RepoPipeline({}, tmp_path).profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
+        RepoPipeline({}, tmp_path, deps_installer=no_deps).profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
 
 
 def test_a_missing_default_tool_set_is_a_clear_error(tmp_path, repo_functions, monkeypatch):
     monkeypatch.delattr("anvil.tools.registry.make_default_registry", raising=False)
-    pipeline = RepoPipeline({}, tmp_path, sandbox_factory=lambda config, root, profile: object())
+    pipeline = RepoPipeline({}, tmp_path, sandbox_factory=lambda config, root, profile: object(), deps_installer=no_deps)
     with pytest.raises(RuntimeError, match="no tools are available"):
         pipeline.profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))

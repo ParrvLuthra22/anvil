@@ -42,13 +42,13 @@ def test_a_relative_output_dir_yields_a_sandbox_that_can_see_the_repository(toy,
 
 
 def test_the_clone_and_the_sandbox_are_addressed_by_absolute_paths_whatever_the_cwd(toy, tmp_path):
-    pipeline = RepoPipeline({"sandbox": "worktree"}, Path("out"))
+    pipeline = RepoPipeline({"sandbox": "worktree", "install_dependencies": False}, Path("out"))
     ingested = pipeline.ingest(rr.ISSUE_URL)
     assert str(ingested.repo_root).startswith(str((tmp_path / "out").resolve()))
 
 
 def test_a_relative_repo_root_handed_to_profile_is_resolved_too(toy, tmp_path, monkeypatch):
-    pipeline = RepoPipeline({"sandbox": "worktree"}, tmp_path / "out")
+    pipeline = RepoPipeline({"sandbox": "worktree", "install_dependencies": False}, tmp_path / "out")
     ingested = pipeline.ingest(rr.ISSUE_URL)
     from dataclasses import replace
 

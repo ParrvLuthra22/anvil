@@ -34,6 +34,7 @@ from anvil.agent.outputs import SCRATCH_DIR, changed_files, filter_diff, render_
 from anvil.agent.pipeline import Ingested, Pipeline, RepoPipeline, Workspace
 from anvil.agent.prompts import (
     PHASE_SPECS,
+    environment_note,
     finalize_kickoff,
     issue_brief,
     patch_kickoff,
@@ -141,7 +142,9 @@ class Orchestrator:
         self._state = RunState(issue_url)
         self._llm = llm
         self._owns_llm = False
-        self._pipeline = pipeline or RepoPipeline(config, Path(self._settings.output_dir))
+        self._pipeline = pipeline or RepoPipeline(
+            config, Path(self._settings.output_dir), notify=self._pipeline_note
+        )
         self._workspace: Workspace | None = None
         self._runner: PhaseRunner | None = None
         self._repro_tool = WriteReproTool()
@@ -170,6 +173,13 @@ class Orchestrator:
             raise
         finally:
             self._finalize()
+
+    def _pipeline_note(self, level: str, message: str) -> None:
+        """Progress and problems from the pipeline's setup work: warnings are ``error`` events of kind ``deps``."""
+        if level == "warning":
+            self._emitter.error("deps", message)
+        else:
+            self._emitter.message("system", message)
 
     def _stop(self, reason: str, note: str) -> None:
         self._state.halted = reason
@@ -222,6 +232,7 @@ class Orchestrator:
             emitter=self._emitter,
             budget=self._budget,
             settings=self._settings,
+            environment=environment_note(workspace.profile, workspace.deps),
         )
         profile = workspace.profile
         self._emitter.message(

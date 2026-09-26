@@ -9,6 +9,8 @@ from pathlib import Path
 from anvil.agent.state import RunState
 
 SCRATCH_DIR = ".anvil"
+DEPS_VENV_DIR = ".anvil_venv"  # the repository's dependencies, installed by the harness (see RepoPipeline)
+_HARNESS_DIRS = (SCRATCH_DIR, DEPS_VENV_DIR)
 # Directories that tools and test runs generate inside a checkout. A sandbox diff lists untracked
 # files, so in a repo without a matching .gitignore they would otherwise end up in the patch.
 ARTEFACT_DIRS = frozenset(
@@ -150,7 +152,7 @@ def _is_excluded(section: list[str]) -> bool:
 
 
 def _is_scratch(path: str) -> bool:
-    return path == SCRATCH_DIR or path.startswith(SCRATCH_DIR + "/")
+    return any(path == name or path.startswith(name + "/") for name in _HARNESS_DIRS)
 
 
 def _is_artefact(path: str) -> bool:

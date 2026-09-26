@@ -180,6 +180,42 @@ def issue_brief(issue: IssueRef, profile: RepoProfile) -> str:
     return "\n".join(lines)
 
 
+_INTERPRETERS = {
+    "python": "python3",
+    "javascript": "node",
+    "typescript": "node",
+    "go": "go",
+    "rust": "cargo",
+    "java": "java",
+}
+
+
+def environment_note(profile: RepoProfile, deps: str = "") -> str:
+    """What the model may assume about the machine it works on, from the repo profile and the dependency install.
+
+    Appended to every phase's system prompt. The point is to stop it guessing: this machine may have ``python3``
+    but no ``python``, and the repro scripts sit in ``.anvil/``, not next to the code they import.
+    """
+    language = profile.primary_language or "unknown"
+    lines = ["", "Environment (facts about this machine, not guesses):", f"- Primary language: {language}."]
+    interpreter = _INTERPRETERS.get(language)
+    if language == "python":
+        lines.append(
+            "- Run Python with `python3`; a bare `python` may not exist. Scripts under .anvil/ start with their own "
+            "directory on sys.path, so begin them with `import sys; sys.path.insert(0, '.')` to import the repository."
+        )
+    elif interpreter:
+        lines.append(f"- Toolchain: `{interpreter}`.")
+    lines.append(
+        f"- Test command: `{profile.test_cmd}` (the run_tests tool runs it; pass a target to narrow it)."
+        if profile.test_cmd
+        else "- No test command was detected; find how the tests are run before relying on them."
+    )
+    if deps:
+        lines.append(f"- Dependencies: {deps}")
+    return "\n".join(lines)
+
+
 def phase_kickoff(phase: Phase, detail: str = "") -> str:
     """The user message that starts ``phase``; ``detail`` carries phase-specific facts."""
     head = f"Begin phase {phase.value.upper()}."

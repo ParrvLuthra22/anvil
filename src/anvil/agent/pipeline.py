@@ -9,13 +9,16 @@ the codebase are not merged yet.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from anvil.agent.outputs import DEPS_VENV_DIR, SCRATCH_DIR
 from anvil.agent.prepared_sandbox import PreparedSandbox
+from anvil.agent.text import clip_head
 from anvil.repo.ingest import IssueRef, clone_repo, fetch_issue, parse_issue_url
 from anvil.repo.profile import RepoProfile, profile_repo, repo_map
 from anvil.sandbox.base import Sandbox
@@ -24,8 +27,15 @@ from anvil.tools.registry import ToolRegistry
 _REPO_URL = re.compile(r"^https?://(?:www\.)?github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
 _TITLE_CHARS = 100
 
+log = logging.getLogger("anvil.agent")
+
 SandboxFactory = Callable[[dict, Path, RepoProfile], Sandbox]
 RegistryFactory = Callable[[RepoProfile], ToolRegistry]
+# Installs the repository's dependencies in the sandbox; the result has ``ok``, ``report`` and ``venv_python``
+# (``anvil.repo.deps.ensure_deps`` is the real one). Notify takes a level ("info" or "warning") and a message.
+DepsInstaller = Callable[[Sandbox, RepoProfile], Any]
+Notify = Callable[[str, str], None]
+_REPORT_CHARS = 600
 
 
 class IssueFetchError(RuntimeError):
@@ -49,6 +59,7 @@ class Workspace:
     repo_map: str
     sandbox: Sandbox
     tools: ToolRegistry
+    deps: str = ""  # one line on the state of the repository's dependencies, for the model; "" if unknown
 
 
 class Pipeline(Protocol):
@@ -85,8 +96,12 @@ class RepoPipeline:
         *,
         sandbox_factory: SandboxFactory | None = None,
         registry_factory: RegistryFactory | None = None,
+        deps_installer: DepsInstaller | None = None,
+        notify: Notify | None = None,
     ) -> None:
         self._config = config
+        self._deps_installer = deps_installer
+        self._notify = notify or (lambda level, message: None)
         self._workspace_dir = Path(output_dir).resolve() / "workspace"
         self._sandbox_factory = sandbox_factory or _default_sandbox
         self._registry_factory = registry_factory or _default_registry
@@ -120,16 +135,50 @@ class RepoPipeline:
         return issue
 
     def profile(self, ingested: Ingested) -> Workspace:
-        """Detect languages and commands, map the repo, then open the sandbox and the tool registry."""
+        """Detect languages and commands, map the repo, open the sandbox, install dependencies, build the tools.
+
+        Dependencies are installed by ``anvil.repo.deps.ensure_deps`` (unless ``install_dependencies: false``). If that
+        is missing, fails or crashes the run goes on, with a warning through ``notify``: the model can still read
+        and patch the code, it just cannot rely on the tests.
+        """
         root = Path(ingested.repo_root).resolve()
+        _exclude_harness_dirs(root)
         profile = profile_repo(root)
+        inner = self._sandbox_factory(self._config, root, profile)
+        venv_dir, deps = self._install_dependencies(inner, profile)
         return Workspace(
             issue=ingested.issue,
             profile=profile,
             repo_map=repo_map(root),
-            sandbox=PreparedSandbox(self._sandbox_factory(self._config, root, profile)),
+            sandbox=PreparedSandbox(inner, venv_dir=venv_dir),
             tools=self._registry_factory(profile),
+            deps=deps,
         )
+
+    def _install_dependencies(self, sandbox: Sandbox, profile: RepoProfile) -> tuple[str | None, str]:
+        """Run the installer; returns the venv directory to put first on PATH (or ``None``) and a status line."""
+        if not self._config.get("install_dependencies", True):
+            return None, "not installed (install_dependencies is off): imports of third-party packages may fail."
+        try:
+            installer = self._deps_installer or _default_installer()
+        except ImportError:
+            self._notify("warning", "The dependency installer (anvil.repo.deps) is not available; continuing without it.")
+            return None, "not installed (no installer): imports of third-party packages may fail."
+        command = profile.install_cmd or "nothing to install"
+        self._notify("info", f"Installing dependencies ({command}); this can take a few minutes.")
+        try:
+            result = installer(sandbox, profile)
+        except Exception as exc:  # noqa: BLE001 - the run can go on without dependencies
+            self._notify("warning", f"Installing dependencies crashed ({type(exc).__name__}: {exc}); continuing without them.")
+            return None, "not installed (the installer crashed): imports of third-party packages may fail."
+        report = clip_head(str(getattr(result, "report", "")).strip(), _REPORT_CHARS)
+        if not getattr(result, "ok", False):
+            self._notify("warning", f"Installing dependencies failed; continuing without them. {report}")
+            return None, "NOT installed (the install failed): imports of third-party packages may fail; the tests may not run."
+        self._notify("info", report or "Dependencies installed.")
+        venv = _venv_dir(getattr(result, "venv_python", None), sandbox)
+        where = f"installed into {venv}, which is first on PATH" if venv else "installed"
+        return venv, where + "."
 
 
 def _supplied_issue(issue_url: str, repo_url: str | None, text: str) -> IssueRef:
@@ -159,6 +208,47 @@ def _owner_and_repo(url: str) -> tuple[str, str]:
             f"Not a GitHub repository URL: {url!r}. Expected https://github.com/<owner>/<repo>"
         ) from None
     return issue.owner, issue.repo
+
+
+def _default_installer() -> DepsInstaller:
+    from anvil.repo.deps import ensure_deps  # noqa: PLC0415 - optional: a missing module must not stop the run
+
+    return ensure_deps
+
+
+def _venv_dir(venv_python: str | None, sandbox: Sandbox) -> str | None:
+    """The venv directory (relative to the repository root) that holds ``venv_python``, or ``None``."""
+    if not venv_python:
+        return None
+    interpreter = Path(venv_python)
+    if interpreter.is_absolute():
+        try:
+            interpreter = interpreter.relative_to(sandbox.root)
+        except ValueError:
+            return None
+    return str(interpreter.parent.parent)
+
+
+def _exclude_harness_dirs(root: Path) -> None:
+    """Keep the harness's own directories out of git's sight, in the clone's ``info/exclude``.
+
+    ``.anvil/`` (repro scripts) and the dependency venv must never reach the patch. Untracked files that git does
+    not ignore are listed one ``git diff`` subprocess each by the sandbox's ``diff()`` and staged by ``git add -A``,
+    which for a venv means thousands of files on every call. Best effort: a failure only costs speed.
+    """
+    if not (root / ".git").is_dir():
+        return  # not a plain git checkout: never invent a .git directory
+    exclude = root / ".git" / "info" / "exclude"
+    wanted = [f"{SCRATCH_DIR}/", f"{DEPS_VENV_DIR}/"]
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        present = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+        missing = [line for line in wanted if line not in present]
+        if missing:
+            with exclude.open("a", encoding="utf-8") as fh:
+                fh.write(("" if not present or present[-1] == "" else "\n") + "\n".join(missing) + "\n")
+    except OSError as exc:
+        log.warning("could not update %s: %s", exclude, exc)
 
 
 def _default_sandbox(config: dict, repo_root: Path, profile: RepoProfile) -> Sandbox:

@@ -101,7 +101,9 @@ class PhaseRunner:
         emitter: Emitter,
         budget: Budget,
         settings: AgentSettings,
+        environment: str = "",
     ) -> None:
+        self._environment = environment
         self._llm = llm
         self._ctx = ctx
         self._registry = registry
@@ -156,7 +158,7 @@ class PhaseRunner:
     def _ask(self, spec: PhaseSpec, schemas: list[dict]) -> LLMResponse:
         self._budget.charge_step()
         try:
-            response = self._llm.chat(self._ctx.build_messages(spec.system_prompt), schemas)
+            response = self._llm.chat(self._ctx.build_messages(spec.system_prompt + self._environment), schemas)
         except LLMError as exc:
             advice = llm_failure_advice(exc)
             self._emitter.error(ErrorClass.LLM_ERROR.value, f"{exc} {advice}")
