@@ -20,6 +20,7 @@ Malformed JSON is repaired where that is safe (see ``loads_lenient``).
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -154,7 +155,103 @@ def _scan(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
         if calls:
             found.append(_Found(fence.start(), fence.end(), calls))
     found += _bare_calls(text, index, found)
+    if not found:
+        found = _python_syntax_calls(text, index)
     return sorted(found, key=lambda item: item.start)
+
+
+_ORPHAN_FENCE_RE = re.compile(r"\s*(?:`{1,3}\w*\s*)?")
+_OPENING_FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\n?[ \t]*\Z")
+_QUOTES = ("\"\"\"", "'''", "\"", "'")
+
+
+def _python_syntax_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
+    """``tool_name(key="value", ...)``: the Python-call form models fall back to, as the last thing in the reply.
+
+    Only a known tool, starting a line (list and quote marks allowed before it), followed by nothing but an optional
+    stray closing fence. Arguments must be literals: they are read with ``ast.literal_eval`` and never executed. A
+    call that is cut off is not completed by guesswork.
+    """
+    if not index:
+        return []
+    names = "|".join(re.escape(name) for name in sorted(index, key=len, reverse=True))
+    for opening in re.finditer(rf"^[ \t>*`\-]*({names})\(", text, re.MULTILINE):
+        scanned = _call_arguments(text, opening.end())
+        if scanned is None:
+            continue
+        close, inner = scanned
+        tail = _ORPHAN_FENCE_RE.fullmatch(text, close)
+        if tail is None:
+            continue  # more reply follows: the call is not the last thing, so it is prose about a call
+        call = _literal_call(opening.group(1), inner, index)
+        if call is None:
+            continue
+        start = opening.start(1)
+        fence = _OPENING_FENCE_RE.search(text, 0, start)
+        return [_Found(fence.start() if fence else start, len(text), [call])]
+    return []
+
+
+def _call_arguments(text: str, begin: int) -> tuple[int, str] | None:
+    """Where the parenthesis opened just before ``begin`` closes, and the text between, read string-aware.
+
+    Returns ``(index after the closing parenthesis, arguments)``, or ``None`` when it never closes. A raw newline
+    inside a single-line quoted string is turned into ``\\n``, which is what the model meant.
+    """
+    depth, position, out = 1, begin, []
+    while position < len(text):
+        quote = next((q for q in _QUOTES if text.startswith(q, position)), None)
+        if quote is not None:
+            out.append(quote)
+            position += len(quote)
+            while position < len(text) and not text.startswith(quote, position):
+                char = text[position]
+                if char == "\\" and position + 1 < len(text):
+                    out.append(text[position:position + 2])
+                    position += 2
+                    continue
+                out.append("\\n" if char == "\n" and len(quote) == 1 else "\\t" if char == "\t" and len(quote) == 1 else char)
+                position += 1
+            if position >= len(text):
+                return None  # cut off inside a string
+            out.append(quote)
+            position += len(quote)
+            continue
+        char = text[position]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return position + 1, "".join(out)
+        out.append(char)
+        position += 1
+    return None
+
+
+def _literal_call(name: str, inner: str, index: Mapping[str, Mapping[str, str]]) -> dict | None:
+    """``name(inner)`` as a call if every argument is a Python literal; positional ones take the schema's order."""
+    try:
+        tree = ast.parse(f"{name}({inner})", mode="eval")
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    call = tree.body
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != name:
+        return None
+    parameters = list(index.get(name, {}))
+    args: dict[str, Any] = {}
+    try:
+        for position, node in enumerate(call.args):
+            if isinstance(node, ast.Starred) or position >= len(parameters):
+                return None
+            args[parameters[position]] = ast.literal_eval(node)
+        for keyword in call.keywords:
+            if keyword.arg is None or keyword.arg in args:
+                return None  # ``**kwargs``, or a name given twice: which value was meant is anyone's guess
+            args[keyword.arg] = ast.literal_eval(keyword.value)
+    except (ValueError, SyntaxError, TypeError, RecursionError, MemoryError):
+        return None
+    return {"tool": name, "args": args}
 
 
 def _tag_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:

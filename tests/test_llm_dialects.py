@@ -383,3 +383,142 @@ def test_native_arguments_that_are_a_list_are_flagged_not_silently_emptied():
 def test_the_text_mode_call_syntax_the_client_asks_for_still_round_trips():
     client, _ = build(Server(chat_body({"content": CALL_BLOCK})), tool_mode="text")
     assert client.chat(USER, TOOLS).tool_calls[0]["args"] == {"path": "a.py"}
+
+
+# ---- Python call syntax: tool_name(key="value") ---------------------------------------------------------------
+# Seen from Qwen3-Coder on a real endpoint, several times in one run: in VERIFY the model closed with
+# phase_done(summary="...") plus a stray closing fence, in plain text, and the phase stalled with a passing repro.
+
+PHASE_TOOLS = ALL_TOOLS + [schema("phase_done", summary="string"), schema("give_up", reason="string")]
+
+REAL_SAMPLE = (
+    'phase_done(summary="The patch has been verified and works correctly. The issue was that the add() function in '
+    "calc.py was implementing subtraction (a - b) instead of addition (a + b). All tests pass, including the specific "
+    'test for add(2, 3) which now correctly returns 5 instead of -1.")\n```'
+)
+
+
+def fcalls(text: str) -> list[tuple[str, dict]]:
+    return calls(text, PHASE_TOOLS)
+
+
+def test_the_call_a_real_model_wrote_in_python_syntax_is_a_call_and_the_stray_fence_goes_with_it():
+    parsed = parse_text_tool_calls(REAL_SAMPLE, PHASE_TOOLS)
+    assert [c["tool"] for c in parsed.calls] == ["phase_done"]
+    assert parsed.calls[0]["args"]["summary"].startswith("The patch has been verified") and "returns 5" in parsed.calls[0]["args"]["summary"]
+    assert parsed.text == "", "no orphan ``` left behind as the reply's text"
+
+
+def test_prose_before_the_call_is_kept():
+    parsed = parse_text_tool_calls("The fix works.\n\nphase_done(summary='changed - to +')", PHASE_TOOLS)
+    assert parsed.calls == [{"tool": "phase_done", "args": {"summary": "changed - to +"}}]
+    assert parsed.text == "The fix works."
+
+
+def test_keyword_arguments_keep_their_python_types():
+    assert fcalls('read_file(path="a.py", start=1, end=40)') == [("read_file", {"path": "a.py", "start": 1, "end": 40})]
+    assert fcalls("run_tests(target=None)") == [("run_tests", {"target": None})]
+    assert fcalls("edit_file(path='a.py', old='x', new='')") == [("edit_file", {"path": "a.py", "old": "x", "new": ""})]
+
+
+def test_positional_arguments_follow_the_order_the_schema_declares():
+    assert fcalls('read_file("a.py", 1, 40)') == [("read_file", {"path": "a.py", "start": 1, "end": 40})]
+    assert fcalls("git_diff()") == [("git_diff", {})]
+
+
+def test_a_call_inside_a_python_fence_is_a_call_and_the_fence_goes_with_it():
+    parsed = parse_text_tool_calls('Checking:\n```python\nread_file(path="a.py")\n```', PHASE_TOOLS)
+    assert parsed.calls == [{"tool": "read_file", "args": {"path": "a.py"}}]
+    assert parsed.text == "Checking:"
+
+
+def test_parentheses_and_quotes_inside_a_string_do_not_end_the_call_early():
+    reply = "grep(pattern=\"def add(a, b):\", path='src')"
+    assert fcalls(reply) == [("grep", {"pattern": "def add(a, b):", "path": "src"})]
+    assert fcalls('edit_file(path="a.py", old="it\'s (a)", new="it\\"s [b]")')[0][1]["old"] == "it's (a)"
+
+
+def test_a_raw_newline_inside_a_quoted_string_is_read_as_a_newline():
+    reply = 'edit_file(path="a.py", old="def f():\n    return 1", new="def f():\n    return 2")'
+    assert fcalls(reply) == [("edit_file", {"path": "a.py", "old": "def f():\n    return 1", "new": "def f():\n    return 2"})]
+
+
+def test_triple_quoted_strings_work():
+    reply = 'phase_done(summary="""Fixed add().\nIt subtracted; it now adds.""")'
+    assert fcalls(reply) == [("phase_done", {"summary": "Fixed add().\nIt subtracted; it now adds."})]
+
+
+def test_a_call_may_be_indented_or_marked_as_a_list_item():
+    assert fcalls("  - read_file(path='a.py')") == [("read_file", {"path": "a.py"})]
+    assert fcalls("> `git_diff()`") == [("git_diff", {})]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Then call phase_done(summary) when you are finished.",  # mentioned mid-sentence, and not literals
+        "phase_done(summary)",  # a name, not a value
+        "You could run_tests() to check.",  # mid-line
+        'frobnicate(x="1")',  # not one of the tools
+        'read_file(path="a.py") and then I will read more of it.',  # followed by prose: not the last thing
+        'phase_done(summary="cut off in the middle of a sentence',  # never completed by guesswork
+        'read_file(path=os.path.join("a", "b.py"))',  # a call in the argument, not a literal
+        'read_file(path=f"{name}.py")',  # an f-string
+        'read_file(**{"path": "a.py"})',  # unpacking
+        'read_file(*["a.py"])',
+        'read_file("a.py", 1, 40, 99)',  # more positionals than the schema has parameters
+        "read_file(path='a.py', path='b.py')",  # a keyword given twice: which value was meant?
+        "read_file('a.py', path='b.py')",  # the same parameter positionally and by name
+    ],
+)
+def test_things_that_only_look_like_calls_are_not_run(reply):
+    assert fcalls(reply) == []
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I will now call read_file(path='a.py')",
+        "The call that failed was git_diff()",
+        "Next: run_tests(target='tests/test_calc.py')",
+    ],
+)
+def test_a_call_in_the_middle_of_a_line_is_talk_about_a_call_even_when_it_ends_the_reply(reply):
+    assert fcalls(reply) == []
+
+
+def test_of_several_calls_written_in_python_syntax_only_the_last_can_run():
+    """The protocol is one call per reply and nothing after it: an earlier one is followed by more reply."""
+    assert fcalls('read_file(path="a.py")\nread_file(path="b.py")') == [("read_file", {"path": "b.py"})]
+
+
+def test_without_the_tool_list_python_syntax_is_never_guessed():
+    assert calls('phase_done(summary="x")', tools=None) == []
+    assert calls('phase_done(summary="x")', tools=ALL_TOOLS) == [], "phase_done is not one of these tools"
+
+
+def test_a_json_call_wins_over_python_syntax_in_the_same_reply():
+    reply = '```json\n{"tool": "read_file", "args": {"path": "a.py"}}\n```\nphase_done(summary="x")'
+    assert fcalls(reply) == [("read_file", {"path": "a.py"})]
+
+
+def test_dangerous_looking_arguments_are_data_never_evaluated():
+    """ast.literal_eval only: nothing in the reply is executed."""
+    assert fcalls('run_tests(target=__import__("os").system("echo hi"))') == []
+    assert fcalls("phase_done(summary=[x for x in range(10**9)])") == []
+    assert fcalls('phase_done(summary="__import__(\'os\').system(\'echo hi\')")') == [
+        ("phase_done", {"summary": "__import__('os').system('echo hi')"})
+    ]
+
+
+def test_the_client_rescues_a_python_syntax_call_from_a_native_reply_and_counts_it_as_a_miss():
+    from tests.test_llm_client import ok
+
+    tools = PHASE_TOOLS
+    server = Server(ok('phase_done(summary="done")\n```'), ok('phase_done(summary="done")'), ok("switched"))
+    client, _ = build(server)
+    first = client.chat(USER, tools)
+    assert first.tool_calls[0]["tool"] == "phase_done" and first.tool_calls[0]["args"] == {"summary": "done"}
+    assert first.text == "" and client.active_tool_mode == "native"
+    client.chat(USER, tools)
+    assert client.active_tool_mode == "text", "two misses in a row: the endpoint is not doing native tool calls"
