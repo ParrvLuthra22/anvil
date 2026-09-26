@@ -362,13 +362,13 @@ class TestRunTestsTool:
         mock_sb = MagicMock()
         mock_sb.root = sandbox.root
         mock_sb.exec.return_value = ExecResult(0, "", "", False, 0.1)
-        RunTestsTool(profile=_pytest_profile()).run({"target": "tests/test_foo.py"}, mock_sb)
+        RunTestsTool(profile=_pytest_profile()).run({"targets": ["tests/test_foo.py"], "fast_fail": True}, mock_sb)
         cmd_used = mock_sb.exec.call_args[0][0]
         assert "tests/test_foo.py" in cmd_used
+        assert "-x" in cmd_used
 
     def test_schema_no_required(self):
         assert RunTestsTool().parameters["required"] == []
-
 
 
 # ---------------------------------------------------------------------------
@@ -444,4 +444,4 @@ class TestToolRegistry:
 
     def test_make_default_registry_schemas_count(self):
         reg = make_default_registry()
-        assert len(reg.schemas()) == 10
+        assert len(reg.schemas()) == 11

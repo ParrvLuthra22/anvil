@@ -116,14 +116,20 @@ class RunTestsTool:
     parameters = {
         "type": "object",
         "properties": {
-            "target": {
-                "type": "string",
+            "targets": {
+                "type": "array",
+                "items": {"type": "string"},
                 "description": (
-                    "Optional test target to pass to the test runner "
-                    "(e.g. 'tests/test_foo.py::test_bar' for pytest, "
-                    "'./pkg/foo/...' for Go). "
+                    "Optional list of specific test targets to run "
+                    "(e.g. ['tests/test_foo.py::test_bar', 'tests/test_baz.py'] for pytest, "
+                    "['./pkg/foo/...'] for Go). "
                     "Leave empty to run all tests."
                 ),
+            },
+            "fast_fail": {
+                "type": "boolean",
+                "description": "If true, stops after the first test failure.",
+                "default": False,
             },
             "timeout": {
                 "type": "integer",
@@ -145,8 +151,13 @@ class RunTestsTool:
         self._char_cap = char_cap
 
     def run(self, args: dict, sandbox: Sandbox) -> ToolResult:
-        """Run tests inside *sandbox*, optionally narrowed to *args['target']*."""
-        target: str = args.get("target", "")
+        """Run tests inside *sandbox*, optionally narrowed to *args['targets']*."""
+        targets: list[str] = args.get("targets", [])
+        # Support fallback if old 'target' str is passed
+        if not targets and args.get("target"):
+            targets = [args["target"]]
+        
+        fast_fail: bool = args.get("fast_fail", False)
         timeout: int = int(args.get("timeout", _DEFAULT_TIMEOUT))
 
         # Resolve test command: prefer profile, allow fallback
@@ -170,7 +181,17 @@ class RunTestsTool:
                     ),
                 )
 
-        cmd = f"{test_cmd} {target}".strip() if target else test_cmd
+        # Apply fast-fail if requested
+        flags = []
+        if fast_fail:
+            # We loosely map the flag to the detected test command
+            if "pytest" in test_cmd or "django" in test_cmd.lower():
+                flags.append("-x")
+            elif "go test" in test_cmd:
+                flags.append("-failfast")
+
+        parts = [test_cmd] + flags + targets
+        cmd = " ".join(parts).strip()
 
         result = sandbox.exec(cmd, timeout=timeout)
 
