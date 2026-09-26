@@ -78,6 +78,7 @@ token_saving:
   tool_output_char_cap: 4000
   repo_map_chars: 3000          # size of the repository map in every prompt (the map itself defaults to 6000)
   # Call caps per phase. A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls.
+  # If the model does not end the phase at that forced close, the harness closes it itself with a summary of the calls made.
   # Order of the phases is UNDERSTAND, LOCALIZE, REPRODUCE, PATCH (per attempt), VERIFY, REVIEW. From real runs: a model that
   # closes REPRODUCE does so in 3 to 6 calls (one that does not never closes it, 10 is enough), REVIEW takes 4 to 5.
   phase_calls: {understand: 1, localize: 8, reproduce: 10, patch: 15, verify: 8, review: 6}

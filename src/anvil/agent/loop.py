@@ -3,7 +3,8 @@
 One ``PhaseRunner.run`` call is one phase: it feeds the model the phase prompt and
 history, executes the tools it asks for (only those on the phase's allowlist),
 and returns as soon as the model ends the phase with ``phase_done`` or
-``give_up``, runs out of steps, stops using tools, or gets stuck in a loop. It never
+``give_up``, runs out of steps, stops using tools, or gets stuck in a loop. A phase that uses its call cap is closed by the
+harness itself (``PhaseStatus.CLOSED``) whatever the model does at the forced close. It never
 raises for model or tool misbehaviour; only the global budget and an unusable LLM
 stop a run (``BudgetExceeded`` and ``RunAborted``).
 
@@ -20,6 +21,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from anvil.agent.budget import Budget
+from anvil.agent.closure import close_summary
 from anvil.agent.emitter import Emitter
 from anvil.agent.prompts import GIVE_UP, PHASE_DONE, PhaseSpec, closing_message, control_tools
 from anvil.agent.recovery import ErrorClass, PhaseGuard, llm_failure_advice
@@ -52,6 +54,7 @@ class PhaseStatus(str, Enum):
     STEP_LIMIT = "step_limit"
     STALLED = "stalled"
     LOOPED = "looped"
+    CLOSED = "closed"  # the phase used its call cap and the harness closed it, with a summary it wrote itself
 
 
 @dataclass
@@ -79,6 +82,11 @@ class PhaseOutcome:
     def done(self) -> bool:
         """True when the model ended the phase with ``phase_done``."""
         return self.status is PhaseStatus.DONE
+
+    @property
+    def closed(self) -> bool:
+        """True when the harness closed the phase at its call cap: ``summary`` is then the harness's own, not a verdict."""
+        return self.status is PhaseStatus.CLOSED
 
 
 @dataclass
@@ -133,6 +141,7 @@ class PhaseRunner:
             steps = min(steps, TEXT_ONLY_STEP_CAP)
         cap = self._settings.call_cap(spec.phase.value)  # a cap of ``steps`` or more never comes up: the hard limit is first
         self._forced = False
+        last_note = ""  # the last thing the model said in words, for the summary if the harness has to close the phase
 
         for step in range(steps):
             # ``step`` is how many calls have been made. A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls.
@@ -141,12 +150,12 @@ class PhaseRunner:
             response = self._ask(spec, schemas)
             calls = [self._normalise(raw) for raw in response.tool_calls or []]
             self._record_assistant(response.text, calls)
+            last_note = response.text.strip() or last_note
             if not calls:
                 if spec.text_only:
                     return PhaseOutcome(PhaseStatus.DONE, response.text.strip(), records=records, forced=self._forced)
                 if self._forced:
-                    reason = f"call cap ({cap}) reached and the closing call made no tool call: {clip_head(response.text.strip(), 300)}"
-                    return PhaseOutcome(PhaseStatus.STEP_LIMIT, reason, records=records, forced=True)
+                    return self._close(spec, cap, records, last_note)
                 nudge = guard.silent_reply()
                 if nudge is None:
                     reason = f"the model stopped calling tools: {clip_head(response.text.strip(), 300)}"
@@ -158,13 +167,25 @@ class PhaseRunner:
             outcome = self._execute(spec, calls, gate, records, guard)
             if outcome is not None:
                 outcome.forced = self._forced
+                if outcome.done and self._forced and not outcome.summary:
+                    outcome = self._close(spec, cap, records, last_note, outcome.args)  # a phase_done with nothing in it says nothing
                 return outcome
             if self._forced:
-                return PhaseOutcome(
-                    PhaseStatus.STEP_LIMIT, f"call cap ({cap}) reached and the closing call did not end the phase",
-                    records=records, forced=True,
-                )
+                return self._close(spec, cap, records, last_note)
         return PhaseOutcome(PhaseStatus.STEP_LIMIT, f"phase step limit ({steps}) reached", records=records)
+
+    def _close(
+        self, spec: PhaseSpec, cap: int, records: list[ToolRecord], last_note: str, args: dict | None = None
+    ) -> PhaseOutcome:
+        """End a phase whose forced close did not end it (ignored, refused by a gate, no tool call, malformed).
+
+        The one forced call is the model's chance to write its own summary. Whatever it did instead, the phase is over:
+        the harness closes it with a summary composed from the calls made, so no model can leave a phase open.
+        """
+        message = f"{spec.phase.value.upper()} used its {cap}-call cap and the model did not close it; the harness closed it."
+        self._emitter.message("system", message)
+        summary = close_summary(spec.phase, cap, records, last_note)
+        return PhaseOutcome(PhaseStatus.CLOSED, summary, args or {}, records, forced=True)
 
     def _force_close(self, spec: PhaseSpec, cap: int) -> list[dict]:
         """Tell the model its calls are used up and offer it nothing but the two ways to end the phase."""

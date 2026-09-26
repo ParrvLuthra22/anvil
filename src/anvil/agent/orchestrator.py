@@ -104,8 +104,8 @@ def run_harness(
     ).run()
 
 
-# Phases that end with text the model wrote itself; only those can be replaced by their summary.
-_COMPRESSIBLE = (PhaseStatus.DONE, PhaseStatus.GAVE_UP)
+# Phases that end with a summary (the model's own, or the harness's after a call cap); only those can be replaced by it.
+_COMPRESSIBLE = (PhaseStatus.DONE, PhaseStatus.GAVE_UP, PhaseStatus.CLOSED)
 
 
 @dataclass(frozen=True)
@@ -286,11 +286,11 @@ class Orchestrator:
 
     def _understand(self) -> None:
         outcome = self._run_phase(Phase.UNDERSTAND, phase_kickoff(Phase.UNDERSTAND), pin=True)
-        self._state.understanding = outcome.summary if outcome.done else ""
+        self._state.understanding = outcome.summary if outcome.done or outcome.closed else ""
 
     def _localize(self) -> None:
         outcome = self._run_phase(Phase.LOCALIZE, phase_kickoff(Phase.LOCALIZE), pin=True)
-        if outcome.done:
+        if outcome.done or outcome.closed:
             self._state.localization = outcome.summary
         else:
             self._state.limit(f"The fault was not localized ({outcome.status.value}: {outcome.summary}).")
@@ -302,7 +302,7 @@ class Orchestrator:
         self._undo_source_edits()
         if not self._state.repro_confirmed:
             self._state.limit(
-                f"The bug was not reproduced ({outcome.status.value}: {outcome.summary}); confidence is capped at low."
+                f"The bug was not reproduced ({outcome.status.value}: {clip_head(outcome.summary, 200)}); confidence is capped at low."
             )
 
     def _undo_source_edits(self) -> list[str]:
@@ -589,12 +589,17 @@ class Orchestrator:
         self._enter(phase)
         self._ctx.set_diff(self._patch_text())
         outcome = self._runner.run(phase_spec(phase, self._settings.weak_model_prompts, self._settings.nav_tools), kickoff, gate)
-        if outcome.forced:
+        if outcome.closed:
+            self._state.limit(
+                f"{phase.value.upper()} used its {self._settings.call_cap(phase.value)}-call cap and the model did not "
+                "close it: the harness closed it with a summary it wrote itself from the calls made."
+            )
+        elif outcome.forced:
             self._state.limit(
                 f"{phase.value.upper()} used its {self._settings.call_cap(phase.value)}-call cap and was closed by the "
                 f"harness with what it had ({outcome.status.value})."
             )
-        text = outcome.summary if outcome.done else f"did not complete ({outcome.status.value}): {outcome.summary}"
+        text = outcome.summary if outcome.done or outcome.closed else f"did not complete ({outcome.status.value}): {outcome.summary}"
         message = phase_summary(phase, text)
         if outcome.status in _COMPRESSIBLE:
             self._ctx.end_phase(message, pinned=pin)

@@ -166,9 +166,18 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
     numbered file text is treated so; short reads and other tools' output are untouched. Flask's `blueprints.py` went from
     about 6,400 tokens to about 900.
   - Each phase has a call cap (UNDERSTAND 1, LOCALIZE 8, REPRODUCE 10, PATCH 15, VERIFY 8, REVIEW 6; per PATCH attempt).
-    A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls. The forced close: only `phase_done` and `give_up` are offered, with a phase-specific instruction to
-    summarise the best findings so far, any other tool is refused, and `phase_done` still goes through the phase's gate. The
-    report lists the phases closed this way. A cap at or above `max_steps_per_phase` never comes up.
+    A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls.
+    The forced close: only `phase_done` and `give_up` are offered, with a phase-specific instruction to summarise the best
+    findings so far, any other tool is refused, and `phase_done` still goes through the phase's gate.
+  - **The harness closes the phase itself; it never depends on the model.** The forced call is the model's one chance to write
+    its own summary. If it does not end the phase with it (it ignores the request and calls another tool, answers in words
+    only, calls a tool that does not exist, is refused by the gate, or sends a `phase_done` with an empty summary) the phase is
+    over anyway: `PhaseStatus.CLOSED`, `PhaseOutcome.closed`, with a summary composed by `agent/closure.py` from the calls made
+    (files read, searches, commands with their exit status, tests, edits) and the model's last note. `outcome.done` still means
+    "the model called `phase_done`", so a harness closure can never be mistaken for a model's verdict. Like any summary it
+    replaces the phase's transcript in the history, so the next phase does not see the argument about the close. UNDERSTAND and
+    LOCALIZE hand the summary on as their findings; the report says which phases the harness closed. (Found in real runs: REPRODUCE
+    ignored the forced close 2 times out of 2 and was left "not completed".) A cap at or above `max_steps_per_phase` never comes up.
     Why these numbers (9 real Qwen3-Coder runs on the toy repo): when the model closed a phase itself it needed at most 1 call
     (UNDERSTAND), 8 (LOCALIZE), 6 (REPRODUCE), 10 (PATCH), 6 (VERIFY) and 5 (REVIEW). A REPRODUCE that got past 6 calls never closed
     (11 calls at the cap, 25 without one), so 10 is enough and more only buys wandering. REVIEW took 4 to 5 calls, so the old cap of 3

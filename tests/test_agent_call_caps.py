@@ -1,4 +1,5 @@
-"""Per-phase call caps (features.token_budgets): after N calls the harness makes the phase close with phase_done."""
+"""Per-phase call caps (features.token_budgets): after N calls the harness asks the model to close the phase, and if it does
+not the harness closes it itself with a summary it writes from the calls made."""
 
 from __future__ import annotations
 
@@ -102,13 +103,14 @@ def test_a_phase_that_ends_exactly_on_its_last_call_is_not_forced():
     assert outcome.done and outcome.forced is False and h.budget.steps == 3
 
 
-def test_at_the_close_any_other_tool_call_is_refused_not_run_and_answered_in_the_history():
+def test_at_the_close_any_other_tool_call_is_refused_not_run_and_the_harness_closes_the_phase():
     h = Harness([GREP(), GREP(), GREP(), GREP(), done()], **CAP3)
     outcome = h.run(LOCALIZE)
 
-    assert outcome.status is PhaseStatus.STEP_LIMIT and outcome.forced is True
-    assert "closing call did not end the phase" in outcome.summary and "call cap (3)" in outcome.summary
+    assert outcome.status is PhaseStatus.CLOSED and outcome.closed and not outcome.done and outcome.forced is True
+    assert outcome.summary.startswith("[Written by the harness: the LOCALIZE phase used its 3 calls")
     assert len(outcome.records) == 3, "the fourth grep was not run"
+    assert outcome.summary.count("def add") == 3, "the three that were run are in the summary, the refused one is not"
     assert h.budget.steps == 4, "and nothing further was asked of the model"
     last_tool_reply = [m for m in h.history if m["role"] == "tool"][-1]["content"]
     assert "only phase_done or give_up can be called now" in last_tool_reply
@@ -117,11 +119,11 @@ def test_at_the_close_any_other_tool_call_is_refused_not_run_and_answered_in_the
     ) for m in h.history), "every call, including the refused one, has its reply: the history stays valid"
 
 
-def test_a_closing_reply_without_any_tool_call_ends_the_phase_at_the_limit_without_a_nudge():
+def test_a_closing_reply_without_any_tool_call_is_closed_by_the_harness_with_the_models_last_words_and_no_nudge():
     h = Harness([GREP(), GREP(), GREP(), reply(text="I think it is calc.py line 2")], **CAP3)
     outcome = h.run(LOCALIZE)
-    assert outcome.status is PhaseStatus.STEP_LIMIT and outcome.forced is True
-    assert "no tool call" in outcome.summary and "calc.py line 2" in outcome.summary
+    assert outcome.status is PhaseStatus.CLOSED and outcome.forced is True
+    assert "The model's last note: I think it is calc.py line 2" in outcome.summary
     assert h.budget.steps == 4
 
 
@@ -140,11 +142,59 @@ def test_the_gate_still_vets_a_forced_phase_done():
 
     h = Harness([GREP(), GREP(), GREP(), done("x", repro_cmd="python .anvil/repro.py")], **CAP3)
     outcome = h.run(REPRODUCE, gate=gate)
-    assert calls and outcome.status is PhaseStatus.STEP_LIMIT and outcome.forced is True
+    assert calls and outcome.status is PhaseStatus.CLOSED and outcome.forced is True, "the gate refused it, so the harness closed the phase"
     assert "the repro does not fail" in [m["content"] for m in h.history if m["role"] == "tool"][-1]
 
     accepted = Harness([GREP(), GREP(), GREP(), done("x", repro_cmd="python .anvil/repro.py")], **CAP3)
     assert accepted.run(REPRODUCE, gate=lambda args: None).status is PhaseStatus.DONE
+
+
+# ---- a model that fights the forced close cannot leave the phase open --------------------------------------------
+
+
+def READ():  # noqa: N802 - a call every capped phase offers; the path differs each time (three equal calls are a loop)
+    return reply(call("read_file", path=f"src/mod{next(_n)}.py"))
+
+
+FIGHTS = {
+    "ignores it and keeps investigating": lambda: [READ()],
+    "answers in words only": lambda: [reply(text="I am not done yet, one more look.")],
+    "calls a tool that does not exist": lambda: [reply(call("teleport", where="calc.py"))],
+    "calls phase_done with an empty summary": lambda: [reply(call("phase_done", summary=""))],
+}
+CAPPED = [Phase.LOCALIZE, Phase.REPRODUCE, Phase.PATCH, Phase.VERIFY, Phase.REVIEW]
+
+
+@pytest.mark.parametrize("phase", CAPPED, ids=lambda p: p.value)
+@pytest.mark.parametrize("fight", FIGHTS)
+def test_a_model_that_fights_the_forced_close_cannot_leave_any_phase_open(fight, phase):
+    h = Harness([READ(), READ()] + FIGHTS[fight]() + [done("never asked for")], phase_call_caps={phase.value: 2})
+    outcome = h.run(PHASE_SPECS[phase])
+
+    assert outcome.status is PhaseStatus.CLOSED and outcome.closed and outcome.forced is True
+    assert h.budget.steps == 3, "two calls of its own, the forced close, and then the harness ended the phase"
+    assert h.llm.remaining == 1, "nothing further was asked of the model"
+    assert outcome.summary.startswith(f"[Written by the harness: the {phase.value.upper()} phase used its 2 calls")
+    assert "Files read: src/mod" in outcome.summary, "the summary says what the phase did"
+
+
+def test_an_empty_phase_done_that_was_not_forced_is_the_models_own_verdict_and_stays_one():
+    h = Harness([READ(), done("")], phase_call_caps={"localize": 5})
+    outcome = h.run(LOCALIZE)
+    assert outcome.done and not outcome.closed and outcome.forced is False
+
+
+def test_a_forced_phase_done_with_a_real_summary_is_still_the_models_own_close():
+    h = Harness([READ(), READ(), done("calc.py:2 subtracts")], phase_call_caps={"localize": 2})
+    outcome = h.run(LOCALIZE)
+    assert outcome.done and not outcome.closed and outcome.summary == "calc.py:2 subtracts"
+
+
+def test_the_harness_says_it_closed_the_phase_so_the_tui_and_the_trace_show_it():
+    h = Harness([READ(), READ()] + FIGHTS["ignores it and keeps investigating"](), phase_call_caps={"localize": 2})
+    h.run(LOCALIZE)
+    texts = [e.data["text"] for e in h.events("message")]
+    assert "LOCALIZE used its 2-call cap and the model did not close it; the harness closed it." in texts
 
 
 # ---- where it does not apply -----------------------------------------------------------------------------------
@@ -221,3 +271,31 @@ def test_a_phase_within_its_cap_leaves_no_note(tmp_path):
 
     run = execute(happy(), tmp_path)
     assert "call cap" not in run.report
+
+
+def test_a_localize_the_model_never_closes_still_hands_the_run_a_summary_and_the_run_goes_on(tmp_path):
+    from tests.test_orchestrator import reproduce
+
+    ignoring = [reply(call("grep", pattern=f"def add{i}")) for i in range(4)]  # 3 calls of its own, then it ignores the close
+    script = understand() + ignoring + reproduce() + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path, token_saving={"phase_calls": {"localize": 3}})
+
+    assert "LOCALIZE used its 3-call cap and the model did not close it: the harness closed it with a summary it wrote itself" in run.report
+    assert "The fault was not localized" not in run.report, "a closed LOCALIZE is not a failed one"
+    assert "Verified after patching: yes" in run.report
+    later = "\n".join(run.prompt_texts())
+    assert "[LOCALIZE summary]\n[Written by the harness: the LOCALIZE phase used its 3 calls" in later
+    assert "Searched for: 'def add0'" in later, "the next phases are told what was searched"
+    assert run.llm.remaining == 0
+
+
+def test_the_forced_close_conversation_does_not_leak_into_later_phases(tmp_path):
+    from tests.test_orchestrator import reproduce
+
+    ignoring = [reply(call("grep", pattern=f"def add{i}")) for i in range(4)]
+    script = understand() + ignoring + reproduce() + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path, token_saving={"phase_calls": {"localize": 3}})
+    messages = next(m for m, _ in run.llm.calls if "Phase: REPRODUCE" in m[0]["content"])  # the first REPRODUCE call
+    reproduce_prompt = "\n".join(m["content"] for m in messages if isinstance(m.get("content"), str))
+    assert "calls are used up" not in reproduce_prompt and "You have used the 3 model calls" not in reproduce_prompt
+
