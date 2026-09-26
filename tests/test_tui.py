@@ -578,3 +578,24 @@ async def test_tui_fallback_bar_shown_on_fetch_failure():
         assert "-visible" in fallback_bar.classes
         text_area = app.query_one("#issue-text-area", TextArea)
         assert text_area is not None
+
+
+@pytest.mark.asyncio
+async def test_tui_pasted_issue_starts_with_ref_and_text():
+    """The fetch fallback forwards both the selected ref and pasted body."""
+    from textual.widgets import Input, TextArea
+
+    calls = []
+    app = AnvilApp(bus=_make_bus(), config={}, on_start=lambda *a, **kw: calls.append((a, kw)))
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#issue-input", Input).value = "https://github.com/example/repo/issues/7"
+        app.query_one("#ref-input", Input).value = "feature/fix"
+        app.query_one("#issue-text-area", TextArea).text = "The parser rejects empty input."
+        app.query_one("#fallback-bar").add_class("-visible")
+        await pilot.pause()
+        await pilot.click("#fallback-start-btn")
+
+    assert calls == [(
+        ("https://github.com/example/repo/issues/7",),
+        {"ref": "feature/fix", "manual_issue_text": "The parser rejects empty input."},
+    )]
