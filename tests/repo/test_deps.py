@@ -84,11 +84,12 @@ class TestEnsureDepsNoCmd:
 
 class TestEnsureDepsPython:
     def test_successful_python_install(self):
-        """Happy path: venv creation + pip upgrade + pip install all succeed."""
+        """Happy path: venv creation + pip upgrade + pip install + framework install all succeed."""
         sb = _make_sandbox([
             _exec_result(0),   # python3 -m venv
             _exec_result(0),   # pip upgrade
             _exec_result(0),   # pip install -e '.[dev]'
+            _exec_result(0),   # pytest install (new step 4)
         ])
         result = ensure_deps(sb, _python_profile())
         assert result.ok
@@ -131,6 +132,7 @@ class TestEnsureDepsPython:
             _exec_result(0),
             _exec_result(0),
             _exec_result(0),
+            _exec_result(0),   # framework install
         ])
         ensure_deps(sb, _python_profile("pip install -r requirements.txt"))
         # Third exec call should have the venv pip, not bare 'pip'

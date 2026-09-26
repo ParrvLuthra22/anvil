@@ -11,11 +11,12 @@ Steps:
 4. Profile the repo (language, install/test commands).
 5. Print the repo map.
 6. Create a WorktreeSandbox (or DockerSandbox if Docker is available).
-7. Run the detected test command and print the result.
-8. Clean up.
+7. Run ensure_deps (isolated Python venv for Python repos).
+8. Run the detected test command and print the result.
+9. Clean up.
 
 Example:
-    python scripts/smoke_ingest.py https://github.com/psf/requests/issues/6456
+    python scripts/smoke_ingest.py https://github.com/golang/go/issues/65528
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from anvil.repo.ingest import clone_repo, fetch_issue, parse_issue_url
 from anvil.repo.profile import profile_repo, repo_map
+from anvil.repo.deps import ensure_deps
 from anvil.sandbox import make_sandbox
 
 
@@ -118,29 +120,34 @@ def main() -> int:
 
         # --- Step 6: Create sandbox ---
         _section("Step 6: Creating sandbox")
-        work_dir = Path(tmpdir) / f"{ref.repo}_work"
         config = {"sandbox": "auto", "tool_output_char_cap": 4000}
         sandbox = make_sandbox(config, repo_root, profile=profile)
         sandbox_type = type(sandbox).__name__
         _ok(f"Sandbox type: {sandbox_type}  root={sandbox.root}")
 
-        # --- Step 7: Run install + tests ---
-        if profile.install_cmd:
-            _section(f"Step 7a: Running install: {profile.install_cmd!r}")
-            t0 = time.monotonic()
-            result = sandbox.exec(profile.install_cmd, timeout=180)
-            elapsed = time.monotonic() - t0
-            if result.exit_code == 0:
-                _ok(f"Install succeeded  ({elapsed:.1f}s)")
-            else:
-                _warn(f"Install exited {result.exit_code}  ({elapsed:.1f}s)")
-                if result.stderr:
-                    print(result.stderr[:500])
+        # --- Step 7: ensure_deps ---
+        _section("Step 7: Installing dependencies via ensure_deps")
+        t0 = time.monotonic()
+        deps_result = ensure_deps(sandbox, profile)
+        elapsed = time.monotonic() - t0
+        if deps_result.ok:
+            _ok(f"Install succeeded  ({elapsed:.1f}s): {deps_result.report}")
+        else:
+            _warn(f"Install issues  ({elapsed:.1f}s): {deps_result.report[:300]}")
+        if deps_result.venv_python:
+            _ok(f"Python interpreter: {deps_result.venv_python}")
 
-        if profile.test_cmd:
-            _section(f"Step 7b: Running tests: {profile.test_cmd!r}")
+        # Adjust test command for Python venv
+        test_cmd = profile.test_cmd
+        if deps_result.venv_python and profile.primary_language == "python" and test_cmd:
+            venv_dir = deps_result.venv_python.replace("/bin/python", "")
+            test_cmd = f"{venv_dir}/bin/{test_cmd}"
+
+        # --- Step 8: Run tests ---
+        if test_cmd:
+            _section(f"Step 8: Running tests: {test_cmd!r}")
             t0 = time.monotonic()
-            result = sandbox.exec(profile.test_cmd, timeout=300)
+            result = sandbox.exec(test_cmd, timeout=180)
             elapsed = time.monotonic() - t0
             status = "PASSED" if result.exit_code == 0 else "FAILED"
             _ok(f"Tests {status}  exit={result.exit_code}  ({elapsed:.1f}s)")
@@ -153,8 +160,8 @@ def main() -> int:
         else:
             _warn("No test command detected — skipping test run.")
 
-        # --- Step 8: Cleanup ---
-        _section("Step 8: Cleanup")
+        # --- Step 9: Cleanup ---
+        _section("Step 9: Cleanup")
         sandbox.close()
         _ok("Sandbox closed. tmpdir will be removed on exit.")
 

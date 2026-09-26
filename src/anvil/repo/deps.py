@@ -130,11 +130,33 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
             venv_python=venv_python,
         )
 
+    # Step 4: Also install the test framework itself — projects sometimes don't
+    # list it as a direct dev dependency, so we guarantee it's in the venv.
+    test_framework_pkg = _test_framework_package(profile)
+    if test_framework_pkg:
+        sandbox.exec(
+            f"{venv_pip} install --quiet {test_framework_pkg}",
+            timeout=60,
+        )
+
     return DepsResult(
         ok=True,
         report=f"Python deps installed into {venv_path}/.",
         venv_python=venv_python,
     )
+
+
+def _test_framework_package(profile: RepoProfile) -> str | None:
+    """Return the pip package name for the repo's test framework, if known."""
+    mapping = {
+        "pytest":   "pytest",
+        "nose":     "nose2",
+        "nose2":    "nose2",
+        "unittest": None,   # stdlib, no install needed
+    }
+    if not profile.test_framework:
+        return "pytest"  # default
+    return mapping.get(profile.test_framework.lower(), profile.test_framework)
 
 
 def _ensure_generic_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
@@ -170,3 +192,4 @@ def _ensure_generic_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:
         ok=True,
         report=f"Dependencies installed. ({cmd})",
     )
+
