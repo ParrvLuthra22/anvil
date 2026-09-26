@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ import httpx
 
 from anvil.llm.config import LLMConfig
 from anvil.llm.errors import LLMConfigError, LLMError
+from anvil.llm.messages import normalize_messages
 from anvil.llm.reasoning import Reply, content_text, split_message
 from anvil.llm.toolcalls import adapt_messages_for_text_mode, loads_lenient, parse_text_tool_calls
 
@@ -43,6 +45,18 @@ _REDACTED = "[REDACTED]"
 # Statuses that, in auto mode, may mean "this provider does not accept the tools parameter".
 _POSSIBLE_TOOL_REJECTIONS = (400, 404, 422)
 _MISSES_BEFORE_TEXT_MODE = 2
+# Parameters worth retrying without when a 400 names one of them (``tools`` is handled by the tool-mode fallback).
+_DROPPABLE_PARAMS = (
+    "tool_choice", "parallel_tool_calls", "temperature", "top_p", "response_format", "max_tokens", "max_completion_tokens",
+)
+# DashScope's open-source Qwen3 models refuse non-streaming calls unless thinking is switched off explicitly.
+_PARAM_FIXES: dict[str, Any] = {"enable_thinking": False}
+_ROLE_COMPLAINT = re.compile(
+    r"alternat|consecutive|must be at the beginning|system message must|first message|unexpected role|invalid role|"
+    r"role\W+\w+\W+(?:is )?not (?:supported|allowed)|roles? must",
+    re.IGNORECASE,
+)
+_MAX_COMPAT_RETRIES = 4
 
 
 @dataclass
@@ -114,6 +128,11 @@ class OpenAICompatClient(LLMClient):
         self._native_misses = 0
         self.totals = UsageTotals()
         self.reasoning_seen = False  # any reply so far carried <think> tags or a reasoning field
+        self.workarounds: list[str] = []  # 400s the client got around; kept for the run (see ``_compat_fix``)
+        self._dropped: set[str] = set()  # request parameters the endpoint rejected
+        self._forced: dict[str, Any] = {}  # parameters the endpoint demanded
+        self._max_tokens_key = "max_tokens"
+        self._strict_roles = False  # the endpoint rejected the message roles: normalise native histories too
 
     def __repr__(self) -> str:
         return (
@@ -164,7 +183,7 @@ class OpenAICompatClient(LLMClient):
         return self._finish(text, calls, payload, data, reply)
 
     def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
-        payload = self._payload(adapt_messages_for_text_mode(messages, tools))
+        payload = self._payload(normalize_messages(adapt_messages_for_text_mode(messages, tools)))
         data = self._request(payload)
         message = data["choices"][0]["message"]
         reply = split_message(message, strip=self._config.strip_reasoning)
@@ -243,9 +262,79 @@ class OpenAICompatClient(LLMClient):
     # ---- request / retry -----------------------------------------------------------------
 
     def _payload(self, messages: list[dict]) -> dict[str, Any]:
-        return {"model": self._config.model, "messages": messages, "temperature": self._config.temperature}
+        """The request body, minus what this endpoint has already rejected and plus what it has demanded."""
+        cfg = self._config
+        if self._strict_roles:
+            messages = normalize_messages(messages, native=True)
+        payload: dict[str, Any] = {"model": cfg.model, "messages": messages}
+        if "temperature" not in self._dropped:
+            payload["temperature"] = cfg.temperature
+        if cfg.max_output_tokens is not None and self._max_tokens_key not in self._dropped:
+            payload[self._max_tokens_key] = cfg.max_output_tokens
+        payload.update({k: v for k, v in cfg.extra_params.items() if k not in self._dropped})
+        payload.update(self._forced)
+        return payload
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST, and when the endpoint answers 400 about something we can leave out or fix, do that and try again.
+
+        See ``_compat_fix``. Each fix is remembered, so it costs one extra request per run, not one per call.
+        """
+        for _ in range(_MAX_COMPAT_RETRIES + 1):
+            try:
+                return self._request_with_retries(payload)
+            except LLMError as err:
+                repaired = self._compat_fix(err, payload)
+                if repaired is None:
+                    raise
+                payload = repaired
+        raise AssertionError("unreachable: _compat_fix stops changing the payload")  # pragma: no cover
+
+    def _compat_fix(self, err: LLMError, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """A repaired copy of ``payload`` for a 400/422 that names something fixable, or ``None`` if there is nothing to fix.
+
+        * a parameter we sent that the endpoint does not support (``temperature``, ``top_p``, ``tool_choice``,
+          ``parallel_tool_calls``, ``response_format``, ``max_tokens``, or a configured extra) is dropped;
+        * ``max_tokens`` rejected in favour of ``max_completion_tokens`` is renamed;
+        * DashScope's ``enable_thinking`` demand is met;
+        * a complaint about message roles (must alternate, system must be first) turns on message normalisation.
+        The ``tools`` parameter is not handled here: in ``auto`` mode a rejection switches to text-mode tool calling.
+        """
+        if err.status_code not in (400, 422) or err.retryable:
+            return None
+        text = f"{err} {err.detail}".lower()
+        fixed = dict(payload)
+        notes: list[str] = []
+
+        if "max_tokens" in fixed and "max_completion_tokens" in text and self._max_tokens_key == "max_tokens":
+            self._max_tokens_key = "max_completion_tokens"
+            fixed["max_completion_tokens"] = fixed.pop("max_tokens")
+            notes.append("renamed max_tokens to max_completion_tokens")
+        else:
+            candidates = [*_DROPPABLE_PARAMS, *self._config.extra_params]
+            for name in dict.fromkeys(candidates):
+                if name in fixed and name not in ("model", "messages", "tools") and _mentions(text, name):
+                    self._dropped.add(name)
+                    del fixed[name]
+                    notes.append(f"dropped parameter '{name}'")
+        for name, value in _PARAM_FIXES.items():
+            if name not in fixed and _mentions(text, name):
+                self._forced[name] = fixed[name] = value
+                notes.append(f"set {name}={value}")
+        if not self._strict_roles and _ROLE_COMPLAINT.search(text):
+            self._strict_roles = True
+            fixed["messages"] = normalize_messages(fixed["messages"], native=True)
+            notes.append("normalised the message roles")
+
+        if not notes:
+            return None
+        why = f"HTTP {err.status_code}: {_excerpt(err.detail or str(err), 160)}"
+        for note in notes:
+            self.workarounds.append(f"{note} ({why})")
+        logger.warning("%s; retrying (%s)", why, "; ".join(notes))
+        return fixed
+
+    def _request_with_retries(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST with retries; return the parsed body of the first good response.
 
         A good body is guaranteed to have ``choices[0].message`` as a dict.
@@ -414,6 +503,11 @@ def _read_api_key() -> str:
             f"{API_KEY_ENV} contains spaces, line breaks or non-ASCII characters; check how it was exported"
         )
     return key
+
+
+def _mentions(text: str, name: str) -> bool:
+    """Whether ``name`` appears in ``text`` as a whole identifier (``tools`` must not match ``tool_choice``)."""
+    return re.search(rf"(?<![a-z0-9_]){re.escape(name.lower())}(?![a-z0-9_])", text) is not None
 
 
 def _retry_after_seconds(value: str | None) -> float | None:

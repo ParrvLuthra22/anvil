@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from anvil.llm.errors import LLMConfigError
 
 TOOL_MODES = ("auto", "native", "text")
+# Request fields the client owns; ``llm_extra_params`` may not override them.
+RESERVED_PARAMS = frozenset({"model", "messages", "tools", "stream"})
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,8 @@ class LLMConfig:
     describes the tools in the prompt and parses a JSON block from the reply,
     ``auto`` tries native first and falls back to text permanently.
     ``strip_reasoning`` removes ``<think>`` blocks and reasoning fields from replies.
+    ``max_output_tokens`` is sent as ``max_tokens`` (``None``: the provider's default). ``extra_params`` are added to
+    every request body as they are (provider-specific switches such as ``top_p`` or ``enable_thinking``).
     """
 
     model: str
@@ -26,6 +30,8 @@ class LLMConfig:
     temperature: float = 0.0
     tool_mode: str = "auto"
     strip_reasoning: bool = True
+    max_output_tokens: int | None = None
+    extra_params: Mapping[str, Any] = field(default_factory=dict)
     max_attempts: int = 5
     timeout_seconds: float = 120.0
     connect_timeout_seconds: float = 10.0
@@ -61,12 +67,34 @@ class LLMConfig:
             temperature=_number(config, "temperature", 0.0, minimum=0.0),
             tool_mode=tool_mode,
             strip_reasoning=_flag(config, "strip_reasoning", True),
+            max_output_tokens=_optional_count(config, "max_output_tokens"),
+            extra_params=_extra_params(config),
             max_attempts=int(_number(config, "llm_max_attempts", 5, minimum=1, integer=True)),
             timeout_seconds=_number(config, "llm_timeout_seconds", 120.0, minimum=0.001),
             connect_timeout_seconds=_number(config, "llm_connect_timeout_seconds", 10.0, minimum=0.001),
             backoff_base_seconds=_number(config, "llm_backoff_base_seconds", 1.0, minimum=0.0),
             backoff_max_seconds=_number(config, "llm_backoff_max_seconds", 60.0, minimum=0.0),
         )
+
+
+def _optional_count(config: Mapping[str, Any], key: str) -> int | None:
+    """A positive whole number, or ``None`` when the key is absent or null."""
+    value = config.get(key)
+    if value is None:
+        return None
+    return int(_number(config, key, 1, minimum=1, integer=True))
+
+
+def _extra_params(config: Mapping[str, Any]) -> dict[str, Any]:
+    value = config.get("llm_extra_params")
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        raise LLMConfigError(f"'llm_extra_params' must be a mapping of request fields, got {value!r}")
+    reserved = sorted(RESERVED_PARAMS & set(value))
+    if reserved:
+        raise LLMConfigError(f"'llm_extra_params' may not set {', '.join(reserved)}: the client owns those fields")
+    return dict(value)
 
 
 def _flag(config: Mapping[str, Any], key: str, default: bool) -> bool:
