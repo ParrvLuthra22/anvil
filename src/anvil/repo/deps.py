@@ -249,6 +249,14 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | Non
         if as_of:
             uv_cmd += f" --exclude-newer {as_of}"
         strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
+    else:
+        # Check if pyproject.toml mentions uv
+        pyproject = sandbox.root / "pyproject.toml"
+        if pyproject.exists():
+            text = pyproject.read_text(encoding="utf-8", errors="replace")
+            # simple check for 'uv' in pyproject.toml
+            if re.search(r'\buv\b', text):
+                log.warning("uv is missing but pyproject.toml appears to require it.")
     
     strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
 
