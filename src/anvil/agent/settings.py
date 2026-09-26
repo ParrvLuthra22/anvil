@@ -10,6 +10,7 @@ from anvil.context.manager import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_SUMMARIZE_THRESHOLD,
 )
+from anvil.llm.profiles import resolve_profile
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,9 @@ class AgentSettings:
             max_tokens_total=_whole(config, "max_tokens_total", cls.max_tokens_total, 1),
             wall_clock_seconds=_number(config, "wall_clock_seconds", cls.wall_clock_seconds, 0),
             tool_output_char_cap=_whole(config, "tool_output_char_cap", cls.tool_output_char_cap, 200),
-            max_context_tokens=_whole(config, "max_context_tokens", cls.max_context_tokens, 1000),
+            max_context_tokens=_whole(
+                config, "max_context_tokens", resolve_profile(config).max_context_tokens, 1000
+            ),
             context_keep_steps=_whole(config, "context_keep_steps", cls.context_keep_steps, 1),
             context_summarize_threshold=_number(
                 config, "context_summarize_threshold", cls.context_summarize_threshold, 0.1, 1.0
