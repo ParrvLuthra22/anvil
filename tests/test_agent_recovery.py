@@ -560,3 +560,30 @@ def test_an_llm_that_dies_after_the_patch_still_yields_the_patch_a_report_and_lo
     assert "Stopped early: LLM call failed" in run.report and advice in run.report
     assert run.done.data["resolved_confidence"] == pytest.approx(0.3)
     assert run.pipeline.sandbox.closed and run.events[-1] is run.done
+
+
+def test_a_sandbox_that_reports_checkpoint_failure_as_a_string_is_never_rolled_back_to(tmp_path):
+    """Regression (audit): 'error: git stash failed' was accepted as a ref, logged ok=True, and rolled back to."""
+
+    class StringErrors(FakeSandbox):
+        rollbacks: list = []
+
+        def checkpoint(self, label):
+            return "error: git stash failed — fatal: not a git repository"
+
+        def rollback(self, ref):
+            self.rollbacks.append(ref)
+
+    sandbox = StringErrors(project_files(), on_exec=project_exec)
+    script = (
+        understand() + localize() + reproduce() + wrong_patch("return a - b", "return a * b", "multiplied") + finalize()
+    )
+    run = execute(script, tmp_path, pipeline=FakePipeline(sandbox), max_patch_attempts=1, max_rollbacks=2)
+
+    assert sandbox.rollbacks == [], "no rollback may be attempted with a ref that is really an error message"
+    assert "a * b" in sandbox.files["calc.py"], "the model's work is still there"
+    assert run_kinds(run) == ["sandbox"]
+    checkpoint_result = next(e for e in run.of("tool_result") if e.data["tool"] == "checkpoint")
+    assert checkpoint_result.data["ok"] is False
+    assert "Checkpointing failed, so rolling back was not possible." in run.report
+    assert "rollbacks: 0" in run.report

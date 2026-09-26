@@ -488,6 +488,15 @@ def llm_failure_advice(exc: LLMError) -> str:
 # ---- checkpoint and rollback ----------------------------------------------------------------
 
 
+def usable_ref(ref: object) -> bool:
+    """Whether a sandbox's checkpoint result is a ref that can be rolled back to.
+
+    Some sandboxes report a failure as an ``"error: ..."`` string instead of raising; that, ``None`` and an
+    empty string are not refs.
+    """
+    return isinstance(ref, str) and bool(ref.strip()) and not ref.strip().lower().startswith("error")
+
+
 class Checkpointer:
     """Checkpoints and rolls back the working tree through the ``Sandbox`` interface.
 
@@ -502,7 +511,7 @@ class Checkpointer:
         self._protected = protected_paths
 
     def checkpoint(self, label: str) -> str | None:
-        """Snapshot the tree; returns the ref, or ``None`` if the sandbox could not."""
+        """Snapshot the tree; returns the ref, or ``None`` if the sandbox could not (it raised, or returned no ref)."""
         saved = self._save()
         self._emitter.tool_call("checkpoint", {"label": label})
         try:
@@ -512,12 +521,20 @@ class Checkpointer:
             self._emitter.error("sandbox", f"checkpoint failed: {exc}")
             return None
         self._restore(saved)
+        if not usable_ref(ref):
+            self._emitter.tool_result("checkpoint", False, str(ref))
+            self._emitter.error("sandbox", f"checkpoint failed: the sandbox returned {str(ref)[:200]!r} instead of a ref")
+            return None
         self._emitter.tool_result("checkpoint", True, str(ref))
-        return ref or None
+        return ref
 
     def rollback(self, ref: str | None, tried: Sequence[str] = ()) -> bool:
-        """Reset the tree to ``ref``; ``tried`` are the approaches the model is about to be told were abandoned."""
-        if not ref:
+        """Reset the tree to ``ref``; ``tried`` are the approaches the model is about to be told were abandoned.
+
+        A ref that is not usable is refused without touching the sandbox: rolling back to nothing would
+        discard the working tree and restore nothing.
+        """
+        if not usable_ref(ref):
             return False
         saved = self._save()
         self._emitter.tool_call("rollback", {"ref": ref})

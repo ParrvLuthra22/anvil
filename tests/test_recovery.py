@@ -505,3 +505,56 @@ def test_a_failing_rollback_is_reported_and_returns_false():
 def test_rolling_back_to_no_checkpoint_does_nothing():
     checkpointer, events = make_checkpointer(project_sandbox())
     assert checkpointer.rollback(None) is False and events() == []
+
+
+# ---- refs the sandbox reports as errors -----------------------------------------------------
+
+
+class ErrorStringSandbox(FakeSandbox):
+    """Like the real worktree sandbox when ``git stash`` fails: it returns a message instead of raising."""
+
+    def __init__(self, ref, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ref, self.rollbacks = ref, []
+
+    def checkpoint(self, label):
+        return self.ref
+
+    def rollback(self, ref):
+        self.rollbacks.append(ref)
+
+
+@pytest.mark.parametrize(
+    "ref", ["error: git stash failed — fatal: not a git repository", "Error: nope", "  ERROR", "", "   ", None]
+)
+def test_an_error_string_or_empty_ref_is_a_failed_checkpoint_not_a_ref(ref):
+    sandbox = ErrorStringSandbox(ref, {"a.py": "x"})
+    checkpointer, events = make_checkpointer(sandbox)
+    assert checkpointer.checkpoint("patch-start") is None
+    recorded = events()
+    result = next(e for e in recorded if e.type == "tool_result")
+    assert result.data["ok"] is False, "the trace must not show a failed checkpoint as a success"
+    (error,) = [e for e in recorded if e.type == "error"]
+    assert error.data["kind"] == "sandbox" and "checkpoint failed" in error.data["message"]
+
+
+def test_a_real_looking_ref_is_still_accepted():
+    for ref in ("stash@{0}", "stash@{3}", "9f2c1ab", "ckpt-1"):
+        checkpointer, _ = make_checkpointer(ErrorStringSandbox(ref, {}))
+        assert checkpointer.checkpoint("s") == ref
+
+
+def test_the_repro_survives_a_checkpoint_that_failed():
+    sandbox = ErrorStringSandbox("error: boom", {".anvil/repro.py": "print(1)"})
+    checkpointer, _ = make_checkpointer(sandbox, lambda: [".anvil/repro.py"])
+    assert checkpointer.checkpoint("s") is None
+    assert sandbox.files[".anvil/repro.py"] == "print(1)"
+
+
+@pytest.mark.parametrize("ref", ["error: git stash failed", "", None])
+def test_rolling_back_to_an_unusable_ref_never_touches_the_sandbox(ref):
+    """Regression: the real sandbox's rollback runs `git checkout -- . && git clean -fd` before it looks at the ref."""
+    sandbox = ErrorStringSandbox("stash@{0}", {"calc.py": "patched"})
+    checkpointer, events = make_checkpointer(sandbox)
+    assert checkpointer.rollback(ref) is False
+    assert sandbox.rollbacks == [] and sandbox.files["calc.py"] == "patched" and events() == []
