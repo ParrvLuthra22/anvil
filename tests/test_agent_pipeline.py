@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import anvil.agent.pipeline as pipeline_module
+from anvil.agent.prepared_sandbox import PreparedSandbox
 from anvil.agent.pipeline import Ingested, RepoPipeline
 from anvil.repo.ingest import IssueRef
 from anvil.repo.profile import RepoProfile
@@ -79,7 +80,8 @@ def test_profile_builds_the_workspace_from_the_injected_factories(tmp_path, repo
 
     assert workspace.issue is issue and workspace.profile is PROFILE
     assert workspace.repo_map == "map of repo"
-    assert workspace.sandbox is sandbox and workspace.tools is registry
+    assert isinstance(workspace.sandbox, PreparedSandbox) and workspace.sandbox.inner is sandbox
+    assert workspace.tools is registry
     assert seen["sandbox"] == (config, tmp_path / "repo", PROFILE)
     assert seen["registry"] is PROFILE
 
@@ -92,7 +94,7 @@ def test_default_factories_delegate_to_the_sandbox_and_tools_packages(tmp_path, 
 
     workspace = RepoPipeline({"k": 1}, tmp_path).profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
 
-    assert workspace.sandbox == ("sandbox", {"k": 1}, Path("/r"), PROFILE)
+    assert workspace.sandbox.inner == ("sandbox", {"k": 1}, Path("/r"), PROFILE)
     assert workspace.tools == ("registry", PROFILE)
 
 

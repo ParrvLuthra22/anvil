@@ -30,6 +30,11 @@ class PreparedSandbox:
         self._venv_dir = venv_dir
 
     @property
+    def inner(self) -> Sandbox:
+        """The wrapped sandbox."""
+        return self._inner
+
+    @property
     def root(self) -> Path:
         """The repository working directory of the wrapped sandbox."""
         return self._inner.root
