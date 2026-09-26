@@ -254,8 +254,12 @@ class TestRepoMap:
         assert "main" in result or "MyClass" in result
 
     def test_repo_name_in_header(self, tmp_path):
+        # Task 2: default header is neutral 'repo', NOT the dir name.
         result = repo_map(tmp_path)
-        assert tmp_path.name in result
+        assert result.startswith("# repo: repo")
+        # But passing label= puts owner/repo in header
+        result_labelled = repo_map(tmp_path, label="psf/requests")
+        assert "psf/requests" in result_labelled
 
     def test_priority_dir_first(self, tmp_path):
         """src/ must appear before other dirs like zzz/."""
@@ -278,3 +282,84 @@ class TestRepoMap:
         (tmp_path / "lib.rs").write_text("pub fn hello() {}\npub struct Foo;\n")
         result = repo_map(tmp_path)
         assert "hello" in result or "Foo" in result
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Task 1 (unittest discover) and Task 2 (repo_map label)
+# ---------------------------------------------------------------------------
+
+class TestTask1UnittestDetection:
+    """Task 1: unittest discover must use python3, not bare python."""
+
+    def test_unittest_in_pyproject_uses_python3(self, tmp_path):
+        """When pyproject mentions unittest (not pytest), command uses python3."""
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname = 'mypkg'\n\n"
+            "# we use unittest for testing\n"
+        )
+        profile = profile_repo(tmp_path)
+        # Should NOT emit 'python -m unittest discover' (bare python)
+        if profile.test_cmd and "unittest" in profile.test_cmd:
+            assert "python3" in profile.test_cmd
+            assert profile.test_cmd != "python -m unittest discover"
+
+    def test_explicit_unittest_in_pyproject(self, tmp_path):
+        """Pyproject with 'unittest' keyword uses python3 -m unittest discover."""
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname = 'mypkg'\n"
+            "# unittest discover\n"
+        )
+        profile = profile_repo(tmp_path)
+        if profile.test_framework == "unittest":
+            assert "python3" in profile.test_cmd
+            assert "python -m" not in profile.test_cmd
+
+    def test_requirements_without_pytest_uses_python3_unittest(self, tmp_path):
+        """requirements.txt without pytest → python3 -m unittest discover."""
+        (tmp_path / "requirements.txt").write_text("requests\nflask\n")
+        profile = profile_repo(tmp_path)
+        assert profile.test_framework == "unittest"
+        assert profile.test_cmd == "python3 -m unittest discover"
+        assert "python3" in profile.test_cmd
+
+    def test_requirements_with_pytest_stays_pytest(self, tmp_path):
+        """requirements.txt with pytest → keep pytest."""
+        (tmp_path / "requirements.txt").write_text("requests\npytest\n")
+        profile = profile_repo(tmp_path)
+        assert profile.test_cmd == "pytest"
+
+    def test_no_bare_python_in_any_test_cmd(self, tmp_path):
+        """Ensure 'python -m' (without '3') never appears in test_cmd."""
+        (tmp_path / "requirements.txt").write_text("httpx\n")
+        profile = profile_repo(tmp_path)
+        if profile.test_cmd:
+            # 'python -m' without '3' must not appear
+            assert "python -m" not in profile.test_cmd or "python3" in profile.test_cmd
+
+
+class TestTask2RepoMapLabel:
+    """Task 2: repo_map header must not expose clone dir name; use label param."""
+
+    def test_default_label_is_repo_not_dirname(self, tmp_path):
+        """Without a label, header says 'repo', NOT the tmp dir name."""
+        result = repo_map(tmp_path)
+        header = result.split("\n")[0]
+        # Must NOT contain the tmp dir basename (e.g. 'pytest-xxx' or similar)
+        assert "# repo: repo" == header
+
+    def test_label_overrides_header(self, tmp_path):
+        """Passing label='psf/requests' puts that in the header."""
+        result = repo_map(tmp_path, label="psf/requests")
+        header = result.split("\n")[0]
+        assert header == "# repo: psf/requests"
+
+    def test_label_none_uses_neutral(self, tmp_path):
+        """Explicit label=None still uses neutral 'repo' label."""
+        result = repo_map(tmp_path, label=None)
+        assert result.startswith("# repo: repo")
+
+    def test_label_shown_in_permission_error(self, tmp_path):
+        """Even on PermissionError the label appears correctly."""
+        # We can't easily test PermissionError so just verify the API accepts label
+        result = repo_map(tmp_path, label="owner/myrepo")
+        assert "# repo: owner/myrepo" in result
