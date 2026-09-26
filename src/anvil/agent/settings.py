@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from anvil.context.manager import (
+    DEFAULT_KEEP_STEPS,
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_SUMMARIZE_THRESHOLD,
+)
+
 
 @dataclass(frozen=True)
 class AgentSettings:
@@ -19,6 +25,9 @@ class AgentSettings:
     max_tokens_total: int = 1_500_000
     wall_clock_seconds: float = 1800.0
     tool_output_char_cap: int = 8000
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
+    context_keep_steps: int = DEFAULT_KEEP_STEPS
+    context_summarize_threshold: float = DEFAULT_SUMMARIZE_THRESHOLD
     max_patch_attempts: int = 3
     max_rollbacks: int = 2
     command_timeout_seconds: int = 120
@@ -42,6 +51,11 @@ class AgentSettings:
             max_tokens_total=_whole(config, "max_tokens_total", cls.max_tokens_total, 1),
             wall_clock_seconds=_number(config, "wall_clock_seconds", cls.wall_clock_seconds, 0),
             tool_output_char_cap=_whole(config, "tool_output_char_cap", cls.tool_output_char_cap, 200),
+            max_context_tokens=_whole(config, "max_context_tokens", cls.max_context_tokens, 1000),
+            context_keep_steps=_whole(config, "context_keep_steps", cls.context_keep_steps, 1),
+            context_summarize_threshold=_number(
+                config, "context_summarize_threshold", cls.context_summarize_threshold, 0.1, 1.0
+            ),
             max_patch_attempts=_whole(config, "max_patch_attempts", cls.max_patch_attempts, 1),
             max_rollbacks=_whole(config, "max_rollbacks", cls.max_rollbacks, 0),
             command_timeout_seconds=_whole(config, "command_timeout_seconds", cls.command_timeout_seconds, 1),
@@ -74,12 +88,16 @@ class AgentSettings:
         ) / 1_000_000
 
 
-def _number(config: Mapping[str, Any], key: str, default: float, minimum: float) -> float:
+def _number(
+    config: Mapping[str, Any], key: str, default: float, minimum: float, maximum: float | None = None
+) -> float:
     value = config.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"'{key}' must be a number, got {value!r}")
     if value < minimum:
         raise ValueError(f"'{key}' must be >= {minimum}, got {value!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"'{key}' must be <= {maximum}, got {value!r}")
     return float(value)
 
 

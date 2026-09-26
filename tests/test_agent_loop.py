@@ -23,9 +23,9 @@ class Harness:
 
     def __init__(self, script, *, registry=None, sandbox=None, llm=None, **settings):
         self.llm = llm or RecordingLLM(script)
-        self.ctx = ContextManager()
         self.sandbox = sandbox or project_sandbox()
         self.settings = AgentSettings(**settings)
+        self.ctx = ContextManager(tool_output_char_cap=self.settings.tool_output_char_cap)
         self.budget = Budget(self.settings)
         bus = EventBus()
         self.queue = bus.subscribe()
@@ -135,7 +135,8 @@ def test_tool_output_is_capped_before_it_reaches_the_model():
     h = Harness([reply(call("read_file", path="big.txt")), done()], sandbox=sandbox, tool_output_char_cap=1000)
     h.run()
     (output,) = tool_results(h)[:1]
-    assert len(output) < 1100 and "chars omitted" in output
+    assert len(output) <= 1000 and "lines omitted" in output
+    assert output.startswith("line\nline") and output.endswith("line\n")
 
 
 def test_invalid_json_arguments_are_reported_and_the_tool_is_not_run():

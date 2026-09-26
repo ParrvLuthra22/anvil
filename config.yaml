@@ -26,8 +26,18 @@ max_total_steps: 120
 max_tokens_total: 1500000
 wall_clock_seconds: 1800
 
-# Maximum characters of any single tool/shell output fed back to the model.
+# Maximum characters of any single tool/shell output fed back to the model; longer output
+# keeps its head and tail with a "[N lines omitted]" marker.
 tool_output_char_cap: 8000
+
+# Context window management: the prompt is kept under max_context_tokens (estimated at
+# chars/4; leave headroom for the tool schemas, which are sent separately).
+#   context_keep_steps: tool output from earlier steps is replaced by a one-line summary
+#   context_summarize_threshold: past this fraction of the budget, old turns are folded into
+#                                a summary (one extra LLM call), or dropped if that fails
+max_context_tokens: 32000
+context_keep_steps: 6
+context_summarize_threshold: 0.75
 
 # Recovery: after this many failed PATCH/VERIFY attempts the tree is rolled back to the
 # checkpoint taken at the start of PATCH and the model must try a different hypothesis.

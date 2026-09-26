@@ -6,6 +6,10 @@ FINALIZE. INGEST and PROFILE are plain code behind ``Pipeline``; every other pha
 an LLM tool loop (``PhaseRunner``) whose facts the harness checks for itself: it
 runs the repro, reads the diff and counts failures rather than trusting the model.
 
+Every model call sees a history kept within ``max_context_tokens`` by the ``ContextManager``:
+a finished phase is replaced in it by its closing summary, old tool output shrinks to one line,
+and the issue, repo map and latest diff stay pinned.
+
 FINALIZE always happens: whatever goes wrong, ``patch.diff`` and ``report.md`` are
 written and a ``done`` event is emitted.
 """
@@ -37,6 +41,7 @@ from anvil.agent.prompts import (
 from anvil.agent.repro import WriteReproTool
 from anvil.agent.settings import AgentSettings
 from anvil.agent.state import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, CheckRun, RunState
+from anvil.agent.summarizer import HistorySummarizer
 from anvil.agent.text import clip_head, clip_middle
 from anvil.context import ContextManager
 from anvil.events import EventBus, Phase
@@ -83,6 +88,10 @@ def run_harness(
     Orchestrator(issue_url, config, bus, llm=llm, pipeline=pipeline).run()
 
 
+# Phases that end with text the model wrote itself; only those can be replaced by their summary.
+_COMPRESSIBLE = (PhaseStatus.DONE, PhaseStatus.GAVE_UP)
+
+
 @dataclass(frozen=True)
 class _Verdict:
     passed: bool
@@ -110,7 +119,13 @@ class Orchestrator:
             self._settings, self._settings_error = AgentSettings.fallback(config), str(exc)
         self._emitter = Emitter(bus)
         self._budget = Budget(self._settings, clock)
-        self._ctx = ContextManager()
+        self._ctx = ContextManager(
+            max_context_tokens=self._settings.max_context_tokens,
+            tool_output_char_cap=self._settings.tool_output_char_cap,
+            keep_steps=self._settings.context_keep_steps,
+            summarize_threshold=self._settings.context_summarize_threshold,
+            summarizer=HistorySummarizer(lambda: self._llm, self._budget, self._emitter, self._settings),
+        )
         self._state = RunState(issue_url)
         self._llm = llm
         self._owns_llm = False
@@ -193,9 +208,12 @@ class Orchestrator:
             "system",
             f"Profile: {profile.primary_language or 'unknown language'}, tests: {profile.test_cmd or 'unknown'}.",
         )
-        brief = issue_brief(workspace.issue, profile, workspace.repo_map)
+        brief = issue_brief(workspace.issue, profile)
         self._ctx.add_message("user", brief, pinned=True)
         self._emitter.message("user", brief)
+        if workspace.repo_map.strip():
+            self._ctx.set_repo_map(workspace.repo_map)
+            self._emitter.message("user", f"Repository overview\n{workspace.repo_map.strip()}")
 
     # ---- UNDERSTAND / LOCALIZE / REPRODUCE ----------------------------------------------------
 
@@ -414,15 +432,25 @@ class Orchestrator:
             self._emitter.set_phase(phase)
 
     def _run_phase(self, phase: Phase, kickoff: str, *, gate: Gate | None = None, pin: bool = False) -> PhaseOutcome:
-        """Run one LLM phase; ``pin`` records its outcome as a pinned message for later phases."""
+        """Run one LLM phase, then swap its transcript for its closing summary in the history.
+
+        A phase that ended with ``phase_done`` or ``give_up`` is compressed into that summary.
+        One that ran out of steps or stalled has no closing text, so its transcript stays for the
+        context manager to prune as it ages. ``pin`` keeps the summary through every later
+        compaction (used for the phases whose findings the rest of the run builds on).
+        """
         if self._runner is None:
             raise RuntimeError("the LLM phases cannot run before PROFILE")
         self._enter(phase)
+        self._ctx.set_diff(self._patch_text())
         outcome = self._runner.run(PHASE_SPECS[phase], kickoff, gate)
-        if pin:
-            text = outcome.summary if outcome.done else f"did not complete ({outcome.status.value}): {outcome.summary}"
-            message = phase_summary(phase, text)
+        text = outcome.summary if outcome.done else f"did not complete ({outcome.status.value}): {outcome.summary}"
+        message = phase_summary(phase, text)
+        if outcome.status in _COMPRESSIBLE:
+            self._ctx.end_phase(message, pinned=pin)
+        elif pin:
             self._ctx.add_message("user", message, pinned=True)
+        if pin:
             self._emitter.message("user", message)
         return outcome
 

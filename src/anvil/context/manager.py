@@ -39,7 +39,7 @@ logger.addHandler(logging.NullHandler())
 
 DEFAULT_MAX_CONTEXT_TOKENS = 32_000
 DEFAULT_TOOL_OUTPUT_CHAR_CAP = 8_000
-DEFAULT_KEEP_STEPS = 8
+DEFAULT_KEEP_STEPS = 6
 DEFAULT_SUMMARIZE_THRESHOLD = 0.75
 
 # Turns a transcript into a summary; typically one LLM call. May raise.
@@ -60,7 +60,7 @@ _SUMMARY_HEADER = "[Summary of earlier work]"
 _DIGEST_HEADER = "[Earlier work was dropped to fit the context budget.]"
 _DIGEST_ACTIONS_HEADER = "[Earlier work was dropped to fit the context budget. Actions taken, oldest first:]"
 _MAP_HEADING = "## Repository overview\n"
-_DIFF_HEADING = "[Latest diff of the working tree]\n"
+_DIFF_HEADING = "[Diff of the working tree as of the start of this phase]\n"
 
 _SUMMARY, _DIFF, _MAP = "summary", "diff", "map"
 
@@ -143,7 +143,9 @@ class ContextManager:
     def set_diff(self, diff: str) -> None:
         """Pin ``diff`` as the latest diff of the working tree, replacing the previous one.
 
-        An empty diff removes it. A diff longer than the tool output cap is truncated.
+        Call it when a phase starts: the model is told the diff is as of then, and it is not
+        updated by edits made during the phase. An empty diff removes it; a diff longer than
+        the tool output cap is truncated.
         """
         self._entries = [e for e in self._entries if e.tag != _DIFF]
         if diff.strip():

@@ -244,7 +244,7 @@ def test_pinned_items_survive_a_100_step_run_unchanged():
         contents = [m["content"] for m in messages]
         assert ISSUE in contents
         assert "[LOCALIZE summary]\ncalc.py:2 uses a - b" in contents
-        assert any(c.startswith("[Latest diff of the working tree]") and "+return a + b" in c for c in contents)
+        assert any(c.startswith("[Diff of the working tree") and "+return a + b" in c for c in contents)
         assert any(c.startswith("## Repository overview") and "src/module_0.py" in c for c in contents)
         exchange(ctx, i, text=payload(i, lines=80, width=80))
 
@@ -505,7 +505,7 @@ def test_ending_a_phase_keeps_the_pinned_diff_and_map_and_folded_summaries():
     ctx.end_phase("[A summary]")
     contents = [m["content"] for m in ctx.build_messages("goal")[1:]]
     assert any(c.startswith("## Repository overview") for c in contents)
-    assert any(c.startswith("[Latest diff") for c in contents)
+    assert any(c.startswith("[Diff of the working tree") for c in contents)
     assert contents[-1] == "[A summary]"
     assert any(c.startswith("[Earlier work was dropped") for c in contents)
     assert not any(c.startswith("reading file") for c in contents)

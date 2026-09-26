@@ -93,24 +93,25 @@ def _issue(**overrides) -> IssueRef:
 _PROFILE = RepoProfile(["python"], "python", "pip install -e .", "pytest", "pytest", notes="src layout")
 
 
-def test_issue_brief_contains_issue_profile_and_map_and_fences_the_untrusted_text():
-    brief = issue_brief(_issue(comments=["me too"]), _PROFILE, "calc.py\ntests/")
-    for expected in ("add is wrong", "acme/calc", "add(2, 3) gives -1", "pytest", "src layout", "me too", "calc.py\ntests/"):
+def test_issue_brief_contains_issue_and_profile_and_fences_the_untrusted_text():
+    brief = issue_brief(_issue(comments=["me too"]), _PROFILE)
+    for expected in ("add is wrong", "acme/calc", "add(2, 3) gives -1", "pytest", "src layout", "me too"):
         assert expected in brief
+    assert "Repository overview" not in brief
     assert "<issue>" in brief and "</issue>" in brief
     assert "untrusted" in brief
 
 
 def test_issue_brief_clips_long_bodies_and_limits_comments():
     long_issue = _issue(body="x" * (MAX_BODY_CHARS * 3), comments=[f"comment number {i}" for i in range(20)])
-    brief = issue_brief(long_issue, _PROFILE, "")
+    brief = issue_brief(long_issue, _PROFILE)
     assert len(brief) < MAX_BODY_CHARS + 3000
     assert f"comment number {MAX_COMMENTS - 1}" in brief
     assert f"comment number {MAX_COMMENTS}" not in brief
 
 
 def test_issue_brief_survives_a_sparse_issue_and_profile():
-    brief = issue_brief(_issue(title="", body=""), RepoProfile([], "", None, None, None), "")
+    brief = issue_brief(_issue(title="", body=""), RepoProfile([], "", None, None, None))
     assert "(no title)" in brief and "(empty)" in brief and "unknown" in brief
 
 

@@ -19,7 +19,8 @@ from anvil.agent.budget import Budget
 from anvil.agent.emitter import Emitter
 from anvil.agent.prompts import GIVE_UP, PHASE_DONE, PhaseSpec, control_tools
 from anvil.agent.settings import AgentSettings
-from anvil.agent.text import clip_head, clip_middle
+from anvil.agent.text import clip_head
+from anvil.agent.usage import record_usage
 from anvil.context import ContextManager
 from anvil.llm.client import LLMClient, LLMResponse
 from anvil.llm.errors import LLMError
@@ -115,7 +116,7 @@ class PhaseRunner:
         ``BudgetExceeded`` when a global budget is hit and ``RunAborted`` when the
         LLM fails for good.
         """
-        self._ctx.add_message("user", kickoff)
+        self._ctx.begin_phase(kickoff)
         self._emitter.message("user", kickoff)
         schemas = self._schemas(spec)
         records: list[ToolRecord] = []
@@ -157,11 +158,7 @@ class PhaseRunner:
         except LLMError as exc:
             self._emitter.error("llm", str(exc))
             raise RunAborted(f"LLM call failed: {exc}") from exc
-        usage = response.usage or {}
-        prompt, completion = _count(usage, "prompt_tokens"), _count(usage, "completion_tokens")
-        total = _count(usage, "total_tokens") or prompt + completion
-        self._budget.add_tokens(total)
-        self._emitter.usage(prompt, completion, total, self._settings.cost_estimate(prompt, completion))
+        record_usage(response, self._budget, self._emitter, self._settings)
         return response
 
     def _normalise(self, raw: dict) -> _Call:
@@ -241,18 +238,14 @@ class PhaseRunner:
             message = f"{type(exc).__name__}: {exc}"
             self._emitter.error("tool", f"{call.name} crashed: {message}")
             return False, f"Tool '{call.name}' crashed ({message}). Try a different approach.", {}
-        return result.ok, clip_middle(result.output, self._settings.tool_output_char_cap), dict(result.meta)
+        return result.ok, result.output, dict(result.meta)
 
     def _reply(self, call: _Call, ok: bool, output: str) -> None:
         """Answer a tool call in both the history and the event stream."""
         self._emitter.tool_result(call.name, ok, output)
-        self._ctx.add_message("tool", output, tool_call_id=call.id)
+        self._ctx.add_message("tool", output, tool_call_id=call.id, ok=ok)
 
 
 def _schema_name(schema: dict) -> str:
     return str(schema.get("function", schema).get("name", ""))
 
-
-def _count(usage: dict, key: str) -> int:
-    value = usage.get(key)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0

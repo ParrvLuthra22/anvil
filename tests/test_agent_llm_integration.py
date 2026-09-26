@@ -10,10 +10,13 @@ import httpx
 import pytest
 
 from anvil.agent.orchestrator import run_harness
+from anvil.agent.prompts import SUMMARIZER_PROMPT
+from anvil.context.tokens import estimate_messages_tokens
 from anvil.events import EventBus
 from anvil.llm.client import make_client
 from anvil.llm.toolcalls import render_call
 from tests.fakes import ISSUE_URL, FakePipeline
+from tests.test_agent_context import big_project_pipeline, wandering_script
 from tests.test_orchestrator import HAPPY_STEPS, happy
 
 
@@ -48,11 +51,20 @@ def _violations(payload: dict, tool_mode: str) -> list[str]:
     return problems
 
 
-def _server(script, tool_mode: str, problems: list[str], requests: list[dict]) -> httpx.MockTransport:
+def _server(
+    script, tool_mode: str, problems: list[str], requests: list[dict], summaries: list[dict] | None = None
+) -> httpx.MockTransport:
     replies = iter(script)
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
+        if payload["messages"][0]["content"] == SUMMARIZER_PROMPT:
+            if summaries is None:
+                problems.append("unexpected summariser call")
+            else:
+                summaries.append(payload)
+            reply_message = {"role": "assistant", "content": "Read helper functions in big.py; no bug there."}
+            return httpx.Response(200, json={"choices": [{"message": reply_message}], "usage": {"total_tokens": 40}})
         requests.append(payload)
         problems.extend(_violations(payload, tool_mode))
         scripted = next(replies)
@@ -113,3 +125,39 @@ def test_the_native_requests_carry_the_phase_tools_and_the_control_tools(tmp_pat
     assert {t["function"]["name"] for t in first["tools"]} == {"phase_done", "give_up"}
     assert {t["function"]["name"] for t in second["tools"]} == {"list_dir", "grep", "read_file", "phase_done", "give_up"}
     assert first["temperature"] == 0
+
+
+@pytest.mark.parametrize("tool_mode", ["native", "text"])
+def test_a_compacted_history_is_still_accepted_by_a_strict_provider(tmp_path, monkeypatch, tool_mode):
+    monkeypatch.setenv("AI_API_KEY", "test-key-not-a-secret")
+    problems: list[str] = []
+    requests: list[dict] = []
+    summaries: list[dict] = []
+    budget = 2500
+    config = {
+        "model": "fake-model",
+        "base_url": "http://provider.invalid/v1",
+        "tool_mode": tool_mode,
+        "output_dir": str(tmp_path / "out"),
+        "max_context_tokens": budget,
+        "context_keep_steps": 8,
+        "tool_output_char_cap": 1500,
+    }
+    transport = _server(wandering_script(20), tool_mode, problems, requests, summaries)
+    client = make_client(config, transport=transport)
+    bus = EventBus()
+    queue = bus.subscribe()
+
+    run_harness(ISSUE_URL, config, bus, llm=client, pipeline=big_project_pipeline())
+
+    assert problems == []
+    assert summaries, "the history never outgrew the budget"
+    assert [m["role"] for m in summaries[0]["messages"]] == ["system", "user"] and "tools" not in summaries[0]
+    assert "big.py" in summaries[0]["messages"][1]["content"]
+    assert max(estimate_messages_tokens(r["messages"]) for r in requests) <= budget + 400  # text mode adds tool docs
+    assert "+    return a + b" in (tmp_path / "out" / "patch.diff").read_text()
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert not [e for e in events if e.type == "error"]
+    assert events[-1].type == "done" and events[-1].data["resolved_confidence"] == pytest.approx(0.9)
