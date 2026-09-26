@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
-# Maximum raw bytes to read from a file before truncating to avoid OOM.
-_MAX_READ_BYTES = 2 * 1024 * 1024   # 2 MB
-# Bytes threshold above which we check for binary content.
-_BINARY_SNIFF_BYTES = 8192
-
 from anvil.sandbox.base import ExecResult, Sandbox
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -25,6 +21,44 @@ from anvil.sandbox.base import ExecResult, Sandbox
 _DEFAULT_CHAR_CAP = 8000      # characters; each half gets half
 _STASH_PREFIX = "anvil-checkpoint"
 
+# Maximum raw bytes to read from a file before truncating to avoid OOM.
+_MAX_READ_BYTES = 2 * 1024 * 1024   # 2 MB
+# Bytes threshold above which we check for binary content.
+_BINARY_SNIFF_BYTES = 8192
+
+# Paths excluded from diff() — venv and anvil internals are never patch-relevant.
+_DIFF_EXCLUDE = (".anvil_venv", ".anvil")
+
+# Regex that matches *any* env var name carrying a secret.
+# Covers: anything ending with KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL,
+# plus AWS_*, GITHUB_*, GH_*, ANTHROPIC_*, OPENAI_*, AI_*, GROQ_*, GOOGLE_*.
+_SECRET_KEY_RE = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)$"
+    r"|(^AWS_|^GITHUB_|^GH_|^ANTHROPIC_|^OPENAI_|^AI_|^GROQ_|^GOOGLE_)",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Typed exception for git failures
+# ---------------------------------------------------------------------------
+
+class GitError(RuntimeError):
+    """Raised when a git operation that must succeed fails."""
+
+    def __init__(self, cmd: list[str], returncode: int, stderr: str) -> None:
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"git {' '.join(cmd[1:] if cmd[0]=='git' else cmd)} failed "
+            f"(exit {returncode}): {stderr.strip()[:300]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _cap_output(text: str, cap: int) -> str:
     """Truncate *text* to *cap* chars using head+tail with an omission marker."""
@@ -36,11 +70,15 @@ def _cap_output(text: str, cap: int) -> str:
 
 
 def _sanitized_env() -> dict[str, str]:
-    """Return os.environ minus secrets that must not leak into child processes."""
-    env = os.environ.copy()
-    for key in ("AI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                "GOOGLE_API_KEY", "GROQ_API_KEY"):
-        env.pop(key, None)
+    """Return os.environ minus *all* secret-looking variables.
+
+    Strips any var whose name matches ``_SECRET_KEY_RE`` (keys, tokens,
+    passwords, credentials, plus AWS/GitHub/AI prefixes).
+    Also injects ``PYTHONDONTWRITEBYTECODE=1``.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not _SECRET_KEY_RE.search(k)}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -51,8 +89,17 @@ def _run_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.Comple
         cwd=cwd,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
         timeout=timeout,
     )
+
+
+def _require_git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a git command and raise :class:`GitError` if it fails."""
+    result = _run_git(args, cwd=cwd, timeout=timeout)
+    if result.returncode != 0:
+        raise GitError(["git"] + args, result.returncode, result.stderr)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -73,36 +120,41 @@ class WorktreeSandbox:
     ) -> None:
         """Set up a worktree rooted at *work_dir* from the repo at *repo_root*.
 
-        If the repo cannot be used as a worktree (e.g. shallow clone without a
-        local branch), falls back to ``shutil.copytree``.
+        Both paths are resolved to absolute paths immediately so that any
+        later ``git worktree add`` (run with ``cwd=repo_root``) operates on
+        the correct directories regardless of the caller's working directory.
+
+        Falls back to ``shutil.copytree`` if the repo cannot be used as a
+        worktree (e.g. a shallow clone without a local branch).
 
         Args:
             repo_root: The directory returned by ``clone_repo`` — the repo clone.
             work_dir:  Where the isolated copy will live.  Created if absent.
             char_cap:  Maximum characters for combined stdout+stderr per exec call.
         """
-        self._repo_root = repo_root
-        self._work_dir = work_dir
+        # Bug 1: resolve both paths so relative inputs never land in the wrong place.
+        self._repo_root = repo_root.resolve()
+        self._work_dir = work_dir.resolve()
         self._char_cap = char_cap
         self._use_worktree = False
 
-        work_dir.mkdir(parents=True, exist_ok=True)
+        self._work_dir.mkdir(parents=True, exist_ok=True)
 
-        # Try git worktree add
+        # Try git worktree add (cwd=repo_root so git finds the right .git)
         result = _run_git(
-            ["worktree", "add", "--detach", str(work_dir)],
-            cwd=repo_root,
+            ["worktree", "add", "--detach", str(self._work_dir)],
+            cwd=self._repo_root,
             timeout=30,
         )
         if result.returncode == 0:
             self._use_worktree = True
         else:
             # Fallback: plain copy (works even with shallow clones)
-            if work_dir.exists():
-                shutil.rmtree(work_dir)
-            shutil.copytree(repo_root, work_dir)
+            if self._work_dir.exists():
+                shutil.rmtree(self._work_dir)
+            shutil.copytree(self._repo_root, self._work_dir)
 
-        # Record the baseline commit so diff() can compare against it
+        # Record the baseline commit so diff() and rollback can compare against it
         rev = _run_git(["rev-parse", "HEAD"], cwd=self._work_dir)
         self._baseline_sha: str = rev.stdout.strip() if rev.returncode == 0 else ""
 
@@ -124,13 +176,11 @@ class WorktreeSandbox:
         Raises:
             PermissionError: If *path* resolves to a location outside the sandbox root.
         """
-        # Reject absolute paths outright
         if os.path.isabs(path):
             raise PermissionError(
                 f"Absolute path {path!r} is not allowed inside the sandbox."
             )
         candidate = self._work_dir / path
-        # realpath follows all symlinks; resolve() doesn't on all Python versions
         real_candidate = Path(os.path.realpath(candidate))
         real_root = Path(os.path.realpath(self._work_dir))
         try:
@@ -141,15 +191,29 @@ class WorktreeSandbox:
             )
         return real_candidate
 
+    def _venv_bin(self) -> str | None:
+        """Return the .anvil_venv/bin path if it exists, else None."""
+        venv_bin = self._work_dir / ".anvil_venv" / "bin"
+        return str(venv_bin) if venv_bin.is_dir() else None
+
     def exec(self, cmd: str, timeout: int = 120) -> ExecResult:
         """Run *cmd* in the sandbox root with a hard timeout.
 
-        The child process group is killed on timeout so no orphans remain.
-        ``AI_API_KEY`` and other secret env vars are stripped from the child env.
-        stdout and stderr are each capped at ``char_cap // 2`` characters.
+        - ``stdin`` is ``/dev/null`` so interactive prompts never hang.
+        - The child process group is killed on timeout so no orphans remain.
+        - All secret env vars are stripped (see ``_sanitized_env``).
+        - ``PYTHONDONTWRITEBYTECODE=1`` is injected.
+        - If ``.anvil_venv/bin`` exists it is prepended to ``PATH`` so
+          venv-installed tools (pytest, etc.) are found automatically.
+        - stdout and stderr are each capped at ``char_cap // 2`` characters.
         """
         start = time.monotonic()
         env = _sanitized_env()
+
+        # Bug 4: prepend venv bin to PATH when it exists
+        venv_bin = self._venv_bin()
+        if venv_bin:
+            env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
 
         try:
             proc = subprocess.Popen(
@@ -159,8 +223,9 @@ class WorktreeSandbox:
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,   # Bug 3: no interactive stdin
                 text=True,
-                start_new_session=True,   # own process group → os.killpg works
+                start_new_session=True,     # own process group → os.killpg works
             )
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
@@ -201,14 +266,6 @@ class WorktreeSandbox:
         Handles binary files, large files (capped at 2 MB), CRLF line endings
         and unicode (invalid bytes replaced with the U+FFFD replacement character).
 
-        Args:
-            path:  Path relative to sandbox root.
-            start: First line to return (1-indexed, inclusive).
-            end:   Last line to return (1-indexed, inclusive).
-
-        Returns:
-            The requested file content (or slice).
-
         Raises:
             FileNotFoundError: If the path does not exist.
             PermissionError:   If the path escapes the sandbox root.
@@ -221,21 +278,18 @@ class WorktreeSandbox:
         if abs_path.is_dir():
             raise IsADirectoryError(f"{path!r} is a directory, not a file.")
 
-        # Read raw bytes so we can detect binary content and cap size.
         raw_bytes = abs_path.read_bytes()
         truncated = False
         if len(raw_bytes) > _MAX_READ_BYTES:
             raw_bytes = raw_bytes[:_MAX_READ_BYTES]
             truncated = True
 
-        # Binary detection: look for null bytes in the first sniff window.
         sniff = raw_bytes[:_BINARY_SNIFF_BYTES]
         if b"\x00" in sniff:
             size_kb = abs_path.stat().st_size // 1024
             return f"(binary file — {size_kb} KB, cannot display as text)"
 
         text = raw_bytes.decode("utf-8", errors="replace")
-        # Normalise CRLF → LF so line counting is consistent cross-platform.
         text = text.replace("\r\n", "\n")
 
         if truncated:
@@ -249,7 +303,6 @@ class WorktreeSandbox:
         if start is None and end is None:
             return "".join(lines)
 
-        # Convert from 1-indexed inclusive to 0-indexed Python slice
         lo = (start - 1) if start is not None else 0
         hi = end if end is not None else len(lines)
         lo = max(lo, 0)
@@ -258,8 +311,6 @@ class WorktreeSandbox:
 
     def write_file(self, path: str, content: str) -> None:
         """Create or overwrite *path* (relative to root) with *content*.
-
-        Parent directories are created automatically.
 
         Raises:
             PermissionError: If the path escapes the sandbox root.
@@ -271,77 +322,100 @@ class WorktreeSandbox:
     def diff(self) -> str:
         """Return a unified diff of all changes versus the baseline commit.
 
-        Includes untracked new files so the agent can see files it created.
+        Excludes ``.anvil_venv`` and ``.anvil`` directories which are never
+        part of the patch.
         """
         if not self._baseline_sha:
             return "(no baseline — diff unavailable)"
 
-        # Tracked changes
+        # Build exclusion pathspecs
+        exclude_args: list[str] = []
+        for exc in _DIFF_EXCLUDE:
+            exclude_args += [":(exclude)" + exc]
+
         tracked = _run_git(
-            ["diff", self._baseline_sha, "--", "."],
+            ["diff", self._baseline_sha, "--", "."] + exclude_args,
             cwd=self._work_dir,
         )
         parts: list[str] = [tracked.stdout] if tracked.returncode == 0 else []
 
-        # Untracked new files — add to index temporarily then diff
         untracked = _run_git(
             ["ls-files", "--others", "--exclude-standard"],
             cwd=self._work_dir,
         )
         for new_file in untracked.stdout.splitlines():
+            # Skip excluded dirs
+            if any(new_file.startswith(exc) for exc in _DIFF_EXCLUDE):
+                continue
             nf_path = self._work_dir / new_file
             if nf_path.exists():
                 r = _run_git(
                     ["diff", "--no-index", "--", "/dev/null", new_file],
                     cwd=self._work_dir,
                 )
-                # git diff --no-index exits 1 when there's a diff (normal)
                 parts.append(r.stdout)
 
         return "".join(parts)
 
     def checkpoint(self, label: str) -> str:
-        """Snapshot current state via ``git stash`` and return the stash ref.
+        """Snapshot current state without touching the working tree.
+
+        Uses ``git stash create`` which creates a stash object and returns its
+        SHA **without** modifying the working tree or index.  The SHA is the
+        stable ref to pass to :meth:`rollback`.
+
+        Raises:
+            GitError: If ``git add -A`` or ``git stash create`` fail.
 
         Returns:
-            A stash ref string like ``stash@{0}``, or an error string prefixed
-            with ``"error:"`` if stashing fails.
+            The stash SHA (a 40-character hex string), or ``"baseline"`` if
+            there are no changes to snapshot (already at the baseline).
         """
-        # Stage everything so stash captures untracked files too
-        _run_git(["add", "-A"], cwd=self._work_dir)
-        msg = f"{_STASH_PREFIX}:{label}"
+        # Stage everything so stash create sees untracked files too
+        _require_git(["add", "-A"], cwd=self._work_dir)
+
         result = _run_git(
-            ["stash", "push", "--include-untracked", "-m", msg],
+            ["stash", "create", f"anvil-checkpoint:{label}"],
             cwd=self._work_dir,
         )
         if result.returncode != 0:
-            return f"error: git stash failed — {result.stderr.strip()}"
+            raise GitError(
+                ["git", "stash", "create"],
+                result.returncode,
+                result.stderr,
+            )
 
-        # Find the ref of the stash we just pushed
-        list_result = _run_git(["stash", "list", "--format=%gd %s"], cwd=self._work_dir)
-        for line in list_result.stdout.splitlines():
-            parts = line.split(" ", 1)
-            if len(parts) == 2 and msg in parts[1]:
-                return parts[0]
-
-        return "stash@{0}"  # best guess if parsing fails
+        sha = result.stdout.strip()
+        if not sha:
+            # No changes vs HEAD → return baseline SHA as the ref
+            return self._baseline_sha or "baseline"
+        return sha
 
     def rollback(self, ref: str) -> None:
-        """Restore to the state captured by *ref* (a stash ref like ``stash@{0}``).
+        """Restore the working tree to the state captured by *ref*.
 
-        The current working-tree state is discarded.
+        ``ref`` is either a stash SHA returned by :meth:`checkpoint` or
+        ``"baseline"`` / the baseline commit SHA, in which case the tree is
+        reset to the original clone state.
+
+        Raises:
+            GitError: If the reset or apply fails.
         """
-        # Discard any current changes
-        _run_git(["checkout", "--", "."], cwd=self._work_dir)
-        _run_git(["clean", "-fd"], cwd=self._work_dir)
+        # Hard-reset to HEAD, then clean untracked files
+        _require_git(["reset", "--hard", "HEAD"], cwd=self._work_dir)
+        _require_git(["clean", "-fd"], cwd=self._work_dir)
 
-        result = _run_git(
-            ["stash", "pop", ref],
-            cwd=self._work_dir,
-        )
+        if ref in ("baseline", self._baseline_sha, ""):
+            # Already at baseline after the hard reset — nothing more to do.
+            return
+
+        result = _run_git(["stash", "apply", ref], cwd=self._work_dir)
         if result.returncode != 0:
-            # Try apply as fallback (doesn't remove the stash entry)
-            _run_git(["stash", "apply", ref], cwd=self._work_dir)
+            raise GitError(
+                ["git", "stash", "apply", ref],
+                result.returncode,
+                result.stderr,
+            )
 
     def close(self) -> None:
         """Remove the worktree (or temp directory) and free resources."""
