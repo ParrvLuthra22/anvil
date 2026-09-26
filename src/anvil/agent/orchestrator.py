@@ -597,7 +597,10 @@ class Orchestrator:
     def _publish(self, patch: str) -> None:
         state, budget = self._state, self._budget
         has_patch = bool(changed_files(patch))
-        report = render_report(state, patch, steps=budget.steps, tokens=budget.tokens, seconds=budget.elapsed)
+        report = render_report(
+            state, patch, steps=budget.steps, tokens=budget.tokens, seconds=budget.elapsed,
+            phase_usage=budget.by_phase if self._settings.token_budgets else None,
+        )
         output_dir = Path(self._settings.output_dir)
         try:
             patch_path, report_path = write_outputs(output_dir, patch, report)
