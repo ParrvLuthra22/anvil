@@ -30,3 +30,12 @@ async def test_async_tests_run_without_a_marker():
     import asyncio
 
     await asyncio.sleep(0)
+
+
+def test_packaging_is_a_runtime_dependency_not_only_a_dev_one():
+    """anvil.repo.deps parses requires-python with it, in the installed harness, not just under pytest."""
+    runtime = _pyproject()["project"]["dependencies"]
+    assert any(dep.lower().startswith("packaging") for dep in runtime)
+    from packaging.specifiers import SpecifierSet
+
+    assert "3.11" in SpecifierSet(">=3.8,<3.12")
