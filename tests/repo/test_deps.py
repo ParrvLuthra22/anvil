@@ -74,17 +74,34 @@ def _make_sandbox(exec_side_effects: list) -> MagicMock:
     """
     sb = MagicMock()
     sb.root = Path("/fake/root")  # no pyproject.toml → no version check
-    sb.exec.side_effect = exec_side_effects
+    
+    it = iter(exec_side_effects)
+    def mock_exec(cmd, **kwargs):
+        if cmd.startswith("git show"):
+            return _exec_result(0, stdout="2025-01-01T00:00:00Z\n")
+        try:
+            return next(it)
+        except StopIteration:
+            return _exec_result(1)
+            
+    sb.exec.side_effect = mock_exec
     return sb
 
 
 def _py_probe_ok() -> list:
-    """Mock 3 exec calls: command -v found (exit 0) + version print (exit 0) + venv --help ok (exit 0).
+    """Mock 5 exec calls: command -v found (exit 0) + version print (exit 0) + rm -rf (exit 0) + venv create (exit 0) + verify (exit 0) + rm -rf (exit 0).
 
     This simulates _pick_python_interpreter succeeding on the first candidate
     (python3.13).
     """
-    return [_exec_result(0), _exec_result(0, stdout="3.13\n"), _exec_result(0)]
+    return [
+        _exec_result(0),  # command -v
+        _exec_result(0, stdout="3.13\n"),  # version
+        _exec_result(0),  # rm -rf probe_dir
+        _exec_result(0),  # venv create
+        _exec_result(0),  # verify python -c import
+        _exec_result(0),  # rm -rf probe_dir
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +141,7 @@ class TestEnsureDepsNoCmd:
         result = ensure_deps(sb, profile)
         assert result.ok
         assert result.skipped
-        sb.exec.assert_not_called()
+        sb.exec.assert_called_once_with("git show -s --format=%cI HEAD", timeout=10)
 
     def test_invalid_as_of_fails_without_running_installer(self):
         sb = MagicMock()
@@ -215,7 +232,10 @@ class TestPickPythonInterpreter:
             _exec_result(1),  # python3.9 not found
             _exec_result(0),  # python3 found
             _exec_result(0, stdout="3.9\n"),  # python3 version
-            _exec_result(0),  # python3 -m venv --help ok
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3 venv create ok
+            _exec_result(0),  # verify python -c import ok
+            _exec_result(0),  # rm -rf
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3"
@@ -231,10 +251,33 @@ class TestPickPythonInterpreter:
         sb = _make_sandbox([
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # python3.13 version
-            _exec_result(1),  # python3.13 -m venv --help fails
+            _exec_result(0),  # rm -rf
+            _exec_result(1),  # python3.13 -m venv create fails
             _exec_result(0),  # python3.12 found
             _exec_result(0, stdout="3.12\n"),  # python3.12 version
-            _exec_result(0),  # python3.12 -m venv --help ok
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3.12 venv create ok
+            _exec_result(0),  # verify import ok
+            _exec_result(0),  # rm -rf
+        ])
+        result = _pick_python_interpreter(sb)
+        assert result == "python3.12"
+
+    def test_skips_when_missing_modules(self):
+        """Skips interpreter that has broken ensurepip/pyexpat/ssl."""
+        sb = _make_sandbox([
+            _exec_result(0),  # python3.13 found
+            _exec_result(0, stdout="3.13\n"),  # version
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # venv create ok
+            _exec_result(1),  # verify import fails
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3.12 found
+            _exec_result(0, stdout="3.12\n"),  # version
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # venv create ok
+            _exec_result(0),  # verify import ok
+            _exec_result(0),  # rm -rf
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3.12"
@@ -258,8 +301,14 @@ class TestPickPythonInterpreter:
                                 ver = "3.8"  # fallback
                             return _exec_result(0, stdout=f"{ver}\n")
                     return _exec_result(0, stdout="3.9\n")
-                if "venv --help" in cmd:
+                if "venv" in cmd or "import ensurepip" in cmd or "rm -rf" in cmd:
                     return _exec_result(0)
+                if "git show" in cmd:
+                    return _exec_result(0, stdout="2025-01-01T00:00:00Z\n")
+                if "upgrade pip" in cmd:
+                    return _exec_result(0)
+                if "test -x" in cmd:
+                    return _exec_result(1) # simulate uv missing by default in general mock
                 return _exec_result(1)
             
             sb.exec.side_effect = mock_exec
@@ -283,7 +332,9 @@ class TestEnsureDepsPython:
             _py_probe_ok() + [
                 _exec_result(0),   # interp -m venv .anvil_venv
                 _exec_result(0),   # pip upgrade
+                _exec_result(1),   # test -x uv (fail, use pip) for project
                 _exec_result(0),   # pip install -e '.[dev]'
+                _exec_result(1),   # test -x uv for framework
                 _exec_result(0),   # pytest install
             ]
         )
@@ -300,10 +351,9 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),  # create venv
-                _exec_result(1),  # uv missing on PATH
-                _exec_result(0),  # install uv into venv
-                _exec_result(0, stdout="--exclude-newer"),  # check cutoff support
-                _exec_result(0),  # install pytest with cutoff
+                _exec_result(0),  # pip upgrade
+                _exec_result(0),  # test -x uv (uv present!)
+                _exec_result(0),  # install pytest with uv cutoff
             ]
         )
         result = ensure_deps(sb, profile, as_of="2024-12-01")
@@ -318,10 +368,10 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),  # create venv
-                _exec_result(1),  # uv missing on PATH
-                _exec_result(0),  # install uv with venv Python's pip
-                _exec_result(0, stdout="--exclude-newer"),  # check uv support
+                _exec_result(0),  # pip upgrade
+                _exec_result(0),  # test -x uv for project
                 _exec_result(0),  # install project and requirements
+                _exec_result(0),  # test -x uv for framework
                 _exec_result(0),  # install pytest
             ]
         )
@@ -332,7 +382,7 @@ class TestEnsureDepsPython:
         install_commands = [cmd for cmd in commands if "uv pip install" in cmd and "--exclude-newer" in cmd]
         assert len(install_commands) == 2
         assert all("--exclude-newer 2024-11-01T20:35:12Z" in cmd for cmd in install_commands)
-        assert all("--python .anvil_venv/bin/python" in cmd for cmd in install_commands)
+        assert all("VIRTUAL_ENV=.anvil_venv" in cmd for cmd in install_commands)
         assert all(not cmd.lstrip().startswith("pip install") for cmd in install_commands)
         assert "2024-11-01T20:35:12Z" in result.report
 
@@ -359,7 +409,8 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
-                _exec_result(0),
+                _exec_result(0),  # upgrade pip
+                _exec_result(1),  # test -x uv
                 _exec_result(1, stderr="No module named 'setuptools'"),
             ]
         )
@@ -372,8 +423,9 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
-                _exec_result(0),
-                _exec_result(-1, timed_out=True),
+                _exec_result(0),  # pip upgrade
+                _exec_result(1),  # test -x uv
+                _exec_result(-1, timed_out=True), # pip install
             ]
         )
         result = ensure_deps(sb, _python_profile())
@@ -408,6 +460,10 @@ class TestEnsureDepsPython:
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),
+                _exec_result(1), 
+                _exec_result(0),
+                _exec_result(0),
+                _exec_result(1), 
                 _exec_result(0),
                 _exec_result(0),
                 _exec_result(0),

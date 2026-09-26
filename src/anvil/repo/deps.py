@@ -77,6 +77,10 @@ def ensure_deps(
         A :class:`DepsResult`.
     """
     try:
+        if as_of is None and profile.primary_language == "python":
+            commit_date = get_commit_date(sandbox, "HEAD")
+            if commit_date:
+                as_of = commit_date
         cutoff = _normalize_as_of(as_of) if as_of is not None else None
     except ValueError as exc:
         return DepsResult(ok=False, report=str(exc))
@@ -201,10 +205,19 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
                 )
                 continue
 
-        # 3. Can it create a venv?
-        venv_probe = sandbox.exec(f"{interp} -m venv --help", timeout=10)
-        if venv_probe.exit_code != 0:
-            log.debug("Skipping %s — cannot create venv", interp)
+        # 3. Can it create a venv and does it have required modules?
+        probe_dir = f".probe_{interp.replace('.', '_')}"
+        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
+        venv_create = sandbox.exec(f"{interp} -m venv {probe_dir}", timeout=30)
+        if venv_create.exit_code != 0:
+            log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
+            continue
+            
+        verify = sandbox.exec(f"{probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'", timeout=10)
+        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
+        
+        if verify.exit_code != 0:
+            log.debug("Skipping %s — broken interpreter (missing ensurepip, pyexpat, or ssl): %s", interp, verify.stderr[:100])
             continue
 
         log.info("Selected Python interpreter: %s", interp)
@@ -276,106 +289,79 @@ def _ensure_python_deps(
             ),
         )
 
-    # Date-aware resolution uses uv's per-artifact upload cutoff. Bootstrap uv
-    # inside the target venv if it is unavailable on PATH; never use global pip.
-    uv = "uv"
-    if as_of is not None:
-        uv_probe = sandbox.exec("command -v uv", timeout=5)
-        if uv_probe.exit_code != 0:
-            bootstrap = sandbox.exec(f"{venv_python} -m pip install --quiet uv", timeout=120)
-            if bootstrap.exit_code != 0 or bootstrap.timed_out:
-                return DepsResult(
-                    ok=False,
-                    report=("Date-pinned install requires uv; could not install uv into the isolated "
-                            f"environment. stderr: {bootstrap.stderr[:400]}"),
-                    venv_python=venv_python,
-                )
-            uv = f"{venv_path}/bin/uv"
-        else:
-            uv = uv_probe.stdout.strip() or "uv"
-        uv_help = sandbox.exec(f"{shlex.quote(uv)} pip install --help", timeout=10)
-        if uv_help.exit_code != 0 or "--exclude-newer" not in uv_help.stdout:
-            return DepsResult(
-                ok=False,
-                report="Date-pinned install requires a uv version supporting --exclude-newer.",
-                venv_python=venv_python,
-            )
-    else:
-        # Upgrade only the isolated environment's pip.
-        sandbox.exec(f"{venv_pip} install --quiet --upgrade pip", timeout=60)
+    # Step 2: Upgrade pip and try to install uv
+    sandbox.exec(f"{venv_pip} install --quiet --upgrade pip uv", timeout=60)
 
-    # Step 3: Run the install command using the venv's pip
+    # Step 3: Run the install command using the venv's pip or uv
     install_cmd = profile.install_cmd
     if install_cmd is None:
         install_cmd = ""
-    elif as_of is None:
-        install_cmd = install_cmd.replace("pip install", f"{venv_pip} install")
-    elif as_of is not None:
-        if "pip install" not in install_cmd:
+        
+    strategies = []
+    if install_cmd and "pip install" in install_cmd:
+        uv_path = f"{venv_path}/bin/uv"
+        uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
+        
+        if uv_probe.exit_code == 0:
+            uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
+            if as_of:
+                uv_cmd += f" --exclude-newer {as_of}"
+            strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
+        
+        strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
+    elif install_cmd:
+        strategies.append(("generic", install_cmd))
+        
+    result = None
+    used_strategy = None
+    if strategies:
+        for strategy_name, cmd in strategies:
+            log.info("Running Python install strategy %s: %s", strategy_name, cmd)
+            result = sandbox.exec(cmd, timeout=_INSTALL_TIMEOUT)
+            
+            if result.exit_code == 0 and not result.timed_out:
+                used_strategy = strategy_name
+                break
+            else:
+                log.debug("Install strategy %s failed (exit %s).", strategy_name, result.exit_code)
+
+        if result is None or result.timed_out or result.exit_code != 0:
+            status = "Install timed out" if (result and result.timed_out) else "Install failed"
             return DepsResult(
                 ok=False,
-                report="Cannot apply the date cutoff: the Python install command has no 'pip install' step.",
+                report=(
+                    f"{status} after trying all strategies.\n"
+                    f"Command: {strategies[-1][1] if strategies else 'None'}\n"
+                    f"stdout: {result.stdout[:400] if result else ''}\n"
+                    f"stderr: {result.stderr[:400] if result else ''}"
+                ),
                 venv_python=venv_python,
             )
-        uv_prefix = (
-            f"{shlex.quote(uv)} pip install --python {shlex.quote(venv_python)} "
-            f"--exclude-newer {shlex.quote(as_of)}"
-        )
-        install_cmd = install_cmd.replace("pip install", uv_prefix)
-
-    if install_cmd:
-        log.info("Running Python install: %s", install_cmd)
-        result = sandbox.exec(install_cmd, timeout=_INSTALL_TIMEOUT)
-    else:
-        result = None
-
-    if result is not None and result.timed_out:
-        return DepsResult(
-            ok=False,
-            report=(
-                f"Install timed out after {_INSTALL_TIMEOUT}s. "
-                f"Command: {install_cmd}\n"
-                f"Partial stdout: {result.stdout[:400]}"
-            ),
-            venv_python=venv_python,
-        )
-
-    if result is not None and result.exit_code != 0:
-        return DepsResult(
-            ok=False,
-            report=(
-                f"Install failed (exit {result.exit_code}).\n"
-                f"Command: {install_cmd}\n"
-                f"stdout: {result.stdout[:400]}\n"
-                f"stderr: {result.stderr[:400]}"
-            ),
-            venv_python=venv_python,
-        )
 
     # Step 4: Guarantee the test framework is in the venv
     test_framework_pkg = _test_framework_package(profile)
     if test_framework_pkg:
-        if as_of is None:
-            sandbox.exec(f"{venv_pip} install --quiet {test_framework_pkg}", timeout=60)
-        else:
-            framework_cmd = (
-                f"{shlex.quote(uv)} pip install --python {shlex.quote(venv_python)} "
-                f"--exclude-newer {shlex.quote(as_of)} {shlex.quote(test_framework_pkg)}"
+        # Always use the best tool available for the framework
+        cmd_framework = f"{venv_pip} install --quiet {test_framework_pkg}"
+        if as_of:
+            uv_path = f"{venv_path}/bin/uv"
+            if sandbox.exec(f"test -x {uv_path}", timeout=5).exit_code == 0:
+                cmd_framework = f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet --exclude-newer {as_of} {test_framework_pkg}"
+            
+        framework_result = sandbox.exec(cmd_framework, timeout=60)
+        if framework_result.exit_code != 0 or framework_result.timed_out:
+            return DepsResult(
+                ok=False,
+                report=f"Test framework install failed: {framework_result.stderr[:400]}",
+                venv_python=venv_python,
             )
-            framework_result = sandbox.exec(framework_cmd, timeout=60)
-            if framework_result.exit_code != 0 or framework_result.timed_out:
-                return DepsResult(
-                    ok=False,
-                    report=f"Date-pinned test framework install failed: {framework_result.stderr[:400]}",
-                    venv_python=venv_python,
-                )
 
     return DepsResult(
         ok=True,
         report=(
-            f"Python deps installed into {venv_path}/ using {interp}."
+            f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy})."
             if as_of is None
-            else f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of}."
+            else f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of} (strategy: {used_strategy})."
         ),
         venv_python=venv_python,
     )
