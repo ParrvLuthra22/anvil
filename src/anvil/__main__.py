@@ -216,21 +216,33 @@ async def _emit_fake_stream(issue_url: str, bus, delay: float = 0.12) -> None:
 # ---------------------------------------------------------------------------
 
 def _wire_recorder(bus, trace_path: Path):
-    """Subscribe a TraceRecorder to *bus*; returns the recorder."""
+    """Subscribe *bus* and start a recorder task in the CURRENT running loop.
+
+    Must be called from within a coroutine or from code that already has a
+    running asyncio event loop (e.g. inside an ``on_start`` callback that the
+    Textual app fires, or inside ``asyncio.run()``).  The subscribe() call
+    happens here so the queue is registered before the orchestrator starts
+    emitting events — ensuring every event is captured and trace.jsonl grows
+    during the run, not only after it finishes.
+    """
     from anvil.trace.recorder import TraceRecorder
 
     recorder = TraceRecorder(trace_path)
+    # subscribe() must be called inside the running loop so that put_nowait()
+    # from any thread delivers to the correct queue.
     q = bus.subscribe()
 
-    async def _loop() -> None:
-        while True:
-            ev = await q.get()
-            recorder.record(ev)
-            if ev.type == "done":
-                recorder.close()
-                break
+    async def _drain() -> None:
+        try:
+            while True:
+                ev = await q.get()
+                recorder.record(ev)  # flushes immediately — trace grows live
+                if ev.type == "done":
+                    break
+        finally:
+            recorder.close()  # always close, even if we exit via cancellation
 
-    asyncio.get_event_loop().create_task(_loop())
+    asyncio.get_event_loop().create_task(_drain())
     return recorder
 
 
@@ -331,41 +343,44 @@ def _run_headless(args: argparse.Namespace, config: dict) -> None:
 
     bus = _make_event_bus()
     patch_path, report_path, trace_path = _output_paths()
-
-    from anvil.trace.recorder import TraceRecorder
-
-    recorder = TraceRecorder(trace_path)
-    q = bus.subscribe()
     print(f"ANVIL — headless run for: {display_url}")
 
-    async def _record_all() -> None:
-        while True:
-            ev = await q.get()
-            recorder.record(ev)
-            if ev.type == "done":
-                recorder.close()
-                data = ev.data or {}
-                conf = data.get("resolved_confidence", 0)
-                try:
-                    conf_str = f"{conf:.0%}"
-                except (TypeError, ValueError):
-                    conf_str = str(conf)
-                actual_patch = data.get("patch_path", str(patch_path))
-                actual_report = data.get("report_path", str(report_path))
-                print(
-                    f"\n✓ Done"
-                    f"  confidence={conf_str}"
-                    f"  steps={data.get('steps', '?')}"
-                    f"  tokens={data.get('tokens', '?')}"
-                    f"  time={data.get('seconds', '?')}s"
-                    f"\n  patch  → {actual_patch}"
-                    f"\n  report → {actual_report}"
-                    f"\n  trace  → {trace_path}"
-                )
-                break
+    async def _record_all(q: asyncio.Queue) -> None:
+        """Drain the bus queue, write each event immediately so trace grows live."""
+        from anvil.trace.recorder import TraceRecorder
+
+        recorder = TraceRecorder(trace_path)
+        try:
+            while True:
+                ev = await q.get()
+                recorder.record(ev)  # flush-on-write — trace.jsonl grows during run
+                if ev.type == "done":
+                    data = ev.data or {}
+                    conf = data.get("resolved_confidence", 0)
+                    try:
+                        conf_str = f"{conf:.0%}"
+                    except (TypeError, ValueError):
+                        conf_str = str(conf)
+                    actual_patch = data.get("patch_path", str(patch_path))
+                    actual_report = data.get("report_path", str(report_path))
+                    print(
+                        f"\n✓ Done"
+                        f"  confidence={conf_str}"
+                        f"  steps={data.get('steps', '?')}"
+                        f"  tokens={data.get('tokens', '?')}"
+                        f"  time={data.get('seconds', '?')}s"
+                        f"\n  patch  → {actual_patch}"
+                        f"\n  report → {actual_report}"
+                        f"\n  trace  → {trace_path}"
+                    )
+                    break
+        finally:
+            recorder.close()  # always close — guarantees trace even on timeout/cancel
 
     async def _main() -> None:
-        record_task = asyncio.create_task(_record_all())
+        # subscribe() inside asyncio.run() so the queue belongs to this loop
+        q = bus.subscribe()
+        record_task = asyncio.create_task(_record_all(q))
         try:
             from anvil.agent.orchestrator import run_harness
 

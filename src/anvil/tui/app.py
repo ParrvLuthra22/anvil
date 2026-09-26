@@ -87,18 +87,34 @@ _PHASE_CSS: dict[str, str] = {
 _MAX_LINE = 400
 
 # ---------------------------------------------------------------------------
-# Error severity
+# Error severity  (source: src/anvil/agent/NOTES.md)
 # ---------------------------------------------------------------------------
-# Benign/recovery kinds: show as a yellow notice in the log only.
-# All other kinds are treated as fatal: they also raise the red ErrorBanner.
+# Benign/recovery kinds: the run continues; show as a yellow notice in the log.
+# Fatal kinds (llm, budget, internal): also raise the sticky red ErrorBanner.
+#
+# Benign kinds emitted by the agent:
+#   loop         — same tool+args 3 times in a row, or A/B/A/B; phase advances
+#   edit         — edit_file failed; model gets closest lines hint
+#   invalid_call — unknown tool, wrong phase, bad JSON args, missing arg
+#   no_tool_call — plain reply in a tool-expecting phase; nudge or stall
+#   test_failure — run_tests failed (non-timeout); failure lines shown to model
+#   timeout      — any tool result reporting a timeout
+#   tool         — tool other than edit/run_tests/run_cmd returned ok=False
+#   deps         — dependency install warning; run continues
+#   sandbox      — checkpoint/rollback/diff/close problem; run continues
+#   context      — context summariser failed; run continues
+#   rollback     — sandbox rolled back to checkpoint; model retries
+#   config       — configuration problem; run continues
+#   io           — file I/O warning; run continues
+#   finalize     — problem during FINALIZE; outputs still written
+#   <phase name> — unexpected exception in a phase (e.g. "ingest", "patch")
 _BENIGN_ERROR_KINDS: frozenset[str] = frozenset({
-    "edit",        # failed str_replace — agent will retry
-    "loop",        # loop-detector triggered — agent advances phase
-    "rollback",    # sandbox rollback to checkpoint
-    "retry",       # generic transient retry
-    "truncate",    # output was truncated (tool_output_char_cap)
-    "context",     # context pruning / summarisation step
-    "timeout_retry",  # command timed out but will be retried
+    "loop", "edit", "invalid_call", "no_tool_call", "test_failure",
+    "timeout", "tool", "deps", "sandbox", "context", "rollback",
+    "config", "io", "finalize",
+    # Phase names used as kind when an unexpected exception occurs mid-phase:
+    "ingest", "profile", "understand", "localize", "reproduce",
+    "patch", "verify", "review",
 })
 
 
@@ -110,9 +126,12 @@ def _clip(text: str, limit: int = _MAX_LINE) -> str:
 
 
 def _is_fatal(kind: str) -> bool:
-    """Return True if *kind* should raise the red ErrorBanner."""
-    return kind.lower() not in _BENIGN_ERROR_KINDS
+    """Return True if *kind* should trigger the red ErrorBanner.
 
+    Fatal kinds: ``llm``, ``budget``, ``internal``.
+    Everything else is benign and shown only as a yellow notice.
+    """
+    return kind.lower() not in _BENIGN_ERROR_KINDS
 
 # ---------------------------------------------------------------------------
 # Phase stepper widget
