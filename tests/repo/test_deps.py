@@ -15,6 +15,7 @@ from anvil.repo.deps import (
     _PYTHON_CANDIDATES,
     _parse_requires_python,
     _pick_python_interpreter,
+    _normalize_as_of,
 )
 from anvil.repo.profile import RepoProfile
 from anvil.sandbox.base import ExecResult
@@ -78,15 +79,12 @@ def _make_sandbox(exec_side_effects: list) -> MagicMock:
 
 
 def _py_probe_ok() -> list:
-    """Mock 6 exec calls: command -v, version, rm, venv create, import check, rm."""
-    return [
-        _exec_result(0),                  # command -v
-        _exec_result(0, stdout="3.13\n"), # version print
-        _exec_result(0),                  # rm -rf .probe_venv
-        _exec_result(0),                  # venv create
-        _exec_result(0),                  # import check
-        _exec_result(0),                  # rm -rf .probe_venv (cleanup)
-    ]
+    """Mock 3 exec calls: command -v found (exit 0) + version print (exit 0) + venv --help ok (exit 0).
+
+    This simulates _pick_python_interpreter succeeding on the first candidate
+    (python3.13).
+    """
+    return [_exec_result(0), _exec_result(0, stdout="3.13\n"), _exec_result(0)]
 
 
 # ---------------------------------------------------------------------------
@@ -122,17 +120,41 @@ class TestEnsureDepsNoCmd:
             install_cmd=None, test_cmd="pytest", test_framework="pytest",
         )
         sb = MagicMock()
-        result = ensure_deps(sb, profile, as_of="2021")
+        result = ensure_deps(sb, profile)
         assert result.ok
         assert result.skipped
         sb.exec.assert_not_called()
+
+    def test_invalid_as_of_fails_without_running_installer(self):
+        sb = MagicMock()
+        result = ensure_deps(sb, _python_profile(), as_of="not a date")
+        assert not result.ok
+        assert "iso-8601" in result.report.lower()
+        sb.exec.assert_not_called()
+
+    def test_date_cutoff_requires_python_installer_support(self):
+        sb = _make_sandbox([_exec_result(0)])
+        result = ensure_deps(sb, _go_profile(), as_of="2021-05-13T20:35:12Z")
+        assert not result.ok
+        assert "only supported for python" in result.report.lower()
+
+
+class TestNormalizeAsOf:
+    def test_date_includes_the_entire_utc_day(self):
+        assert _normalize_as_of("2021-05-13") == "2021-05-13T23:59:59.999999Z"
+
+    def test_timestamp_converts_to_utc(self):
+        assert _normalize_as_of("2021-05-13T22:35:12+02:00") == "2021-05-13T20:35:12Z"
+
+    def test_timestamp_preserves_fractional_seconds(self):
+        assert _normalize_as_of("2021-05-13T20:35:12.123456Z") == "2021-05-13T20:35:12.123456Z"
 
     def test_ensure_deps_never_raises(self):
         """Bug 4: ensure_deps must never raise, even on internal errors."""
         sb = MagicMock()
         sb.exec.side_effect = RuntimeError("boom")
         sb.root = Path("/fake")
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert "internal error" in result.report.lower() or "boom" in result.report.lower()
 
@@ -190,13 +212,9 @@ class TestPickPythonInterpreter:
             _exec_result(1),  # python3.11 not found
             _exec_result(1),  # python3.10 not found
             _exec_result(1),  # python3.9 not found
-            _exec_result(0),                  # python3 found
+            _exec_result(0),  # python3 found
             _exec_result(0, stdout="3.9\n"),  # python3 version
-            _exec_result(0),                  # rm -rf .probe_venv
-            _exec_result(0),                  # python3 venv create ok
-            _exec_result(0),                  # import pyexpat ok
-            _exec_result(0),                  # rm -rf .probe_venv
-
+            _exec_result(0),  # python3 -m venv --help ok
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3"
@@ -210,17 +228,12 @@ class TestPickPythonInterpreter:
     def test_skips_when_venv_not_supported(self):
         """Skips interpreter that can't create a venv."""
         sb = _make_sandbox([
-            _exec_result(0),                  # python3.13 found
-            _exec_result(0, stdout="3.13\n"), # python3.13 version
-            _exec_result(0),                  # rm -rf .probe_venv
-            _exec_result(1),                  # python3.13 venv create fails
-            _exec_result(0),                  # python3.12 found
-            _exec_result(0, stdout="3.12\n"), # python3.12 version
-            _exec_result(0),                  # rm -rf .probe_venv
-            _exec_result(0),                  # python3.12 venv create ok
-            _exec_result(0),                  # python3.12 import ok
-            _exec_result(0),                  # rm -rf .probe_venv
-
+            _exec_result(0),  # python3.13 found
+            _exec_result(0, stdout="3.13\n"),  # python3.13 version
+            _exec_result(1),  # python3.13 -m venv --help fails
+            _exec_result(0),  # python3.12 found
+            _exec_result(0, stdout="3.12\n"),  # python3.12 version
+            _exec_result(0),  # python3.12 -m venv --help ok
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3.12"
@@ -244,11 +257,7 @@ class TestPickPythonInterpreter:
                                 ver = "3.8"  # fallback
                             return _exec_result(0, stdout=f"{ver}\n")
                     return _exec_result(0, stdout="3.9\n")
-                if "venv" in cmd and "probe" in cmd:
-                    return _exec_result(0)
-                if "import pyexpat" in cmd:
-                    return _exec_result(0)
-                if "rm -rf" in cmd:
+                if "venv --help" in cmd:
                     return _exec_result(0)
                 return _exec_result(1)
             
@@ -268,26 +277,68 @@ class TestPickPythonInterpreter:
 
 class TestEnsureDepsPython:
     def test_successful_python_install(self):
-        """Happy path: probe ok + venv + pip upgrade + pip install + framework + collection."""
+        """Happy path: probe ok + venv + pip upgrade + pip install + framework."""
         sb = _make_sandbox(
             _py_probe_ok() + [
                 _exec_result(0),   # interp -m venv .anvil_venv
                 _exec_result(0),   # pip upgrade
-                _exec_result(1),   # command -v uv (fail -> pip)
                 _exec_result(0),   # pip install -e '.[dev]'
                 _exec_result(0),   # pytest install
-                _exec_result(0),   # pytest --collect-only
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert result.ok
         assert result.venv_python is not None
         assert _VENV_DIR in result.venv_python
 
+    def test_as_of_creates_venv_and_installs_pinned_pytest_without_project_command(self):
+        profile = RepoProfile(
+            languages=["python"], primary_language="python", install_cmd=None,
+            test_cmd="pytest", test_framework="pytest",
+        )
+        sb = _make_sandbox(
+            _py_probe_ok() + [
+                _exec_result(0),  # create venv
+                _exec_result(1),  # uv missing on PATH
+                _exec_result(0),  # install uv into venv
+                _exec_result(0, stdout="--exclude-newer"),  # check cutoff support
+                _exec_result(0),  # install pytest with cutoff
+            ]
+        )
+        result = ensure_deps(sb, profile, as_of="2021-05-13")
+        assert result.ok, result.report
+        commands = [call.args[0] for call in sb.exec.call_args_list]
+        assert any("-m venv .anvil_venv" in cmd for cmd in commands)
+        assert not any("pip install -e" in cmd for cmd in commands)
+        assert any("--exclude-newer 2021-05-13T23:59:59.999999Z pytest" in cmd for cmd in commands)
+
+    def test_as_of_uses_uv_cutoff_for_project_and_test_framework(self):
+        """The requested cutoff reaches every install and stays inside the venv."""
+        sb = _make_sandbox(
+            _py_probe_ok() + [
+                _exec_result(0),  # create venv
+                _exec_result(1),  # uv missing on PATH
+                _exec_result(0),  # install uv with venv Python's pip
+                _exec_result(0, stdout="--exclude-newer"),  # check uv support
+                _exec_result(0),  # install project and requirements
+                _exec_result(0),  # install pytest
+            ]
+        )
+
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13T20:35:12Z")
+        assert result.ok, result.report
+        commands = [call.args[0] for call in sb.exec.call_args_list]
+        install_commands = [cmd for cmd in commands if "uv pip install" in cmd and "--exclude-newer" in cmd]
+        assert len(install_commands) == 2
+        assert all("--exclude-newer 2021-05-13T20:35:12Z" in cmd for cmd in install_commands)
+        assert all("--python .anvil_venv/bin/python" in cmd for cmd in install_commands)
+        assert all(not cmd.lstrip().startswith("pip install") for cmd in install_commands)
+        assert "2021-05-13T20:35:12Z" in result.report
+
     def test_no_interpreter_found_skips(self):
         """Task 3: all candidates fail → skipped with clear reason."""
-        sb = _make_sandbox([_exec_result(1)] * (len(_PYTHON_CANDIDATES)*6 + 1))
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        sb = _make_sandbox([_exec_result(1)] * len(_PYTHON_CANDIDATES))
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert result.skipped
         assert "python" in result.report.lower()
@@ -299,7 +350,7 @@ class TestEnsureDepsPython:
                 _exec_result(1, stderr="No space left"),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert "venv" in result.report.lower()
 
@@ -308,11 +359,10 @@ class TestEnsureDepsPython:
             _py_probe_ok() + [
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(1), # test -x uv (fail -> pip)
                 _exec_result(1, stderr="No module named 'setuptools'"),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
         assert "failed" in result.report.lower()
         assert result.venv_python is not None
@@ -322,13 +372,12 @@ class TestEnsureDepsPython:
             _py_probe_ok() + [
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(1), # test -x uv (fail -> pip)
                 _exec_result(-1, timed_out=True),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
-        assert "failed" in result.report.lower()
+        assert "timed out" in result.report.lower()
 
     def test_uses_venv_pip_not_bare_pip(self):
         """The install command must use the venv-scoped pip."""
@@ -336,14 +385,15 @@ class TestEnsureDepsPython:
             _py_probe_ok() + [
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(1), # test -x uv
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(0), # pytest --collect-only
             ]
         )
-        ensure_deps(sb, _python_profile("pip install -r requirements.txt"), as_of="2021")
-        assert any(".anvil_venv/bin/pip install" in str(c) for c in sb.exec.call_args_list)
+        ensure_deps(sb, _python_profile("pip install -r requirements.txt"))
+        # index 4 = venv(2) + pip_upgrade(3) + install(4)
+        install_call_cmd = sb.exec.call_args_list[4][0][0]
+        assert _VENV_DIR in install_call_cmd
+        assert "pip install" in install_call_cmd
 
     def test_venv_timeout_is_handled(self):
         """venv creation times out → ok=False."""
@@ -352,7 +402,7 @@ class TestEnsureDepsPython:
                 _exec_result(-1, timed_out=True),
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert not result.ok
 
     def test_report_mentions_interpreter(self):
@@ -361,13 +411,11 @@ class TestEnsureDepsPython:
             _py_probe_ok() + [
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(1), # uv probe fail
                 _exec_result(0),
                 _exec_result(0),
-                _exec_result(0), # pytest --collect-only
             ]
         )
-        result = ensure_deps(sb, _python_profile(), as_of="2021")
+        result = ensure_deps(sb, _python_profile())
         assert result.ok
         assert "python" in result.report.lower()
 
@@ -382,13 +430,13 @@ class TestEnsureDepsJS:
             _exec_result(0),   # command -v npm
             _exec_result(0, stdout="added 100 packages"),
         ])
-        result = ensure_deps(sb, _js_profile(), as_of="2021")
+        result = ensure_deps(sb, _js_profile())
         assert result.ok
         assert result.venv_python is None
 
     def test_js_npm_not_found_skips_cleanly(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _js_profile(), as_of="2021")
+        result = ensure_deps(sb, _js_profile())
         assert not result.ok
         assert result.skipped
         assert "npm" in result.report.lower()
@@ -398,7 +446,7 @@ class TestEnsureDepsJS:
             _exec_result(0),
             _exec_result(1, stderr="npm ERR!"),
         ])
-        result = ensure_deps(sb, _js_profile(), as_of="2021")
+        result = ensure_deps(sb, _js_profile())
         assert not result.ok
         assert "failed" in result.report.lower()
 
@@ -413,13 +461,13 @@ class TestEnsureDepsGo:
             _exec_result(0),
             _exec_result(0, stdout="downloading modules"),
         ])
-        result = ensure_deps(sb, _go_profile(), as_of="2021")
+        result = ensure_deps(sb, _go_profile())
         assert result.ok
         assert result.venv_python is None
 
     def test_go_toolchain_missing_skips(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _go_profile(), as_of="2021")
+        result = ensure_deps(sb, _go_profile())
         assert not result.ok
         assert result.skipped
         assert "go" in result.report.lower()
@@ -429,7 +477,7 @@ class TestEnsureDepsGo:
             _exec_result(0),
             _exec_result(1, stderr="network error"),
         ])
-        result = ensure_deps(sb, _go_profile(), as_of="2021")
+        result = ensure_deps(sb, _go_profile())
         assert not result.ok
         assert "failed" in result.report.lower()
 
@@ -438,7 +486,7 @@ class TestEnsureDepsGo:
             _exec_result(0),
             _exec_result(-1, timed_out=True),
         ])
-        result = ensure_deps(sb, _go_profile(), as_of="2021")
+        result = ensure_deps(sb, _go_profile())
         assert not result.ok
         assert "timed out" in result.report.lower()
 
@@ -447,7 +495,7 @@ class TestEnsureDepsGo:
         sb = MagicMock()
         sb.root = Path("/fake")
         sb.exec.return_value = _exec_result(0)
-        ensure_deps(sb, _go_profile(), as_of="2021")
+        ensure_deps(sb, _go_profile())
         for c in sb.exec.call_args_list:
             t = c.kwargs.get("timeout", c.args[1] if len(c.args) > 1 else _INSTALL_TIMEOUT)
             assert t <= _INSTALL_TIMEOUT
@@ -463,12 +511,12 @@ class TestEnsureDepsRust:
             _exec_result(0),
             _exec_result(0),
         ])
-        result = ensure_deps(sb, _rust_profile(), as_of="2021")
+        result = ensure_deps(sb, _rust_profile())
         assert result.ok
 
     def test_rust_cargo_missing_skips(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _rust_profile(), as_of="2021")
+        result = ensure_deps(sb, _rust_profile())
         assert not result.ok
         assert result.skipped
         assert "cargo" in result.report.lower()
@@ -484,12 +532,12 @@ class TestEnsureDepsJava:
             _exec_result(0),
             _exec_result(0),
         ])
-        result = ensure_deps(sb, _java_profile(), as_of="2021")
+        result = ensure_deps(sb, _java_profile())
         assert result.ok
 
     def test_java_mvn_missing_skips(self):
         sb = _make_sandbox([_exec_result(1)])
-        result = ensure_deps(sb, _java_profile(), as_of="2021")
+        result = ensure_deps(sb, _java_profile())
         assert not result.ok
         assert result.skipped
         assert "mvn" in result.report.lower()
@@ -500,6 +548,6 @@ class TestEnsureDepsJava:
             _exec_result(0),
             _exec_result(0),
         ])
-        ensure_deps(sb, _java_profile(), as_of="2021")
+        ensure_deps(sb, _java_profile())
         install_cmd = sb.exec.call_args_list[1][0][0]
         assert "dependency:resolve" in install_cmd

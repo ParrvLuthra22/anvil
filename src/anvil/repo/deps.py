@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 from anvil.repo.profile import RepoProfile
@@ -46,15 +48,20 @@ class DepsResult:
 
 
 def get_commit_date(sandbox: Sandbox, ref: str = "HEAD") -> str:
-    """Return the commit date of `ref` as an ISO 8601 datetime string."""
-    result = sandbox.exec(f"git show -s --format=%cI {ref}")
-    if result.exit_code != 0:
+    """Return the committer timestamp for *ref*, or an empty string on failure."""
+    result = sandbox.exec(f"git show -s --format=%cI {shlex.quote(ref)}", timeout=10)
+    if result.exit_code != 0 or result.timed_out:
         log.warning("Could not get commit date for %r: %s", ref, result.stderr)
         return ""
     return result.stdout.strip()
 
 
-def ensure_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
+def ensure_deps(
+    sandbox: Sandbox,
+    profile: RepoProfile,
+    *,
+    as_of: str | date | datetime | None = None,
+) -> DepsResult:
     """Install dependencies required to build and test the repo.
 
     Never raises — all errors are captured in :attr:`DepsResult.report`.
@@ -62,28 +69,40 @@ def ensure_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None
     Args:
         sandbox: An open :class:`~anvil.sandbox.base.Sandbox` instance.
         profile: The :class:`~anvil.repo.profile.RepoProfile` for the repo.
-        as_of: Optional ISO 8601 datetime for dependency pinning. If None, derived from HEAD.
+        as_of: Optional PyPI upload-time cutoff. A date includes the full UTC
+            calendar day; a timestamp is an exact cutoff. If omitted for a
+            Python repo with an install command, the checked-out commit date is used.
 
     Returns:
         A :class:`DepsResult`.
     """
-    if as_of is None:
-        as_of = get_commit_date(sandbox, "HEAD")
-        
     try:
-        return _ensure_deps_inner(sandbox, profile, as_of=as_of)
+        cutoff = _normalize_as_of(as_of) if as_of is not None else None
+    except ValueError as exc:
+        return DepsResult(ok=False, report=str(exc))
+    try:
+        return _ensure_deps_inner(sandbox, profile, cutoff)
     except Exception as exc:  # noqa: BLE001
         return DepsResult(ok=False, report=f"ensure_deps internal error: {exc}")
 
 
 def _ensure_deps_inner(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
     if not profile.install_cmd:
+        if profile.primary_language == "python" and as_of is not None:
+            # Scoring still needs a fresh interpreter and date-pinned test runner
+            # even when the repository has no package install command.
+            return _ensure_python_deps(sandbox, profile, as_of=as_of)
         return DepsResult(ok=True, report="No install command detected — skipping.", skipped=True)
 
     lang = profile.primary_language
 
     if lang == "python":
         return _ensure_python_deps(sandbox, profile, as_of=as_of)
+    if as_of is not None:
+        return DepsResult(
+            ok=False,
+            report=f"Date-pinned dependency installation is only supported for Python, not {lang}.",
+        )
     if lang in ("javascript", "typescript"):
         return _ensure_js_deps(sandbox, profile)
     if lang == "go":
@@ -174,23 +193,10 @@ def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
                 )
                 continue
 
-        # 3. Can it ACTUALLY create a venv and import basic modules?
-        # On some macOS Homebrew installations, python3.13 and 3.12 have broken pyexpat/ssl.
-        # We verify by creating a probe venv and running imports.
-        probe_venv = ".probe_venv"
-        sandbox.exec(f"rm -rf {probe_venv}")
-        venv_create = sandbox.exec(f"{interp} -m venv {probe_venv}", timeout=10)
-        if venv_create.exit_code != 0:
-            log.debug("Skipping %s — failed to create venv: %s", interp, venv_create.stderr[:100])
-            continue
-            
-        import_check = sandbox.exec(
-            f"{probe_venv}/bin/python -c 'import pyexpat, ssl'", timeout=10
-        )
-        sandbox.exec(f"rm -rf {probe_venv}")
-        
-        if import_check.exit_code != 0:
-            log.debug("Skipping %s — venv created but failed to import pyexpat/ssl: %s", interp, import_check.stderr[:100])
+        # 3. Can it create a venv?
+        venv_probe = sandbox.exec(f"{interp} -m venv --help", timeout=10)
+        if venv_probe.exit_code != 0:
+            log.debug("Skipping %s — cannot create venv", interp)
             continue
 
         log.info("Selected Python interpreter: %s", interp)
@@ -199,7 +205,37 @@ def _pick_python_interpreter(sandbox: Sandbox) -> str | None:
     return None
 
 
-def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | None = None) -> DepsResult:
+def _normalize_as_of(value: str | date | datetime) -> str:
+    """Normalize an inclusive date or exact timestamp to an RFC 3339 UTC cutoff."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, time.max)
+    elif isinstance(value, str):
+        raw = value.strip()
+        try:
+            if len(raw) == 10:
+                parsed = datetime.combine(date.fromisoformat(raw), time.max)
+            else:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"as_of must be an ISO-8601 date or timestamp: {value!r}") from None
+    else:
+        raise ValueError("as_of must be an ISO-8601 date or timestamp")
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    # Preserve timestamp precision; truncating fractional seconds could make
+    # dependencies uploaded just before the requested cutoff unavailable.
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_python_deps(
+    sandbox: Sandbox,
+    profile: RepoProfile,
+    *,
+    as_of: str | None = None,
+) -> DepsResult:
     """Create an isolated venv using the best available interpreter and install deps."""
     venv_path = _VENV_DIR
     venv_python = f"{venv_path}/bin/python"
@@ -232,54 +268,78 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | Non
             ),
         )
 
-    # Step 2: Upgrade pip and install uv silently
-    sandbox.exec(f"{venv_pip} install --quiet --upgrade pip uv", timeout=60)
-
-    # Step 3: Run the install command using the venv's pip or uv
-    install_cmd = profile.install_cmd
-    assert install_cmd is not None
-    
-    # Task 1: Try uv with --exclude-newer if available, else plain pip, then test collection fallback
-    uv_path = f"{venv_path}/bin/uv"
-    uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
-    
-    strategies = []
-    if uv_probe.exit_code == 0:
-        uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
-        if as_of:
-            uv_cmd += f" --exclude-newer {as_of}"
-        strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
-    else:
-        # Check if pyproject.toml mentions uv
-        pyproject = sandbox.root / "pyproject.toml"
-        if pyproject.exists():
-            text = pyproject.read_text(encoding="utf-8", errors="replace")
-            # simple check for 'uv' in pyproject.toml
-            if re.search(r'\buv\b', text):
-                log.warning("uv is missing but pyproject.toml appears to require it.")
-    
-    strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
-
-    result = None
-    used_strategy = None
-    for strategy_name, cmd in strategies:
-        log.info("Running Python install strategy %s: %s", strategy_name, cmd)
-        result = sandbox.exec(cmd, timeout=_INSTALL_TIMEOUT)
-        
-        if result.exit_code == 0 and not result.timed_out:
-            used_strategy = strategy_name
-            break
+    # Date-aware resolution uses uv's per-artifact upload cutoff. Bootstrap uv
+    # inside the target venv if it is unavailable on PATH; never use global pip.
+    uv = "uv"
+    if as_of is not None:
+        uv_probe = sandbox.exec("command -v uv", timeout=5)
+        if uv_probe.exit_code != 0:
+            bootstrap = sandbox.exec(f"{venv_python} -m pip install --quiet uv", timeout=120)
+            if bootstrap.exit_code != 0 or bootstrap.timed_out:
+                return DepsResult(
+                    ok=False,
+                    report=("Date-pinned install requires uv; could not install uv into the isolated "
+                            f"environment. stderr: {bootstrap.stderr[:400]}"),
+                    venv_python=venv_python,
+                )
+            uv = f"{venv_path}/bin/uv"
         else:
-            log.debug("Install strategy %s failed (exit %s).", strategy_name, result.exit_code)
+            uv = uv_probe.stdout.strip() or "uv"
+        uv_help = sandbox.exec(f"{shlex.quote(uv)} pip install --help", timeout=10)
+        if uv_help.exit_code != 0 or "--exclude-newer" not in uv_help.stdout:
+            return DepsResult(
+                ok=False,
+                report="Date-pinned install requires a uv version supporting --exclude-newer.",
+                venv_python=venv_python,
+            )
+    else:
+        # Upgrade only the isolated environment's pip.
+        sandbox.exec(f"{venv_pip} install --quiet --upgrade pip", timeout=60)
 
-    if result is None or result.timed_out or result.exit_code != 0:
+    # Step 3: Run the install command using the venv's pip
+    install_cmd = profile.install_cmd
+    if install_cmd is None:
+        install_cmd = ""
+    elif as_of is None:
+        install_cmd = install_cmd.replace("pip install", f"{venv_pip} install")
+    elif as_of is not None:
+        if "pip install" not in install_cmd:
+            return DepsResult(
+                ok=False,
+                report="Cannot apply the date cutoff: the Python install command has no 'pip install' step.",
+                venv_python=venv_python,
+            )
+        uv_prefix = (
+            f"{shlex.quote(uv)} pip install --python {shlex.quote(venv_python)} "
+            f"--exclude-newer {shlex.quote(as_of)}"
+        )
+        install_cmd = install_cmd.replace("pip install", uv_prefix)
+
+    if install_cmd:
+        log.info("Running Python install: %s", install_cmd)
+        result = sandbox.exec(install_cmd, timeout=_INSTALL_TIMEOUT)
+    else:
+        result = None
+
+    if result is not None and result.timed_out:
         return DepsResult(
             ok=False,
             report=(
-                f"Install failed after trying all strategies.\n"
-                f"Command: {cmd if result else 'None'}\n"
-                f"stdout: {result.stdout[:400] if result else ''}\n"
-                f"stderr: {result.stderr[:400] if result else ''}"
+                f"Install timed out after {_INSTALL_TIMEOUT}s. "
+                f"Command: {install_cmd}\n"
+                f"Partial stdout: {result.stdout[:400]}"
+            ),
+            venv_python=venv_python,
+        )
+
+    if result is not None and result.exit_code != 0:
+        return DepsResult(
+            ok=False,
+            report=(
+                f"Install failed (exit {result.exit_code}).\n"
+                f"Command: {install_cmd}\n"
+                f"stdout: {result.stdout[:400]}\n"
+                f"stderr: {result.stderr[:400]}"
             ),
             venv_python=venv_python,
         )
@@ -287,25 +347,28 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | Non
     # Step 4: Guarantee the test framework is in the venv
     test_framework_pkg = _test_framework_package(profile)
     if test_framework_pkg:
-        sandbox.exec(
-            f"{venv_pip} install --quiet {test_framework_pkg}",
-            timeout=60,
-        )
-        
-        if test_framework_pkg == "pytest":
-            collect = sandbox.exec(f"{venv_python} -m pytest --collect-only", timeout=60)
-            if collect.exit_code != 0:
-                log.info("pytest collection failed, falling back to older pytest constraint")
-                # fallback to pytest<7 (known good era for many old python repos)
-                sandbox.exec(
-                    f"{venv_pip} install --quiet \"pytest<7\"",
-                    timeout=60,
+        if as_of is None:
+            sandbox.exec(f"{venv_pip} install --quiet {test_framework_pkg}", timeout=60)
+        else:
+            framework_cmd = (
+                f"{shlex.quote(uv)} pip install --python {shlex.quote(venv_python)} "
+                f"--exclude-newer {shlex.quote(as_of)} {shlex.quote(test_framework_pkg)}"
+            )
+            framework_result = sandbox.exec(framework_cmd, timeout=60)
+            if framework_result.exit_code != 0 or framework_result.timed_out:
+                return DepsResult(
+                    ok=False,
+                    report=f"Date-pinned test framework install failed: {framework_result.stderr[:400]}",
+                    venv_python=venv_python,
                 )
-                used_strategy = f"{used_strategy}_with_pytest_fallback"
 
     return DepsResult(
         ok=True,
-        report=f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy}).",
+        report=(
+            f"Python deps installed into {venv_path}/ using {interp}."
+            if as_of is None
+            else f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of}."
+        ),
         venv_python=venv_python,
     )
 
