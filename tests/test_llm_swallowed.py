@@ -139,11 +139,12 @@ def test_the_text_mode_repeat_failing_raises_the_llm_error_but_keeps_the_wasted_
     assert client.totals.total_tokens == 447 and client.totals.calls == 1
 
 
-def test_a_repeat_that_is_empty_too_is_returned_empty_not_repeated_again():
-    server = Server(swallowed(), swallowed(), ok(CALL_BLOCK))
+def test_a_repeat_that_is_empty_too_gets_the_text_mode_retries_and_then_is_returned_empty():
+    server = Server(swallowed())
     client, _ = build(server)
     response = client.chat(USER, TOOLS)
-    assert len(server.requests) == 2 and response.tool_calls == [] and response.text == ""
+    assert len(server.requests) == 4, "the native attempt, the text-mode repeat, and its two retries"
+    assert response.tool_calls == [] and response.text == ""
 
 
 def test_the_key_is_never_in_what_is_logged_about_a_swallowed_reply(caplog):
@@ -154,3 +155,104 @@ def test_the_key_is_never_in_what_is_logged_about_a_swallowed_reply(caplog):
     with caplog.at_level("DEBUG", logger="anvil.llm"):
         client.chat(USER, TOOLS)
     assert "text mode" in caplog.text and KEY not in caplog.text
+
+
+# ---- text mode: the same provider swallows replies that carry no tools at all ----------------------------
+# In a real run about a third of Qwen3-Coder's text-mode replies were content:null with 24-190 tokens billed
+# (the model wrote its native <tool_call> XML and the provider's parser removed it). The agent loop would nudge once
+# and end the phase, so the client retries first, twice at most, and the agent never sees the glitch.
+
+TEXT = {"tool_mode": "text"}
+
+
+def test_an_empty_text_mode_reply_is_retried_with_a_reminder_and_the_retry_is_returned():
+    server = Server(swallowed(), ok(CALL_BLOCK))
+    client, _ = build(server, **TEXT)
+
+    response = client.chat(USER, TOOLS)
+
+    assert response.tool_calls[0]["tool"] == "read_file"
+    assert len(server.requests) == 2
+    first, second = server.body(0), server.body(1)
+    assert first["messages"][-1]["content"] == "hello"
+    assert "empty" in second["messages"][-1]["content"].lower() and "hello" in second["messages"][-1]["content"]
+    assert "json" in second["messages"][-1]["content"].lower(), "the reminder names the format to reply in"
+    assert second["temperature"] > first["temperature"] == 0, "a greedy repeat would be swallowed the same way"
+
+
+def test_the_reminder_is_for_that_call_only():
+    server = Server(swallowed(), ok(CALL_BLOCK), ok(CALL_BLOCK))
+    client, _ = build(server, **TEXT)
+    client.chat(USER, TOOLS)
+    client.chat(USER, TOOLS)
+    assert "empty" not in server.body(2)["messages"][-1]["content"].lower()
+    assert server.body(2)["temperature"] == 0
+
+
+def test_the_wasted_attempts_tokens_are_summed_into_the_response_and_the_totals():
+    empty = {"prompt_tokens": 300, "completion_tokens": 40, "total_tokens": 340}
+    good = {"prompt_tokens": 320, "completion_tokens": 25, "total_tokens": 345}
+    server = Server(swallowed(usage=empty), swallowed(usage=empty), ok(CALL_BLOCK, usage=good))
+    client, _ = build(server, **TEXT)
+    response = client.chat(USER, TOOLS)
+    assert len(server.requests) == 3
+    assert (response.usage["prompt_tokens"], response.usage["completion_tokens"], response.usage["total_tokens"]) == (920, 105, 1025)
+    assert (client.totals.calls, client.totals.total_tokens) == (3, 1025)
+
+
+def test_at_most_two_retries_then_the_empty_reply_is_returned_for_the_agent_to_deal_with():
+    server = Server(swallowed())
+    client, _ = build(server, **TEXT)
+    response = client.chat(USER, TOOLS)
+    assert len(server.requests) == 3 and response.text == "" and response.tool_calls == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        swallowed(finish="length"),
+        swallowed(usage={"prompt_tokens": 300, "completion_tokens": 0, "total_tokens": 300}),
+        reply({"role": "assistant", "content": "", "reasoning_content": "thinking"}),
+    ],
+    ids=["cut off", "no tokens spent", "only reasoning"],
+)
+def test_an_empty_text_reply_that_is_explained_otherwise_is_not_retried(response):
+    server = Server(response, ok(CALL_BLOCK))
+    client, _ = build(server, **TEXT)
+    assert client.chat(USER, TOOLS).tool_calls == [] and len(server.requests) == 1
+
+
+def test_without_tools_an_empty_text_reply_is_retried_asking_for_a_plain_answer():
+    server = Server(swallowed(), ok("the answer"))
+    client, _ = build(server, **TEXT)
+    response = client.chat(USER)
+    assert response.text == "the answer" and len(server.requests) == 2
+    reminder = server.body(1)["messages"][-1]["content"].lower()
+    assert "empty" in reminder and "json" not in reminder
+
+
+def test_a_reply_with_prose_but_no_call_is_an_answer_not_an_empty_reply():
+    server = Server(ok("I will look at it."), ok(CALL_BLOCK))
+    client, _ = build(server, **TEXT)
+    assert client.chat(USER, TOOLS).text == "I will look at it." and len(server.requests) == 1
+
+
+def test_no_temperature_is_sent_on_the_retry_when_the_endpoint_refused_one_earlier():
+    server = Server(
+        httpx.Response(400, json={"error": {"message": "Unsupported parameter: 'temperature'"}}),
+        swallowed(),
+        ok(CALL_BLOCK),
+    )
+    client, _ = build(server, **TEXT)
+    response = client.chat(USER, TOOLS)
+    assert response.tool_calls and len(server.requests) == 3  # rejected; re-sent without it and came back empty; retried
+    assert "temperature" in server.body(0), "the request the endpoint rejected"
+    assert all("temperature" not in server.body(i) for i in (1, 2)), "including the warmer retry"
+
+
+def test_a_native_swallow_repeated_in_text_mode_gets_the_text_mode_retries_too():
+    server = Server(swallowed(), swallowed(), ok(CALL_BLOCK))
+    client, _ = build(server)  # auto
+    response = client.chat(USER, TOOLS)
+    assert response.tool_calls and len(server.requests) == 3
+    assert "tools" in server.body(0) and "tools" not in server.body(1) and "tools" not in server.body(2)

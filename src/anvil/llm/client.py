@@ -46,6 +46,13 @@ _REDACTED = "[REDACTED]"
 _POSSIBLE_TOOL_REJECTIONS = (400, 404, 422)
 _MISSES_BEFORE_TEXT_MODE = 2
 _SWALLOWED_BEFORE_TEXT_MODE = 2
+_EMPTY_TEXT_RETRIES = 2
+_RETRY_TEMPERATURE = 0.5  # a greedy repeat of a request whose reply was swallowed is swallowed the same way
+_REMINDER_WITH_TOOLS = (
+    "(Your previous reply was empty. Reply now with exactly one tool call: a single fenced ```json block "
+    'containing {"tool": "<tool name>", "args": {...}}, and nothing after it.)'
+)
+_REMINDER_PLAIN = "(Your previous reply was empty. Please answer in plain text.)"
 # Parameters worth retrying without when a 400 names one of them (``tools`` is handled by the tool-mode fallback).
 _DROPPABLE_PARAMS = (
     "tool_choice", "parallel_tool_calls", "temperature", "top_p", "response_format", "max_tokens", "max_completion_tokens",
@@ -212,7 +219,33 @@ class OpenAICompatClient(LLMClient):
         return response
 
     def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
+        """One text-mode request; if the reply was billed but came back empty, ask again (twice at most).
+
+        Some providers strip what they take for a tool call out of the reply even when no tools were sent, leaving
+        ``content: null``. The agent would answer that with a nudge and, on a second one, end the phase; here the
+        request is repeated first, with a reminder added for that call only and a warmer temperature. What the
+        empty attempts cost is added to the response's usage.
+        """
+        response, empty = self._text_attempt(messages, tools)
+        retries = 0
+        while empty and retries < _EMPTY_TEXT_RETRIES:
+            retries += 1
+            logger.warning("empty reply in text mode (%d tokens billed); asking again (%d of %d)",
+                           response.usage["completion_tokens"], retries, _EMPTY_TEXT_RETRIES)
+            wasted = response.usage
+            response, empty = self._text_attempt(messages, tools, reminder=True)
+            response.usage = _sum_usage(wasted, response.usage)
+        return response
+
+    def _text_attempt(
+        self, messages: list[dict], tools: list[dict] | None, *, reminder: bool = False
+    ) -> tuple[LLMResponse, bool]:
+        """One text-mode request and whether its reply was swallowed (empty, yet billed)."""
+        if reminder:
+            messages = messages + [{"role": "user", "content": _REMINDER_WITH_TOOLS if tools else _REMINDER_PLAIN}]
         payload = self._payload(normalize_messages(adapt_messages_for_text_mode(messages, tools)))
+        if reminder and "temperature" in payload:
+            payload["temperature"] = max(float(payload["temperature"] or 0), _RETRY_TEMPERATURE)
         data = self._request(payload)
         message = data["choices"][0]["message"]
         reply = split_message(message, strip=self._config.strip_reasoning)
@@ -220,7 +253,8 @@ class OpenAICompatClient(LLMClient):
         calls: list[dict] = []
         if tools:
             text, calls = self._first_text_call(text, tools)
-        return self._finish(text, calls, payload, data, reply)
+        empty = not calls and not text.strip() and _swallowed(data, reply)
+        return self._finish(text, calls, payload, data, reply), empty
 
     def _first_text_call(self, text: str, tools: list[dict]) -> tuple[str, list[dict]]:
         """The first tool call written in ``text`` (the text-mode protocol is one call per reply) and the prose around it.
