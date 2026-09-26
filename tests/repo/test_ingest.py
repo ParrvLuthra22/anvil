@@ -541,7 +541,7 @@ class TestBug5IngestHardening:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             clone_repo(ref, dest)
             call_args = mock_run.call_args[0][0]
-            assert call_args[:4] == ["git", "clone", "--depth", "1"]
+            assert call_args[:5] == ["git", "clone", "--filter=blob:none", "--depth", "1"]
             assert "--branch" not in call_args
 
     def test_issue_ref_has_fetch_error_field(self):

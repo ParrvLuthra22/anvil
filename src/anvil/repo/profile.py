@@ -248,9 +248,9 @@ def profile_repo(root: Path) -> RepoProfile:
 # ---------------------------------------------------------------------------
 
 _SKIP_DIRS = {
-    ".git", "node_modules", "vendor", "venv", ".venv", "dist", "build",
+    ".git", "node_modules", "vendor", "vendored", "venv", ".venv", "dist", "build",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".tox", "target",
-    ".gradle", ".idea", ".vscode",
+    ".gradle", ".idea", ".vscode", "generated", "minified", "min", "out",
 }
 
 # Priority source directories — shown first in the map
@@ -290,16 +290,24 @@ def _walk_tree(
     lines: list[str],
     indent: int,
     char_budget: list[int],
-) -> None:
-    """Recursively walk *current* and append formatted lines to *lines*."""
+    file_budget: list[int],
+    deadline: float,
+) -> bool:
+    """Recursively walk *current* and append formatted lines to *lines*. Returns True if timeout hit."""
+    if time.monotonic() > deadline:
+        return True
+
     try:
         entries = sorted(current.iterdir(), key=lambda p: (p.is_file(), p.name))
     except PermissionError:
-        return
+        return False
 
+    timeout_hit = False
     for entry in entries:
-        if char_budget[0] <= 0:
-            return
+        if char_budget[0] <= 0 or file_budget[0] <= 0:
+            return timeout_hit
+        if time.monotonic() > deadline:
+            return True
 
         if entry.is_dir():
             if entry.name in _SKIP_DIRS:
@@ -307,7 +315,10 @@ def _walk_tree(
             line = "  " * indent + f"{entry.name}/"
             lines.append(line)
             char_budget[0] -= len(line) + 1
-            _walk_tree(root, entry, lines, indent + 1, char_budget)
+            file_budget[0] -= 1
+            timeout_hit = timeout_hit or _walk_tree(root, entry, lines, indent + 1, char_budget, file_budget, deadline)
+            if timeout_hit:
+                return True
 
         elif entry.is_file():
             symbols = _extract_symbols(entry)
@@ -315,9 +326,14 @@ def _walk_tree(
             line = "  " * indent + entry.name + sym_str
             lines.append(line)
             char_budget[0] -= len(line) + 1
+            file_budget[0] -= 1
+
+    return timeout_hit
 
 
-def repo_map(root: Path, max_chars: int = 6000, label: str | None = None) -> str:
+import time
+
+def repo_map(root: Path, max_chars: int = 6000, label: str | None = None, max_files: int = 2000, max_time_sec: float = 3.0) -> str:
     """Return a compact file tree with top-level symbols, truncated to *max_chars*.
 
     Priority directories (src/, lib/, pkg/, cmd/, ...) are rendered first so the
@@ -337,6 +353,10 @@ def repo_map(root: Path, max_chars: int = 6000, label: str | None = None) -> str
     header = f"# repo: {header_label}"
     lines: list[str] = [header, ""]
     char_budget = [max_chars - len(header) - 2]
+    
+    file_budget = [max_files]
+    deadline = time.monotonic() + max_time_sec
+    timeout_hit = False
 
     try:
         top_entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name))
@@ -346,16 +366,19 @@ def repo_map(root: Path, max_chars: int = 6000, label: str | None = None) -> str
     # Priority dirs first
     for entry in top_entries:
         if entry.is_dir() and entry.name in _PRIORITY_DIRS and entry.name not in _SKIP_DIRS:
-            if char_budget[0] <= 0:
+            if char_budget[0] <= 0 or file_budget[0] <= 0 or time.monotonic() > deadline:
+                if time.monotonic() > deadline: timeout_hit = True
                 break
             line = f"{entry.name}/"
             lines.append(line)
             char_budget[0] -= len(line) + 1
-            _walk_tree(root, entry, lines, 1, char_budget)
+            file_budget[0] -= 1
+            timeout_hit = timeout_hit or _walk_tree(root, entry, lines, 1, char_budget, file_budget, deadline)
 
     # Then everything else
     for entry in top_entries:
-        if char_budget[0] <= 0:
+        if char_budget[0] <= 0 or file_budget[0] <= 0 or time.monotonic() > deadline:
+            if time.monotonic() > deadline: timeout_hit = True
             break
         name = entry.name
         if entry.is_dir():
@@ -364,15 +387,17 @@ def repo_map(root: Path, max_chars: int = 6000, label: str | None = None) -> str
             line = f"{name}/"
             lines.append(line)
             char_budget[0] -= len(line) + 1
-            _walk_tree(root, entry, lines, 1, char_budget)
+            file_budget[0] -= 1
+            timeout_hit = timeout_hit or _walk_tree(root, entry, lines, 1, char_budget, file_budget, deadline)
         else:
             symbols = _extract_symbols(entry)
             sym_str = f"  [{', '.join(symbols)}]" if symbols else ""
             line = name + sym_str
             lines.append(line)
             char_budget[0] -= len(line) + 1
+            file_budget[0] -= 1
 
     result = "\n".join(lines)
-    if len(result) > max_chars:
+    if timeout_hit or file_budget[0] <= 0 or len(result) > max_chars:
         result = result[:max_chars - 20] + "\n... [truncated]"
     return result
