@@ -45,6 +45,7 @@ _REDACTED = "[REDACTED]"
 # Statuses that, in auto mode, may mean "this provider does not accept the tools parameter".
 _POSSIBLE_TOOL_REJECTIONS = (400, 404, 422)
 _MISSES_BEFORE_TEXT_MODE = 2
+_SWALLOWED_BEFORE_TEXT_MODE = 2
 # Parameters worth retrying without when a 400 names one of them (``tools`` is handled by the tool-mode fallback).
 _DROPPABLE_PARAMS = (
     "tool_choice", "parallel_tool_calls", "temperature", "top_p", "response_format", "max_tokens", "max_completion_tokens",
@@ -126,6 +127,7 @@ class OpenAICompatClient(LLMClient):
         self._call_ids = itertools.count(1)
         self._use_text = config.tool_mode == "text"
         self._native_misses = 0
+        self._swallowed_replies = 0
         self.totals = UsageTotals()
         self.reasoning_seen = False  # any reply so far carried <think> tags or a reasoning field
         self.workarounds: list[str] = []  # 400s the client got around; kept for the run (see ``_compat_fix``)
@@ -180,7 +182,34 @@ class OpenAICompatClient(LLMClient):
         calls = self._native_calls(message)
         if tools and self._config.tool_mode == "auto":
             text, calls = self._rescue_native_miss(text, calls, tools)
+            if not calls and not text.strip() and _swallowed(data, reply):
+                return self._repeat_in_text_mode(messages, tools, payload, data, reply)
         return self._finish(text, calls, payload, data, reply)
+
+    def _repeat_in_text_mode(
+        self, messages: list[dict], tools: list[dict], payload: dict[str, Any], data: dict, reply: Reply
+    ) -> LLMResponse:
+        """Repeat a request whose reply the endpoint billed for but returned nothing of.
+
+        Some providers run their own tool-call parser over the model's output and, when it cannot read it, return
+        ``content: null`` without a call, whether the model was calling a tool or answering. Text mode has no server-side
+        parser to swallow anything. The wasted call stays in the totals and is added to the response's usage, so the
+        caller's budget sees everything that was billed. After ``_SWALLOWED_BEFORE_TEXT_MODE`` such replies the client
+        stays in text mode.
+        """
+        wasted = self._finish("", [], payload, data, reply).usage
+        self._swallowed_replies += 1
+        if self._swallowed_replies >= _SWALLOWED_BEFORE_TEXT_MODE:
+            logger.warning("the endpoint swallowed %d replies; switching to text mode for good", self._swallowed_replies)
+            self._use_text = True
+        else:
+            logger.warning(
+                "the endpoint billed %s tokens for an empty reply; repeating the request in text mode",
+                wasted["completion_tokens"],
+            )
+        response = self._chat_text(messages, tools)
+        response.usage = _sum_usage(wasted, response.usage)
+        return response
 
     def _chat_text(self, messages: list[dict], tools: list[dict] | None) -> LLMResponse:
         payload = self._payload(normalize_messages(adapt_messages_for_text_mode(messages, tools)))
@@ -534,6 +563,22 @@ def _excerpt(text: str, limit: int = 500) -> str:
 
 def _as_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _swallowed(data: dict, reply: Reply) -> bool:
+    """A reply that cost tokens and came back with nothing: no text, no calls, no reasoning, and not cut off."""
+    spent = _as_count((data.get("usage") or {}).get("completion_tokens")) or 0
+    return spent > 0 and not reply.found and data["choices"][0].get("finish_reason") == "stop"
+
+
+def _sum_usage(first: dict, second: dict) -> dict:
+    """The usage of two calls as one: token counts added, ``estimated`` if either was."""
+    merged = dict(second)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+        if key in first or key in second:
+            merged[key] = first.get(key, 0) + second.get(key, 0)
+    merged["estimated"] = bool(first.get("estimated") or second.get("estimated"))
+    return merged
 
 
 def _tokens_from_chars(chars: int) -> int:
