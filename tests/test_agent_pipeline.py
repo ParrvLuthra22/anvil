@@ -45,7 +45,7 @@ def repo_functions(monkeypatch):
     monkeypatch.setattr(pipeline_module, "fetch_issue", fetch)
     monkeypatch.setattr(pipeline_module, "clone_repo", clone)
     monkeypatch.setattr(pipeline_module, "profile_repo", lambda root: calls.append(("profile", root)) or PROFILE)
-    monkeypatch.setattr(pipeline_module, "repo_map", lambda root: f"map of {root.name}")
+    monkeypatch.setattr(pipeline_module, "repo_map", lambda root, label=None: f"map of {label} at {root.name}")
     return calls
 
 
@@ -86,7 +86,7 @@ def test_profile_builds_the_workspace_from_the_injected_factories(tmp_path, repo
     workspace = pipeline.profile(Ingested(issue, tmp_path / "repo"))
 
     assert workspace.issue is issue and workspace.profile is PROFILE
-    assert workspace.repo_map == "map of repo"
+    assert workspace.repo_map == "map of acme/calc at repo"
     assert isinstance(workspace.sandbox, PreparedSandbox) and workspace.sandbox.inner is sandbox
     assert workspace.tools is registry
     assert seen["sandbox"] == (config, tmp_path / "repo", PROFILE)
@@ -117,3 +117,19 @@ def test_a_missing_default_tool_set_is_a_clear_error(tmp_path, repo_functions, m
     pipeline = RepoPipeline({}, tmp_path, sandbox_factory=lambda config, root, profile: object(), deps_installer=no_deps)
     with pytest.raises(RuntimeError, match="no tools are available"):
         pipeline.profile(Ingested(IssueRef("a", "b", 1, URL), Path("/r")))
+
+
+def test_the_repo_map_header_names_the_repository_not_the_clone_directory(tmp_path):
+    """The real profile_repo and repo_map, on a small repository in an ugly temp directory name."""
+    root = tmp_path / "acme__calc__7__1790000000" / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    pipeline = RepoPipeline(
+        {}, tmp_path, sandbox_factory=lambda config, root, profile: object(), registry_factory=lambda profile: object(),
+        deps_installer=no_deps,
+    )
+    workspace = pipeline.profile(Ingested(IssueRef("acme", "calc", 7, URL), root))
+
+    assert workspace.repo_map.splitlines()[0] == "# repo: acme/calc"
+    assert "acme__calc" not in workspace.repo_map and "1790000000" not in workspace.repo_map
+    assert "calc.py" in workspace.repo_map

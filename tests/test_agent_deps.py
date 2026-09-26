@@ -164,7 +164,7 @@ class FakeSandboxWithRoot:
 
 def profile_with(monkeypatch, tmp_path, installer, config=None):
     monkeypatch.setattr(pipeline_module, "profile_repo", lambda root: PY)
-    monkeypatch.setattr(pipeline_module, "repo_map", lambda root: "map")
+    monkeypatch.setattr(pipeline_module, "repo_map", lambda root, label=None: "map")
     notes = Recorder()
     pipeline = make_pipeline(tmp_path, installer, config, notes)
     root = tmp_path / "clone"

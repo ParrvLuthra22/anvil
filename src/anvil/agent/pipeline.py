@@ -224,7 +224,7 @@ class RepoPipeline:
         return Workspace(
             issue=ingested.issue,
             profile=profile,
-            repo_map=repo_map(root),
+            repo_map=repo_map(root, label=f"{ingested.issue.owner}/{ingested.issue.repo}"),
             sandbox=PreparedSandbox(inner, venv_dir=venv_dir),
             tools=self._registry_factory(profile),
             deps=deps,
