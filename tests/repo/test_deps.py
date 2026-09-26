@@ -79,12 +79,19 @@ def _make_sandbox(exec_side_effects: list) -> MagicMock:
 
 
 def _py_probe_ok() -> list:
-    """Mock 3 exec calls: command -v found (exit 0) + version print (exit 0) + venv --help ok (exit 0).
+    """Mock 5 exec calls: command -v found (exit 0) + version print (exit 0) + rm -rf (exit 0) + venv create (exit 0) + verify (exit 0) + rm -rf (exit 0).
 
     This simulates _pick_python_interpreter succeeding on the first candidate
     (python3.13).
     """
-    return [_exec_result(0), _exec_result(0, stdout="3.13\n"), _exec_result(0)]
+    return [
+        _exec_result(0),  # command -v
+        _exec_result(0, stdout="3.13\n"),  # version
+        _exec_result(0),  # rm -rf probe_dir
+        _exec_result(0),  # venv create
+        _exec_result(0),  # verify python -c import
+        _exec_result(0),  # rm -rf probe_dir
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +222,10 @@ class TestPickPythonInterpreter:
             _exec_result(1),  # python3.9 not found
             _exec_result(0),  # python3 found
             _exec_result(0, stdout="3.9\n"),  # python3 version
-            _exec_result(0),  # python3 -m venv --help ok
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3 venv create ok
+            _exec_result(0),  # verify python -c import ok
+            _exec_result(0),  # rm -rf
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3"
@@ -231,10 +241,33 @@ class TestPickPythonInterpreter:
         sb = _make_sandbox([
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # python3.13 version
-            _exec_result(1),  # python3.13 -m venv --help fails
+            _exec_result(0),  # rm -rf
+            _exec_result(1),  # python3.13 -m venv create fails
             _exec_result(0),  # python3.12 found
             _exec_result(0, stdout="3.12\n"),  # python3.12 version
-            _exec_result(0),  # python3.12 -m venv --help ok
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3.12 venv create ok
+            _exec_result(0),  # verify import ok
+            _exec_result(0),  # rm -rf
+        ])
+        result = _pick_python_interpreter(sb)
+        assert result == "python3.12"
+
+    def test_skips_when_missing_modules(self):
+        """Skips interpreter that has broken ensurepip/pyexpat/ssl."""
+        sb = _make_sandbox([
+            _exec_result(0),  # python3.13 found
+            _exec_result(0, stdout="3.13\n"),  # version
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # venv create ok
+            _exec_result(1),  # verify import fails
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # python3.12 found
+            _exec_result(0, stdout="3.12\n"),  # version
+            _exec_result(0),  # rm -rf
+            _exec_result(0),  # venv create ok
+            _exec_result(0),  # verify import ok
+            _exec_result(0),  # rm -rf
         ])
         result = _pick_python_interpreter(sb)
         assert result == "python3.12"
@@ -258,7 +291,7 @@ class TestPickPythonInterpreter:
                                 ver = "3.8"  # fallback
                             return _exec_result(0, stdout=f"{ver}\n")
                     return _exec_result(0, stdout="3.9\n")
-                if "venv --help" in cmd:
+                if "venv" in cmd or "import ensurepip" in cmd or "rm -rf" in cmd:
                     return _exec_result(0)
                 return _exec_result(1)
             

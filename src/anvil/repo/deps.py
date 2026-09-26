@@ -201,10 +201,19 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
                 )
                 continue
 
-        # 3. Can it create a venv?
-        venv_probe = sandbox.exec(f"{interp} -m venv --help", timeout=10)
-        if venv_probe.exit_code != 0:
-            log.debug("Skipping %s — cannot create venv", interp)
+        # 3. Can it create a venv and does it have required modules?
+        probe_dir = f".probe_{interp.replace('.', '_')}"
+        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
+        venv_create = sandbox.exec(f"{interp} -m venv {probe_dir}", timeout=30)
+        if venv_create.exit_code != 0:
+            log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
+            continue
+            
+        verify = sandbox.exec(f"{probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'", timeout=10)
+        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
+        
+        if verify.exit_code != 0:
+            log.debug("Skipping %s — broken interpreter (missing ensurepip, pyexpat, or ssl): %s", interp, verify.stderr[:100])
             continue
 
         log.info("Selected Python interpreter: %s", interp)
