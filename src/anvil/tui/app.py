@@ -1,31 +1,40 @@
 """ANVIL Textual TUI — main application.
 
-Layout
-------
-┌─────────────────────────────────────────────────────────────┐
-│  Title bar  │  Issue URL input  │  [Start]                  │
-├─────────────┬──────────────────────────────┬────────────────┤
-│  Phase      │  Scrolling event log          │  Metrics       │
-│  stepper    │  (messages / tools / results) │  (tokens, cost)│
-├─────────────┴──────────────────────────────┴────────────────┤
-│  Diff preview pane  (toggle with d)                         │
-│  RESULT panel (appears on done event)                        │
-└─────────────────────────────────────────────────────────────┘
+Layout (min 80×24)
+------------------
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Header: ANVIL | Issue URL input | [Start]                                 │
+├──────────────┬───────────────────────────────────────┬─────────────────────┤
+│  Phase       │  Scrolling event log                  │  Metrics panel      │
+│  stepper     │  messages / tool calls / results      │  steps/tokens/cost  │
+│  (9 phases)  │  colour-coded, never crashes          │  elapsed / budget   │
+├──────────────┴───────────────────────────────────────┴─────────────────────┤
+│  ERROR banner (red, visible on error events; run continues)                │
+├─────────────────────────────────────────────────────────────────────────────│
+│  Diff preview pane  (toggle: d)                                            │
+│  RESULT panel (appears on done event)                                      │
+└────────────────────────────────────────────────────────────────────────────┘
 
-Keyboard: q → quit, r → restart, d → toggle diff pane.
+Keyboard:
+  q         quit (Ctrl+C also exits cleanly)
+  r         restart (clear log + reset phases)
+  d         toggle diff pane
+  space     pause / resume replay
+  → / l     step forward  (replay step-by-step)
+  ← / h     step backward (replay step-by-step, re-emits from buffer)
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Callable
 from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
-from textual.reactive import reactive
+from textual.containers import Horizontal, ScrollableContainer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -40,7 +49,7 @@ from textual.widgets import (
 from anvil.events import AgentEvent, EventBus, Phase
 
 # ---------------------------------------------------------------------------
-# Phase display helpers
+# Constants
 # ---------------------------------------------------------------------------
 
 _PHASE_ORDER: list[Phase] = [
@@ -56,23 +65,33 @@ _PHASE_ORDER: list[Phase] = [
 ]
 
 _PHASE_LABEL: dict[Phase, str] = {
-    Phase.INGEST: "① INGEST",
-    Phase.PROFILE: "② PROFILE",
+    Phase.INGEST:     "① INGEST",
+    Phase.PROFILE:    "② PROFILE",
     Phase.UNDERSTAND: "③ UNDERSTAND",
-    Phase.LOCALIZE: "④ LOCALIZE",
-    Phase.REPRODUCE: "⑤ REPRODUCE",
-    Phase.PATCH: "⑥ PATCH",
-    Phase.VERIFY: "⑦ VERIFY",
-    Phase.REVIEW: "⑧ REVIEW",
-    Phase.FINALIZE: "⑨ FINALIZE",
+    Phase.LOCALIZE:   "④ LOCALIZE",
+    Phase.REPRODUCE:  "⑤ REPRODUCE",
+    Phase.PATCH:      "⑥ PATCH",
+    Phase.VERIFY:     "⑦ VERIFY",
+    Phase.REVIEW:     "⑧ REVIEW",
+    Phase.FINALIZE:   "⑨ FINALIZE",
 }
 
-_PHASE_STATE_CSS: dict[str, str] = {
+_PHASE_CSS: dict[str, str] = {
     "pending": "phase-pending",
-    "active": "phase-active",
-    "done": "phase-done",
-    "failed": "phase-failed",
+    "active":  "phase-active",
+    "done":    "phase-done",
+    "failed":  "phase-failed",
 }
+
+# Max chars per log line — prevents the RichLog from choking on huge tool output
+_MAX_LINE = 400
+
+
+def _clip(text: str, limit: int = _MAX_LINE) -> str:
+    """Truncate *text* to *limit* chars with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " [dim]…[/dim]"
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +104,7 @@ class PhaseStepper(Widget):
     DEFAULT_CSS = """
     PhaseStepper {
         width: 20;
+        min-width: 18;
         height: 100%;
         border-right: solid $primary-darken-2;
         padding: 1;
@@ -94,6 +114,7 @@ class PhaseStepper(Widget):
     .phase-active   { color: $warning; text-style: bold; }
     .phase-done     { color: $success; }
     .phase-failed   { color: $error; text-style: bold; }
+    #phase-header   { color: $accent; text-style: bold; padding-bottom: 1; }
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -115,15 +136,13 @@ class PhaseStepper(Widget):
         lbl = self._labels.get(phase)
         if lbl is None:
             return
-        # Remove old class, add new
-        for css_class in _PHASE_STATE_CSS.values():
+        for css_class in _PHASE_CSS.values():
             lbl.remove_class(css_class)
-        lbl.add_class(_PHASE_STATE_CSS.get(state, "phase-pending"))
+        lbl.add_class(_PHASE_CSS.get(state, "phase-pending"))
         prefix = {"pending": "  ", "active": "▶ ", "done": "✓ ", "failed": "✗ "}.get(state, "  ")
         lbl.update(prefix + _PHASE_LABEL[phase])
 
     def mark_active(self, phase: Phase) -> None:
-        # Mark previous phases done
         for p in _PHASE_ORDER:
             if p == phase:
                 break
@@ -142,17 +161,22 @@ class PhaseStepper(Widget):
             if self._states[p] in ("pending", "active"):
                 self.set_phase_state(p, "done")
 
+    def reset(self) -> None:
+        for p in _PHASE_ORDER:
+            self.set_phase_state(p, "pending")
+
 
 # ---------------------------------------------------------------------------
-# Metrics widget
+# Metrics panel widget
 # ---------------------------------------------------------------------------
 
 class MetricsPanel(Widget):
-    """Right column: live step / token / cost / time metrics."""
+    """Right column: live step / token / cost / time / budget metrics."""
 
     DEFAULT_CSS = """
     MetricsPanel {
         width: 22;
+        min-width: 20;
         height: 100%;
         border-left: solid $primary-darken-2;
         padding: 1;
@@ -160,6 +184,7 @@ class MetricsPanel(Widget):
     }
     .metric-label { color: $text-muted; }
     .metric-value { color: $accent; text-style: bold; }
+    #metrics-header { color: $accent; text-style: bold; padding-bottom: 1; }
     """
 
     def __init__(self, config: dict, **kwargs: Any) -> None:
@@ -176,45 +201,99 @@ class MetricsPanel(Widget):
     def compose(self) -> ComposeResult:
         yield Label("METRICS", id="metrics-header")
         yield Static("─" * 18)
-        yield Label("Steps", classes="metric-label")
-        yield Label("0", id="m-steps", classes="metric-value")
-        yield Label("Prompt tokens", classes="metric-label")
-        yield Label("0", id="m-prompt", classes="metric-value")
+        yield Label("Steps",          classes="metric-label")
+        yield Label("0",              id="m-steps",      classes="metric-value")
+        yield Label("Prompt tokens",  classes="metric-label")
+        yield Label("0",              id="m-prompt",     classes="metric-value")
         yield Label("Completion tok", classes="metric-label")
-        yield Label("0", id="m-completion", classes="metric-value")
-        yield Label("Total tokens", classes="metric-label")
-        yield Label("0", id="m-total-tok", classes="metric-value")
-        yield Label("Est. cost ($)", classes="metric-label")
-        yield Label("0.000000", id="m-cost", classes="metric-value")
-        yield Label("Elapsed", classes="metric-label")
-        yield Label("0s", id="m-elapsed", classes="metric-value")
+        yield Label("0",              id="m-completion", classes="metric-value")
+        yield Label("Total tokens",   classes="metric-label")
+        yield Label("0",              id="m-total-tok",  classes="metric-value")
+        yield Label("Est. cost ($)",  classes="metric-label")
+        yield Label("0.000000",       id="m-cost",       classes="metric-value")
+        yield Label("Elapsed",        classes="metric-label")
+        yield Label("0s",             id="m-elapsed",    classes="metric-value")
         yield Static("─" * 18)
-        yield Label("Budget remaining", classes="metric-label")
-        yield Label("", id="m-budget", classes="metric-value")
+        yield Label("Budget left",    classes="metric-label")
+        yield Label("",               id="m-budget",     classes="metric-value")
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self._tick)
 
     def _tick(self) -> None:
         elapsed = int(time.time() - self._start_ts)
-        self.query_one("#m-elapsed", Label).update(f"{elapsed}s")
-        tok_remain = self._max_tokens - (self._prompt_tok + self._completion_tok)
-        step_remain = self._max_steps - self._steps
-        self.query_one("#m-budget", Label).update(
-            f"steps:{step_remain}  tok:{tok_remain:,}"
-        )
+        try:
+            self.query_one("#m-elapsed", Label).update(f"{elapsed}s")
+            tok_used = self._prompt_tok + self._completion_tok
+            tok_remain = max(0, self._max_tokens - tok_used)
+            step_remain = max(0, self._max_steps - self._steps)
+            self.query_one("#m-budget", Label).update(
+                f"steps:{step_remain}\ntok:{tok_remain:,}"
+            )
+        except Exception:
+            pass
 
     def update_usage(self, prompt: int, completion: int, cost: float) -> None:
+        """Accumulate one LLM call's usage."""
         self._prompt_tok += prompt
         self._completion_tok += completion
         self._cost += cost
         self._steps += 1
         total = self._prompt_tok + self._completion_tok
-        self.query_one("#m-steps", Label).update(str(self._steps))
-        self.query_one("#m-prompt", Label).update(f"{self._prompt_tok:,}")
-        self.query_one("#m-completion", Label).update(f"{self._completion_tok:,}")
-        self.query_one("#m-total-tok", Label).update(f"{total:,}")
-        self.query_one("#m-cost", Label).update(f"{self._cost:.6f}")
+        try:
+            self.query_one("#m-steps",      Label).update(str(self._steps))
+            self.query_one("#m-prompt",     Label).update(f"{self._prompt_tok:,}")
+            self.query_one("#m-completion", Label).update(f"{self._completion_tok:,}")
+            self.query_one("#m-total-tok",  Label).update(f"{total:,}")
+            self.query_one("#m-cost",       Label).update(f"{self._cost:.6f}")
+        except Exception:
+            pass
+
+    def reset(self) -> None:
+        """Reset all counters (used by restart)."""
+        self._steps = 0
+        self._prompt_tok = 0
+        self._completion_tok = 0
+        self._cost = 0.0
+        self._start_ts = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Error banner widget (visible when an error event arrives)
+# ---------------------------------------------------------------------------
+
+class ErrorBanner(Widget):
+    """Sticky red banner — appears on error events, run continues."""
+
+    DEFAULT_CSS = """
+    ErrorBanner {
+        height: 2;
+        padding: 0 2;
+        background: $error-darken-2;
+        display: none;
+    }
+    ErrorBanner.visible { display: block; }
+    #error-text { color: $text; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="error-text")
+
+    def show_error(self, kind: str, message: str) -> None:
+        """Display *message*; makes the banner visible."""
+        text = f"[bold red]⚠ {kind.upper()}[/bold red]  {_clip(message, 200)}"
+        try:
+            self.query_one("#error-text", Label).update(text)
+            self.add_class("visible")
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        try:
+            self.query_one("#error-text", Label).update("")
+            self.remove_class("visible")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -226,32 +305,37 @@ class DiffPane(Widget):
 
     DEFAULT_CSS = """
     DiffPane {
-        height: 12;
+        height: 10;
         border-top: solid $primary-darken-2;
         padding: 0 1;
         background: $surface-darken-1;
         display: block;
     }
     DiffPane.hidden { display: none; }
+    #diff-header { color: $text-muted; }
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("── DIFF PREVIEW ─────────────────────────────", id="diff-header")
+        yield Label("── DIFF PREVIEW ──────────────────────────────", id="diff-header")
         yield RichLog(id="diff-log", highlight=True, markup=True, wrap=False)
 
     def update_diff(self, diff_text: str) -> None:
-        """Replace the diff log with new content, coloured."""
-        log = self.query_one("#diff-log", RichLog)
-        log.clear()
-        for line in diff_text.splitlines():
-            if line.startswith("+") and not line.startswith("+++"):
-                log.write(f"[green]{line}[/green]")
-            elif line.startswith("-") and not line.startswith("---"):
-                log.write(f"[red]{line}[/red]")
-            elif line.startswith("@@"):
-                log.write(f"[cyan]{line}[/cyan]")
-            else:
-                log.write(line)
+        """Replace the diff log content with syntax-coloured diff."""
+        try:
+            log = self.query_one("#diff-log", RichLog)
+            log.clear()
+            for line in diff_text.splitlines()[:200]:  # cap at 200 lines
+                line = line.rstrip()
+                if line.startswith("+") and not line.startswith("+++"):
+                    log.write(f"[green]{_clip(line)}[/green]")
+                elif line.startswith("-") and not line.startswith("---"):
+                    log.write(f"[red]{_clip(line)}[/red]")
+                elif line.startswith("@@"):
+                    log.write(f"[cyan]{_clip(line)}[/cyan]")
+                else:
+                    log.write(_clip(line))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -259,11 +343,11 @@ class DiffPane(Widget):
 # ---------------------------------------------------------------------------
 
 class ResultBanner(Widget):
-    """Appears at the bottom when the done event arrives."""
+    """Shows patch path, confidence, steps, tokens and time when done."""
 
     DEFAULT_CSS = """
     ResultBanner {
-        height: 4;
+        height: 5;
         border: double $success;
         padding: 0 2;
         background: $success-darken-3;
@@ -273,20 +357,68 @@ class ResultBanner(Widget):
     """
 
     def compose(self) -> ComposeResult:
-        yield Label("", id="result-text")
+        yield Label("", id="result-line1")
+        yield Label("", id="result-line2")
 
     def show(self, data: dict) -> None:
-        conf = data.get("resolved_confidence", 0)
-        patch = data.get("patch_path", "output/patch.diff")
-        steps = data.get("steps", "?")
-        tokens = data.get("tokens", "?")
-        secs = data.get("seconds", "?")
-        text = (
-            f"[bold green]✓ DONE[/bold green]  "
-            f"confidence={conf:.0%}  steps={steps}  tokens={tokens:,}  time={secs}s  "
-            f"patch → [link]{patch}[/link]"
-        )
-        self.query_one("#result-text", Label).update(text)
+        """Populate and reveal the result banner from *data*."""
+        try:
+            conf   = data.get("resolved_confidence", 0)
+            patch  = data.get("patch_path",  "output/patch.diff")
+            report = data.get("report_path", "output/report.md")
+            steps  = data.get("steps",   "?")
+            tokens = data.get("tokens",  0)
+            secs   = data.get("seconds", "?")
+
+            line1 = (
+                f"[bold green]✓ DONE[/bold green]  "
+                f"confidence=[bold]{conf:.0%}[/bold]  "
+                f"steps={steps}  tokens={tokens:,}  time={secs}s"
+            )
+            line2 = (
+                f"patch  → {patch}\n"
+                f"report → {report}"
+            )
+            self.query_one("#result-line1", Label).update(line1)
+            self.query_one("#result-line2", Label).update(line2)
+            self.add_class("visible")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Replay status bar
+# ---------------------------------------------------------------------------
+
+class ReplayBar(Widget):
+    """Thin bar showing replay speed and pause/step status."""
+
+    DEFAULT_CSS = """
+    ReplayBar {
+        height: 1;
+        background: $primary-darken-3;
+        padding: 0 2;
+        display: none;
+    }
+    ReplayBar.visible { display: block; }
+    #replay-status { color: $accent; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="replay-status")
+
+    def update_status(self, speed: float, paused: bool, idx: int, total: int) -> None:
+        speed_str = "instant" if speed == 0 else f"{speed}×"
+        state = "PAUSED" if paused else f"playing {speed_str}"
+        try:
+            self.query_one("#replay-status", Label).update(
+                f"[bold]REPLAY[/bold]  {state}  event {idx}/{total}  "
+                "│ space=pause  →/←=step  1/4/0=speed"
+            )
+        except Exception:
+            pass
+
+    def show(self) -> None:
         self.add_class("visible")
 
 
@@ -298,16 +430,15 @@ class AnvilApp(App):
     """ANVIL Textual application.
 
     Consumes :class:`~anvil.events.AgentEvent` objects from *bus* and renders
-    them. Works identically for live runs and replays.
+    them. Works identically for live runs, ``--demo``, and trace replays.
+    Never crashes on an unknown event type or a missing data field.
     """
 
     TITLE = "ANVIL — Autonomous Coding Agent"
     CSS = """
-    Screen {
-        background: $background;
-    }
+    Screen { background: $background; }
 
-    /* ── Title / Input bar ── */
+    /* ── Top input bar ── */
     #top-bar {
         height: 3;
         background: $primary-darken-3;
@@ -315,7 +446,7 @@ class AnvilApp(App):
         border-bottom: solid $primary-darken-1;
     }
     #app-title {
-        width: 28;
+        width: 26;
         color: $accent;
         text-style: bold;
         padding: 0 1;
@@ -325,15 +456,10 @@ class AnvilApp(App):
         width: 1fr;
         border: none;
     }
-    #start-btn {
-        width: 10;
-        margin: 0 1;
-    }
+    #start-btn { width: 10; margin: 0 1; }
 
     /* ── Body ── */
-    #body {
-        height: 1fr;
-    }
+    #body { height: 1fr; }
 
     /* ── Event log ── */
     #log-area {
@@ -346,26 +472,21 @@ class AnvilApp(App):
         height: 100%;
         scrollbar-color: $primary;
     }
-
-    /* ── Phase header label ── */
-    #phase-header {
-        color: $accent;
-        text-style: bold;
-        padding-bottom: 1;
-    }
-
-    /* ── Metrics header label ── */
-    #metrics-header {
-        color: $accent;
-        text-style: bold;
-        padding-bottom: 1;
-    }
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("r", "restart", "Restart"),
-        Binding("d", "toggle_diff", "Toggle diff"),
+        Binding("q",          "quit",         "Quit",          priority=True),
+        Binding("ctrl+c",     "quit",         "Quit",          show=False, priority=True),
+        Binding("r",          "restart",      "Restart"),
+        Binding("d",          "toggle_diff",  "Toggle diff"),
+        Binding("space",      "toggle_pause", "Pause/Resume",  show=False),
+        Binding("right",      "step_forward", "Step →",        show=False),
+        Binding("l",          "step_forward", "Step →",        show=False),
+        Binding("left",       "step_back",    "Step ←",        show=False),
+        Binding("h",          "step_back",    "Step ←",        show=False),
+        Binding("1",          "speed_1",      "Speed 1×",      show=False),
+        Binding("4",          "speed_4",      "Speed 4×",      show=False),
+        Binding("0",          "speed_instant","Speed instant",  show=False),
     ]
 
     def __init__(
@@ -374,6 +495,8 @@ class AnvilApp(App):
         issue_url: str = "",
         on_start: Callable[[str], None] | None = None,
         replay: bool = False,
+        replay_events: list[AgentEvent] | None = None,
+        replay_speed: float = 1.0,
         config: dict | None = None,
         **kwargs: Any,
     ) -> None:
@@ -382,18 +505,28 @@ class AnvilApp(App):
         self._issue_url = issue_url
         self._on_start = on_start
         self._replay = replay
+        self._replay_events: list[AgentEvent] = replay_events or []
+        self._replay_speed: float = replay_speed
         self._config = config or {}
+
+        # Runtime state
         self._queue: asyncio.Queue[AgentEvent] | None = None
         self._started = False
         self._diff_visible = True
         self._current_phase: Phase | None = None
+
+        # Replay state
+        self._replay_paused = False
+        self._replay_idx = 0          # index of next event to emit
+        self._replay_task: asyncio.Task | None = None
+        self._replay_history: list[AgentEvent] = []  # all events emitted so far
 
     # ── Layout ──────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
 
-        # Top bar
+        # Top input bar
         with Horizontal(id="top-bar"):
             yield Label("⚒  ANVIL", id="app-title")
             yield Input(
@@ -403,22 +536,23 @@ class AnvilApp(App):
             )
             yield Button("▶  Start", id="start-btn", variant="primary")
 
-        # Body: phase stepper | log | metrics
+        # Replay status bar (hidden unless in replay mode)
+        yield ReplayBar(id="replay-bar")
+
+        # Body: phase stepper | event log | metrics
         with Horizontal(id="body"):
             yield PhaseStepper(id="phase-stepper")
             with ScrollableContainer(id="log-area"):
-                yield RichLog(
-                    id="event-log",
-                    highlight=True,
-                    markup=True,
-                    wrap=True,
-                )
+                yield RichLog(id="event-log", highlight=True, markup=True, wrap=True)
             yield MetricsPanel(config=self._config, id="metrics-panel")
 
-        # Diff pane (toggled with d)
+        # Error banner (appears on error events)
+        yield ErrorBanner(id="error-banner")
+
+        # Diff preview pane
         yield DiffPane(id="diff-pane")
 
-        # Result banner (hidden until done)
+        # Result banner (appears on done event)
         yield ResultBanner(id="result-banner")
 
         yield Footer()
@@ -426,14 +560,15 @@ class AnvilApp(App):
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        """Subscribe to the bus and optionally auto-start if issue_url provided."""
+        """Subscribe to the bus and optionally auto-start."""
         self._queue = self._bus.subscribe()
         self.set_interval(0.05, self._drain_queue)
 
-        if self._issue_url and not self._replay:
-            # Auto-start when URL was passed via --issue flag
+        if self._replay and self._replay_events:
+            replay_bar = self.query_one("#replay-bar", ReplayBar)
+            replay_bar.show()
             self._do_start(self._issue_url)
-        elif self._replay:
+        elif self._issue_url:
             self._do_start(self._issue_url)
 
     # ── Queue drainer ────────────────────────────────────────────────────────
@@ -448,85 +583,104 @@ class AnvilApp(App):
                 self._handle_event(ev)
         except asyncio.QueueEmpty:
             pass
+        except Exception:
+            pass
 
-    # ── Event handling ───────────────────────────────────────────────────────
+    # ── Event → UI dispatch ──────────────────────────────────────────────────
 
-    def _handle_event(self, ev: AgentEvent) -> None:  # noqa: C901 (complexity OK here)
-        """Dispatch an AgentEvent to the appropriate UI update."""
+    def _handle_event(self, ev: AgentEvent) -> None:
+        """Dispatch an AgentEvent to the appropriate UI widgets.
+
+        Wraps every operation in try/except so a bad event never crashes the TUI.
+        Missing fields are defaulted, unknown event types are silently skipped.
+        """
         try:
-            ev_type = ev.type
-            phase = ev.phase
-            data = ev.data or {}
+            ev_type = str(ev.type) if ev.type is not None else "unknown"
+            data = ev.data if isinstance(ev.data, dict) else {}
 
+            log: RichLog         = self.query_one("#event-log",    RichLog)
             stepper: PhaseStepper = self.query_one("#phase-stepper", PhaseStepper)
-            log: RichLog = self.query_one("#event-log", RichLog)
             metrics: MetricsPanel = self.query_one("#metrics-panel", MetricsPanel)
 
             if ev_type == "phase":
-                new_phase = phase
-                if new_phase and isinstance(new_phase, Phase):
-                    # Mark previous phase done
-                    if self._current_phase and self._current_phase != new_phase:
-                        stepper.mark_done(self._current_phase)
-                    self._current_phase = new_phase
-                    stepper.mark_active(new_phase)
-                    log.write(
-                        f"\n[bold cyan]━━ {new_phase.value.upper()} ━━[/bold cyan]"
-                    )
+                self._handle_phase(ev.phase, data, stepper, log)
 
             elif ev_type == "message":
-                role = data.get("role", "?")
-                text = data.get("text", "")
+                role  = str(data.get("role", "?"))
+                text  = str(data.get("text", ""))
                 colour = "yellow" if role == "assistant" else "white"
-                label = "🤖" if role == "assistant" else "👤"
-                log.write(f"[{colour}]{label} [{role}][/{colour}] {text}")
+                icon   = "🤖" if role == "assistant" else "👤"
+                log.write(f"[{colour}]{icon} [{role}][/{colour}] {_clip(text)}")
 
             elif ev_type == "tool_call":
-                tool = data.get("tool", "?")
+                tool = str(data.get("tool", "?"))
                 args = data.get("args", {})
-                # Pretty-print args compactly
-                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) if args else ""
+                if not isinstance(args, dict):
+                    args = {}
+                args_str = ", ".join(
+                    f"{k}={_clip(repr(v), 60)}" for k, v in list(args.items())[:8]
+                )
                 log.write(f"[bold blue]⚙ CALL[/bold blue] [cyan]{tool}[/cyan]({args_str})")
 
             elif ev_type == "tool_result":
-                tool = data.get("tool", "?")
-                ok = data.get("ok", True)
-                preview = data.get("output_preview", "")
-                icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
-                log.write(f"  {icon} [dim]{tool}[/dim]: {preview}")
-                # Update diff pane if this looks like a git_diff result
+                tool    = str(data.get("tool", "?"))
+                ok      = bool(data.get("ok", True))
+                preview = str(data.get("output_preview", ""))
+                icon    = "[green]✓[/green]" if ok else "[red]✗[/red]"
+                log.write(f"  {icon} [dim]{tool}[/dim]: {_clip(preview)}")
                 if tool == "git_diff" and ok and preview:
                     self.query_one("#diff-pane", DiffPane).update_diff(preview)
 
             elif ev_type == "llm_usage":
-                prompt = data.get("prompt_tokens", 0)
-                comp = data.get("completion_tokens", 0)
-                cost = data.get("cost_estimate", 0.0)
+                prompt = int(data.get("prompt_tokens", 0))
+                comp   = int(data.get("completion_tokens", 0))
+                cost   = float(data.get("cost_estimate", 0.0))
                 metrics.update_usage(prompt, comp, cost)
-                log.write(
-                    f"  [dim]tokens: +{prompt}p +{comp}c  cost Δ${cost:.6f}[/dim]"
-                )
+                log.write(f"  [dim]tokens: +{prompt}p +{comp}c  Δcost=${cost:.6f}[/dim]")
 
             elif ev_type == "error":
-                kind = data.get("kind", "error")
-                msg = data.get("message", "")
-                log.write(f"[bold red]⚠ ERROR[/bold red] [{kind}] {msg}")
+                kind = str(data.get("kind", "error"))
+                msg  = str(data.get("message", ""))
+                log.write(f"[bold red]⚠ ERROR[/bold red] [{kind}] {_clip(msg)}")
+                self.query_one("#error-banner", ErrorBanner).show_error(kind, msg)
 
             elif ev_type == "done":
-                if self._current_phase:
-                    stepper.mark_all_done()
+                stepper.mark_all_done()
                 self.query_one("#result-banner", ResultBanner).show(data)
-                patch_path = data.get("patch_path", "")
-                if patch_path:
-                    import os
-                    if os.path.exists(patch_path):
-                        with open(patch_path) as f:
-                            self.query_one("#diff-pane", DiffPane).update_diff(f.read())
+                # Load patch into diff pane if it exists on disk
+                patch_path = str(data.get("patch_path", ""))
+                if patch_path and os.path.exists(patch_path):
+                    try:
+                        with open(patch_path) as fh:
+                            self.query_one("#diff-pane", DiffPane).update_diff(fh.read())
+                    except Exception:
+                        pass
 
-            # Ignore unknown event types gracefully (future-proof)
+            # Unknown types: silently skipped (future-proof).
 
         except Exception:
-            # The TUI must never crash on a bad event
+            # The TUI must never crash on a bad event under any circumstances.
+            pass
+
+    def _handle_phase(
+        self,
+        phase: Any,
+        data: dict,
+        stepper: PhaseStepper,
+        log: RichLog,
+    ) -> None:
+        """Handle a phase transition event."""
+        try:
+            if not isinstance(phase, Phase):
+                return
+            if self._current_phase and self._current_phase != phase:
+                stepper.mark_done(self._current_phase)
+            self._current_phase = phase
+            stepper.mark_active(phase)
+            log.write(f"\n[bold cyan]━━ {phase.value.upper()} ━━[/bold cyan]")
+            # Clear the error banner when a new phase starts (run recovered)
+            self.query_one("#error-banner", ErrorBanner).clear()
+        except Exception:
             pass
 
     # ── Button / Input handlers ───────────────────────────────────────────────
@@ -544,34 +698,168 @@ class AnvilApp(App):
                 self._do_start(url)
 
     def _do_start(self, url: str) -> None:
-        """Trigger the harness for *url* (idempotent — only runs once)."""
+        """Trigger the harness for *url* (idempotent)."""
         if self._started:
             return
         self._started = True
-        self.query_one("#issue-input", Input).value = url
-        log: RichLog = self.query_one("#event-log", RichLog)
-        log.write(f"[bold green]▶ Starting run for:[/bold green] {url}\n")
-        if self._on_start:
+        try:
+            self.query_one("#issue-input", Input).value = url
+        except Exception:
+            pass
+        try:
+            log: RichLog = self.query_one("#event-log", RichLog)
+            log.write(f"[bold green]▶ Starting:[/bold green] {_clip(url, 200)}\n")
+        except Exception:
+            pass
+
+        if self._replay and self._replay_events:
+            self._start_replay_task()
+        elif self._on_start:
             self._on_start(url)
 
-    # ── Key bindings ──────────────────────────────────────────────────────────
+    # ── Replay engine ─────────────────────────────────────────────────────────
+
+    def _start_replay_task(self) -> None:
+        """Launch the async replay emitter."""
+        if self._replay_task and not self._replay_task.done():
+            self._replay_task.cancel()
+        self._replay_task = asyncio.get_event_loop().create_task(self._replay_loop())
+
+    async def _replay_loop(self) -> None:
+        """Emit replay events respecting speed, pause and step controls."""
+        events = self._replay_events
+        total  = len(events)
+        if not events:
+            return
+
+        prev_ts = events[0].ts
+        self._replay_idx = 0
+
+        while self._replay_idx < total:
+            # Update status bar
+            try:
+                self.query_one("#replay-bar", ReplayBar).update_status(
+                    self._replay_speed,
+                    self._replay_paused,
+                    self._replay_idx,
+                    total,
+                )
+            except Exception:
+                pass
+
+            if self._replay_paused:
+                await asyncio.sleep(0.1)
+                continue
+
+            ev = events[self._replay_idx]
+
+            # Timing delay
+            if self._replay_speed > 0:
+                delay = (ev.ts - prev_ts) / self._replay_speed
+                if delay > 0:
+                    elapsed = 0.0
+                    step_size = 0.05
+                    while elapsed < delay:
+                        if self._replay_paused:
+                            break
+                        await asyncio.sleep(step_size)
+                        elapsed += step_size
+            prev_ts = ev.ts
+
+            self._bus.emit(ev)
+            self._replay_history.append(ev)
+            self._replay_idx += 1
+
+        # Final status update
+        try:
+            self.query_one("#replay-bar", ReplayBar).update_status(
+                self._replay_speed, False, total, total
+            )
+        except Exception:
+            pass
+
+    # ── Key-binding actions ───────────────────────────────────────────────────
 
     def action_quit(self) -> None:
+        """Exit cleanly — output/ files are preserved."""
         self.exit()
 
     def action_restart(self) -> None:
+        """Reset the UI to its initial state."""
         self._started = False
-        log: RichLog = self.query_one("#event-log", RichLog)
-        log.clear()
-        stepper: PhaseStepper = self.query_one("#phase-stepper", PhaseStepper)
-        for p in _PHASE_ORDER:
-            stepper.set_phase_state(p, "pending")
         self._current_phase = None
+        try:
+            self.query_one("#event-log",    RichLog).clear()
+            self.query_one("#phase-stepper", PhaseStepper).reset()
+            self.query_one("#metrics-panel", MetricsPanel).reset()
+            self.query_one("#error-banner",  ErrorBanner).clear()
+            self.query_one("#result-banner", ResultBanner).remove_class("visible")
+        except Exception:
+            pass
 
     def action_toggle_diff(self) -> None:
-        diff_pane = self.query_one("#diff-pane", DiffPane)
         self._diff_visible = not self._diff_visible
-        if self._diff_visible:
-            diff_pane.remove_class("hidden")
-        else:
-            diff_pane.add_class("hidden")
+        try:
+            diff_pane = self.query_one("#diff-pane", DiffPane)
+            if self._diff_visible:
+                diff_pane.remove_class("hidden")
+            else:
+                diff_pane.add_class("hidden")
+        except Exception:
+            pass
+
+    # ── Replay control actions ────────────────────────────────────────────────
+
+    def action_toggle_pause(self) -> None:
+        if not self._replay:
+            return
+        self._replay_paused = not self._replay_paused
+
+    def action_step_forward(self) -> None:
+        """Emit the next event immediately (step-by-step mode)."""
+        if not self._replay:
+            return
+        events = self._replay_events
+        if self._replay_idx < len(events):
+            self._replay_paused = True
+            ev = events[self._replay_idx]
+            self._bus.emit(ev)
+            self._replay_history.append(ev)
+            self._replay_idx += 1
+            try:
+                self.query_one("#replay-bar", ReplayBar).update_status(
+                    self._replay_speed, True, self._replay_idx, len(events)
+                )
+            except Exception:
+                pass
+
+    def action_step_back(self) -> None:
+        """Re-emit all events up to idx-1 (re-renders from history)."""
+        if not self._replay:
+            return
+        if self._replay_idx <= 1:
+            return
+        self._replay_paused = True
+        self._replay_idx -= 1
+        # Re-render: restart the UI then replay up to idx
+        self.action_restart()
+        for ev in self._replay_events[: self._replay_idx]:
+            self._handle_event(ev)
+        try:
+            self.query_one("#replay-bar", ReplayBar).update_status(
+                self._replay_speed, True, self._replay_idx, len(self._replay_events)
+            )
+        except Exception:
+            pass
+
+    def action_speed_1(self) -> None:
+        if self._replay:
+            self._replay_speed = 1.0
+
+    def action_speed_4(self) -> None:
+        if self._replay:
+            self._replay_speed = 4.0
+
+    def action_speed_instant(self) -> None:
+        if self._replay:
+            self._replay_speed = 0.0
