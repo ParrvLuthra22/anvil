@@ -20,12 +20,51 @@ def GREP():  # noqa: N802 - a call that never ends the phase; the pattern differ
 CAP3 = {"phase_call_caps": {"localize": 3, "reproduce": 3, "patch": 3}}
 
 
+@pytest.fixture(autouse=True)
+def scripts_never_look_like_a_loop(monkeypatch):
+    """Every fake-model script here must use distinct calls: three identical ones in a row are refused as a loop."""
+    from anvil.agent.recovery import PhaseGuard
+
+    real = PhaseGuard.repeated
+
+    def strict(self, *args, **kwargs):
+        verdict = real(self, *args, **kwargs)
+        assert verdict is None, "the loop detector fired: this test's script repeats the same call (use distinct arguments)"
+        return verdict
+
+    monkeypatch.setattr(PhaseGuard, "repeated", strict)
+
+
 def offered(harness: Harness, index: int) -> set[str]:
     return {t["function"]["name"] for t in harness.llm.calls[index][1]}
 
 
 def user_messages(harness: Harness) -> list[str]:
     return [m["content"] for m in harness.history if m["role"] == "user"]
+
+
+# ---- what "a cap of N" means -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 5, 8])
+def test_a_cap_of_n_gives_the_model_n_calls_of_its_own_and_call_n_plus_one_is_the_forced_close(n):
+    """A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close: at most N+1 calls."""
+    h = Harness([GREP() for _ in range(n)] + [done("the best so far")], phase_call_caps={"localize": n})
+    outcome = h.run(LOCALIZE)
+
+    assert len(outcome.records) == n, "the model's own calls all ran"
+    assert h.budget.steps == n + 1, "and the one after them was the close"
+    assert outcome.done and outcome.forced is True and outcome.summary == "the best so far"
+    assert offered(h, n - 1) > {"phase_done", "give_up"}, f"call {n} still had every tool"
+    assert offered(h, n) == {"phase_done", "give_up"}, f"call {n + 1} had only the two ways to close"
+    assert any(m.startswith(f"You have used the {n} model calls this phase allows") for m in user_messages(h))
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_ending_the_phase_on_call_n_is_not_a_forced_close(n):
+    h = Harness([GREP() for _ in range(n - 1)] + [done("on my own")], phase_call_caps={"localize": n})
+    outcome = h.run(LOCALIZE)
+    assert outcome.done and outcome.forced is False and h.budget.steps == n
 
 
 # ---- the forced close ------------------------------------------------------------------------------------------

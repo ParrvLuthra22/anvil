@@ -117,7 +117,7 @@ class AgentSettings:
         return cls()
 
     def call_cap(self, phase: str) -> int | None:
-        """Model calls ``phase`` may make before the harness forces it to close, or ``None`` when the cap is off."""
+        """The call cap of ``phase``, or ``None`` when the cap is off. A cap of N gives the model N calls of its own, and call N+1 is the harness's forced close, so a phase makes at most N+1 calls."""
         return self.phase_call_caps.get(phase) if self.token_budgets else None
 
     def cost_estimate(self, prompt_tokens: int, completion_tokens: int) -> float:
