@@ -77,7 +77,7 @@ class GrepTool:
                 cmd += ["--glob", file_pattern]
             cmd += [pattern, str(search_path)]
         else:
-            cmd = ["grep", "-rn", "--include" if file_pattern else "-r"]
+            cmd = ["grep", "-rn", "--exclude-dir=.git", "--exclude-dir=.anvil_venv"]
             if file_pattern:
                 cmd += [f"--include={file_pattern}"]
             if not case_sensitive:
