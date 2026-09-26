@@ -78,12 +78,12 @@ def _make_sandbox(exec_side_effects: list) -> MagicMock:
 
 
 def _py_probe_ok() -> list:
-    """Mock 2 exec calls: command -v found (exit 0) + venv --help ok (exit 0).
+    """Mock 3 exec calls: command -v found (exit 0) + version print (exit 0) + venv --help ok (exit 0).
 
     This simulates _pick_python_interpreter succeeding on the first candidate
-    (python3.12) with no requires-python constraint.
+    (python3.13).
     """
-    return [_exec_result(0), _exec_result(0)]
+    return [_exec_result(0), _exec_result(0, stdout="3.13\n"), _exec_result(0)]
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +150,13 @@ class TestParseRequiresPython:
         )
         sb = MagicMock()
         sb.root = tmp_path
-        assert _parse_requires_python(sb) == (3, 11)
+        assert _parse_requires_python(sb) == ">=3.11"
 
     def test_pyproject_without_constraint_defaults_39(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'foo'\n")
         sb = MagicMock()
         sb.root = tmp_path
-        assert _parse_requires_python(sb) == (3, 9)
+        assert _parse_requires_python(sb) == ">=3.9"
 
     def test_setup_cfg_with_constraint(self, tmp_path):
         (tmp_path / "setup.cfg").write_text(
@@ -164,7 +164,7 @@ class TestParseRequiresPython:
         )
         sb = MagicMock()
         sb.root = tmp_path
-        assert _parse_requires_python(sb) == (3, 10)
+        assert _parse_requires_python(sb) == ">=3.10"
 
 
 # ---------------------------------------------------------------------------
@@ -173,19 +173,22 @@ class TestParseRequiresPython:
 
 class TestPickPythonInterpreter:
     def test_first_candidate_found(self):
-        """When python3.12 is available and can create a venv, it is chosen."""
+        """When python3.13 is available and can create a venv, it is chosen."""
         sb = _make_sandbox(_py_probe_ok())
         result = _pick_python_interpreter(sb)
-        assert result == "python3.12"
+        assert result == "python3.13"
 
     def test_fallback_to_python3(self):
         """Falls back through candidates until python3 works."""
-        # python3.12, 3.11, 3.10 all fail command -v; python3 succeeds
+        # candidates: 3.13, 3.12, 3.11, 3.10, 3.9, 3 all fail command -v except python3
         sb = _make_sandbox([
+            _exec_result(1),  # python3.13 not found
             _exec_result(1),  # python3.12 not found
             _exec_result(1),  # python3.11 not found
             _exec_result(1),  # python3.10 not found
+            _exec_result(1),  # python3.9 not found
             _exec_result(0),  # python3 found
+            _exec_result(0, stdout="3.9\n"),  # python3 version
             _exec_result(0),  # python3 -m venv --help ok
         ])
         result = _pick_python_interpreter(sb)
@@ -193,20 +196,54 @@ class TestPickPythonInterpreter:
 
     def test_none_if_all_fail(self):
         """Returns None if no candidate is usable."""
-        sb = _make_sandbox([_exec_result(1)] * 4)  # all command -v fail
+        sb = _make_sandbox([_exec_result(1)] * len(_PYTHON_CANDIDATES))  # all command -v fail
         result = _pick_python_interpreter(sb)
         assert result is None
 
     def test_skips_when_venv_not_supported(self):
         """Skips interpreter that can't create a venv."""
         sb = _make_sandbox([
+            _exec_result(0),  # python3.13 found
+            _exec_result(0, stdout="3.13\n"),  # python3.13 version
+            _exec_result(1),  # python3.13 -m venv --help fails
             _exec_result(0),  # python3.12 found
-            _exec_result(1),  # python3.12 -m venv --help fails
-            _exec_result(0),  # python3.11 found
-            _exec_result(0),  # python3.11 -m venv --help ok
+            _exec_result(0, stdout="3.12\n"),  # python3.12 version
+            _exec_result(0),  # python3.12 -m venv --help ok
         ])
         result = _pick_python_interpreter(sb)
-        assert result == "python3.11"
+        assert result == "python3.12"
+
+    def test_specifier_evaluation(self, tmp_path):
+        """Tests for '>=3.8,<3.12', '!=3.12.*', '==3.10.*', '>=3.13', none satisfiable."""
+        def run_with_spec(spec_str):
+            (tmp_path / "pyproject.toml").write_text(f'[project]\nrequires-python = "{spec_str}"\n')
+            sb = MagicMock()
+            sb.root = tmp_path
+            
+            def mock_exec(cmd, **kwargs):
+                if "command -v" in cmd:
+                    return _exec_result(0)
+                if "import sys" in cmd:
+                    # extract 'python3.x' from cmd
+                    for c in _PYTHON_CANDIDATES:
+                        if cmd.startswith(c):
+                            ver = c.replace("python", "")
+                            if not ver or ver == "3":
+                                ver = "3.8"  # fallback
+                            return _exec_result(0, stdout=f"{ver}\n")
+                    return _exec_result(0, stdout="3.9\n")
+                if "venv --help" in cmd:
+                    return _exec_result(0)
+                return _exec_result(1)
+            
+            sb.exec.side_effect = mock_exec
+            return _pick_python_interpreter(sb)
+
+        assert run_with_spec(">=3.8,<3.12") == "python3.11"
+        assert run_with_spec("!=3.12.*") == "python3.13"
+        assert run_with_spec("==3.10.*") == "python3.10"
+        assert run_with_spec(">=3.13") == "python3.13"
+        assert run_with_spec(">=4.0") is None
 
 
 # ---------------------------------------------------------------------------

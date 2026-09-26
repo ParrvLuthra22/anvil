@@ -31,6 +31,14 @@ class IssueRef:
     fetch_error: str = ""
 
 
+@dataclass
+class BaseRefResult:
+    """The result of resolving an issue's pre-fix commit."""
+    ref: str | None
+    reason: str
+    already_fixed: bool
+
+
 # ---------------------------------------------------------------------------
 # URL parsing (no network)
 # ---------------------------------------------------------------------------
@@ -165,6 +173,71 @@ def fetch_issue(ref: IssueRef) -> IssueRef:
     return ref
 
 
+def resolve_base_ref(ref: IssueRef) -> BaseRefResult:
+    """Determine the pre-fix base commit for a given issue.
+    
+    If the issue is already fixed by a merged PR or a direct commit, returns
+    the parent commit of the fix (or the PR's base sha).
+    """
+    timeline_url = f"{_GITHUB_API}/repos/{ref.owner}/{ref.repo}/issues/{ref.number}/timeline"
+    issue_url = f"{_GITHUB_API}/repos/{ref.owner}/{ref.repo}/issues/{ref.number}"
+    
+    try:
+        with _http_client() as client:
+            resp = client.get(issue_url)
+            if resp.status_code == 403:
+                return BaseRefResult(None, "GitHub API rate-limited (HTTP 403)", False)
+            if resp.status_code == 404:
+                return BaseRefResult(None, "Issue not found", False)
+            resp.raise_for_status()
+            issue_data = resp.json()
+            
+            if issue_data.get("state") == "open":
+                return BaseRefResult(None, "Issue is still open", False)
+            
+            # Fetch timeline
+            t_resp = client.get(timeline_url)
+            if t_resp.status_code == 403:
+                return BaseRefResult(None, "GitHub API rate-limited on timeline", True)
+            t_resp.raise_for_status()
+            timeline = t_resp.json()
+            
+            fix_commit = None
+            fix_pr = None
+            
+            for event in timeline:
+                ev_type = event.get("event")
+                if ev_type == "closed" and event.get("commit_id"):
+                    fix_commit = event["commit_id"]
+                    break
+                elif ev_type == "cross-referenced":
+                    issue_src = event.get("source", {}).get("issue", {})
+                    if issue_src.get("pull_request") and issue_src.get("state") == "closed":
+                        if issue_src.get("pull_request", {}).get("merged_at"):
+                            fix_pr = issue_src.get("number")
+                elif ev_type == "connected":
+                    subj = event.get("subject", {})
+                    if subj.get("type") == "pull_request" and subj.get("state") == "merged":
+                        fix_pr = subj.get("number")
+            
+            if fix_commit:
+                return BaseRefResult(f"{fix_commit}^", f"Closed by commit {fix_commit[:7]}", True)
+            
+            if fix_pr:
+                pr_url = f"{_GITHUB_API}/repos/{ref.owner}/{ref.repo}/pulls/{fix_pr}"
+                pr_resp = client.get(pr_url)
+                if pr_resp.status_code == 200:
+                    pr_data = pr_resp.json()
+                    if pr_data.get("merged"):
+                        base_sha = pr_data.get("base", {}).get("sha")
+                        if base_sha:
+                            return BaseRefResult(base_sha, f"Closed by merged PR #{fix_pr}", True)
+                        
+            return BaseRefResult(None, "Issue is closed but no fix commit or PR found", True)
+            
+    except httpx.HTTPError as exc:
+        return BaseRefResult(None, f"Network error resolving base ref: {exc}", False)
+
 # ---------------------------------------------------------------------------
 # Repository clone
 # ---------------------------------------------------------------------------
@@ -201,30 +274,45 @@ def clone_repo(ref: IssueRef, dest: Path, git_ref: str | None = None) -> Path:
     # Disable interactive prompts so private/missing repos fail immediately.
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    # Never pass secrets into git subprocess
     for key in list(env):
         if key in ("AI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
             del env[key]
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=_CLONE_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"git clone timed out after {_CLONE_TIMEOUT}s for {clone_url}. "
-            "The repo may be large or unreachable."
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"git clone failed (exit {result.returncode}) for {clone_url}:\n"
-            f"stderr: {result.stderr[:500]}"
-        )
-
+    if not git_ref:
+        cmd = ["git", "clone", "--depth", "1", clone_url, str(dest)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"git clone timed out for {clone_url}")
+        if result.returncode != 0:
+            raise RuntimeError(f"git clone failed (exit {result.returncode}) for {clone_url}:\nstderr: {result.stderr[:500]}")
+        return dest
+        
+    # If git_ref is provided, init an empty repo and fetch that specific ref
+    subprocess.run(["git", "init", str(dest)], check=True, capture_output=True)
+    
+    # Try shallow fetch first
+    fetch_cmd = ["git", "fetch", "--depth", "1", clone_url, git_ref]
+    res = subprocess.run(fetch_cmd, cwd=dest, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
+    
+    if res.returncode != 0:
+        # Fall back to a deeper fetch
+        fetch_cmd = ["git", "fetch", "--deepen", "100", clone_url, git_ref]
+        res = subprocess.run(fetch_cmd, cwd=dest, capture_output=True, text=True, timeout=_CLONE_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
+        
+    if res.returncode != 0:
+        # If it still fails, we might just be failing to fetch a raw SHA directly if the server forbids it.
+        # Let's try a full clone and checkout.
+        import shutil
+        shutil.rmtree(dest)
+        subprocess.run(["git", "clone", clone_url, str(dest)], check=True, capture_output=True, env=env)
+        res = subprocess.run(["git", "checkout", git_ref], cwd=dest, capture_output=True, text=True, env=env)
+        if res.returncode != 0:
+            raise RuntimeError(f"git checkout {git_ref} failed:\nstderr: {res.stderr[:500]}")
+        return dest
+        
+    checkout_res = subprocess.run(["git", "checkout", "FETCH_HEAD"], cwd=dest, capture_output=True, text=True, env=env)
+    if checkout_res.returncode != 0:
+        raise RuntimeError(f"git checkout FETCH_HEAD failed for {git_ref}:\nstderr: {checkout_res.stderr[:500]}")
+    
     return dest

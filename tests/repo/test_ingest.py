@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from anvil.repo.ingest import IssueRef, clone_repo, fetch_issue, parse_issue_url
+from anvil.repo.ingest import IssueRef, clone_repo, fetch_issue, parse_issue_url, resolve_base_ref, BaseRefResult
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +258,91 @@ class TestCloneRepo:
 
 
 # ---------------------------------------------------------------------------
+# resolve_base_ref
+# ---------------------------------------------------------------------------
+
+class TestResolveBaseRef:
+    def _ref(self):
+        return parse_issue_url("https://github.com/a/b/issues/1")
+        
+    @patch("anvil.repo.ingest._http_client")
+    def test_open_issue(self, mock_client_factory):
+        issue_resp = _make_mock_response(200, {"state": "open"})
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.get.return_value = issue_resp
+        mock_client_factory.return_value = cm
+        
+        result = resolve_base_ref(self._ref())
+        assert result.ref is None
+        assert "open" in result.reason.lower()
+        assert result.already_fixed is False
+
+    @patch("anvil.repo.ingest._http_client")
+    def test_closed_by_commit(self, mock_client_factory):
+        issue_resp = _make_mock_response(200, {"state": "closed"})
+        timeline_resp = _make_mock_response(200, [
+            {"event": "closed", "commit_id": "abcdef123456"}
+        ])
+        
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.get.side_effect = [issue_resp, timeline_resp]
+        mock_client_factory.return_value = cm
+        
+        result = resolve_base_ref(self._ref())
+        assert result.ref == "abcdef123456^"
+        assert result.already_fixed is True
+        assert "abcdef1" in result.reason
+        
+    @patch("anvil.repo.ingest._http_client")
+    def test_closed_by_pr(self, mock_client_factory):
+        issue_resp = _make_mock_response(200, {"state": "closed"})
+        timeline_resp = _make_mock_response(200, [
+            {
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "pull_request": {"merged_at": "2024-01-01"},
+                        "state": "closed",
+                        "number": 42
+                    }
+                }
+            }
+        ])
+        pr_resp = _make_mock_response(200, {
+            "merged": True,
+            "base": {"sha": "basesha123"}
+        })
+        
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.get.side_effect = [issue_resp, timeline_resp, pr_resp]
+        mock_client_factory.return_value = cm
+        
+        result = resolve_base_ref(self._ref())
+        assert result.ref == "basesha123"
+        assert result.already_fixed is True
+        assert "42" in result.reason
+
+    @patch("anvil.repo.ingest._http_client")
+    def test_rate_limited(self, mock_client_factory):
+        issue_resp = _make_mock_response(403)
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.get.return_value = issue_resp
+        mock_client_factory.return_value = cm
+        
+        result = resolve_base_ref(self._ref())
+        assert result.ref is None
+        assert "rate-limited" in result.reason.lower()
+        assert result.already_fixed is False
+
+# ---------------------------------------------------------------------------
 # Regression tests for Bug 5 (ingest hardening)
 # ---------------------------------------------------------------------------
 
@@ -374,15 +459,23 @@ class TestBug5IngestHardening:
                 clone_repo(ref, dest)
 
     def test_clone_repo_with_git_ref(self, tmp_path):
-        """Bug 5: git_ref kwarg passes --branch to git clone."""
+        """Bug 5: git_ref kwarg does init + fetch."""
         dest = tmp_path / "r"
         ref = parse_issue_url("https://github.com/psf/requests/issues/1")
         with patch("anvil.repo.ingest.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             clone_repo(ref, dest, git_ref="v2.31.0")
-            call_args = mock_run.call_args[0][0]
-            assert "--branch" in call_args
-            assert "v2.31.0" in call_args
+            
+            # Since git_ref was used, the first call should be git init
+            calls = mock_run.call_args_list
+            assert len(calls) >= 3
+            assert ["git", "init"] == calls[0][0][0][:2]
+            
+            # Second call should be git fetch --depth 1
+            fetch_cmd = calls[1][0][0]
+            assert "fetch" in fetch_cmd
+            assert "--depth" in fetch_cmd
+            assert "v2.31.0" in fetch_cmd
 
     def test_clone_no_git_ref_no_branch_flag(self, tmp_path):
         """Without git_ref, --branch must not appear in the command."""
