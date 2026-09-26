@@ -233,6 +233,33 @@ async def test_live_trace_readable_mid_run(tmp_path: Path):
     assert len(loaded) == 3
 
 
+@pytest.mark.asyncio
+async def test_entrypoint_recorder_writes_trace_before_run_finishes(tmp_path: Path):
+    """The production recorder wiring flushes events while a run is active."""
+    import asyncio
+
+    from anvil.__main__ import _make_event_bus, _wire_recorder
+
+    bus = _make_event_bus()
+    trace = tmp_path / "output" / "trace.jsonl"
+    _wire_recorder(bus, trace)
+
+    bus.emit(_make_event("phase", Phase.INGEST, {"name": "ingest"}))
+    # Let the actual _wire_recorder drain task consume and flush the event.
+    for _ in range(20):
+        await asyncio.sleep(0.005)
+        if trace.exists() and trace.stat().st_size:
+            break
+    assert len(trace.read_text().splitlines()) == 1
+
+    bus.emit(_make_event("done", None, {"steps": 1}))
+    for _ in range(20):
+        await asyncio.sleep(0.005)
+        if len(trace.read_text().splitlines()) == 2:
+            break
+    assert len(list(TraceRecorder.load(trace))) == 2
+
+
 def test_main_make_event_bus_returns_events_event_bus():
     """_make_event_bus() in __main__.py returns anvil.events.EventBus."""
     from anvil.__main__ import _make_event_bus
