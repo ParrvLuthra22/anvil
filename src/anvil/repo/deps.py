@@ -239,40 +239,39 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | Non
     install_cmd = profile.install_cmd
     assert install_cmd is not None
     
-    # Try uv if available
+    # Task 1: Try uv with --exclude-newer if available, else plain pip, then test collection fallback
     uv_path = f"{venv_path}/bin/uv"
     uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
+    
+    strategies = []
     if uv_probe.exit_code == 0:
         uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
         if as_of:
             uv_cmd += f" --exclude-newer {as_of}"
-        install_cmd = install_cmd.replace("pip install", uv_cmd, 1)
-    else:
-        # Fallback to pip
-        install_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
+        strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
+    
+    strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
 
-    log.info("Running Python install: %s", install_cmd)
-    result = sandbox.exec(install_cmd, timeout=_INSTALL_TIMEOUT)
+    result = None
+    used_strategy = None
+    for strategy_name, cmd in strategies:
+        log.info("Running Python install strategy %s: %s", strategy_name, cmd)
+        result = sandbox.exec(cmd, timeout=_INSTALL_TIMEOUT)
+        
+        if result.exit_code == 0 and not result.timed_out:
+            used_strategy = strategy_name
+            break
+        else:
+            log.debug("Install strategy %s failed (exit %s).", strategy_name, result.exit_code)
 
-    if result.timed_out:
+    if result is None or result.timed_out or result.exit_code != 0:
         return DepsResult(
             ok=False,
             report=(
-                f"Install timed out after {_INSTALL_TIMEOUT}s. "
-                f"Command: {install_cmd}\n"
-                f"Partial stdout: {result.stdout[:400]}"
-            ),
-            venv_python=venv_python,
-        )
-
-    if result.exit_code != 0:
-        return DepsResult(
-            ok=False,
-            report=(
-                f"Install failed (exit {result.exit_code}).\n"
-                f"Command: {install_cmd}\n"
-                f"stdout: {result.stdout[:400]}\n"
-                f"stderr: {result.stderr[:400]}"
+                f"Install failed after trying all strategies.\n"
+                f"Command: {cmd if result else 'None'}\n"
+                f"stdout: {result.stdout[:400] if result else ''}\n"
+                f"stderr: {result.stderr[:400] if result else ''}"
             ),
             venv_python=venv_python,
         )
@@ -284,10 +283,21 @@ def _ensure_python_deps(sandbox: Sandbox, profile: RepoProfile, as_of: str | Non
             f"{venv_pip} install --quiet {test_framework_pkg}",
             timeout=60,
         )
+        
+        if test_framework_pkg == "pytest":
+            collect = sandbox.exec(f"{venv_python} -m pytest --collect-only", timeout=60)
+            if collect.exit_code != 0:
+                log.info("pytest collection failed, falling back to older pytest constraint")
+                # fallback to pytest<7 (known good era for many old python repos)
+                sandbox.exec(
+                    f"{venv_pip} install --quiet \"pytest<7\"",
+                    timeout=60,
+                )
+                used_strategy = f"{used_strategy}_with_pytest_fallback"
 
     return DepsResult(
         ok=True,
-        report=f"Python deps installed into {venv_path}/ using {interp}.",
+        report=f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy}).",
         venv_python=venv_python,
     )
 
