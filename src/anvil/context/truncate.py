@@ -33,6 +33,16 @@ def truncate_output(text: str, cap: int) -> str:
     return f"{''.join(head)}[{omitted} {noun} omitted]\n{''.join(tail)}"
 
 
+def clip_lines(text: str, limit: int) -> str:
+    """Keep the leading whole lines of ``text`` that fit in ``limit`` characters, noting how many were left out."""
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines(keepends=True)
+    kept = _take(lines, limit)
+    left = len(lines) - len(kept)
+    return f"{''.join(kept)}[{left} more {'line' if left == 1 else 'lines'} omitted]"
+
+
 def _take(lines: list[str], budget: int) -> list[str]:
     """The longest prefix of ``lines`` that fits in ``budget`` characters."""
     taken: list[str] = []
