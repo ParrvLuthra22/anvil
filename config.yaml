@@ -29,5 +29,19 @@ wall_clock_seconds: 1800
 # Maximum characters of any single tool/shell output fed back to the model.
 tool_output_char_cap: 8000
 
+# Recovery: after this many failed PATCH/VERIFY attempts the tree is rolled back to the
+# checkpoint taken at the start of PATCH and the model must try a different hypothesis.
+# After max_rollbacks rollbacks the run stops trying and reports low confidence.
+max_patch_attempts: 3
+max_rollbacks: 2
+
+# Timeout for commands the harness itself runs (repro checks) and where run artifacts go.
+command_timeout_seconds: 120
+output_dir: output
+
+# Optional cost reporting (USD per million tokens). 0 = free tier / unknown.
+cost_per_million_prompt_tokens: 0
+cost_per_million_completion_tokens: 0
+
 # Sandbox backend: auto (docker if available, else worktree) | worktree | docker
 sandbox: auto
