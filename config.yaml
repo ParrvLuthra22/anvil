@@ -51,7 +51,7 @@ wall_clock_seconds: 1800
 # keeps its head and tail with a "[N lines omitted]" marker.
 tool_output_char_cap: 8000
 
-# Feature switches. Each is on unless set to false, and off gives exactly the behaviour from before it existed.
+# Feature switches. The value shown is the default; a switch that is off gives exactly the behaviour from before it existed.
 features:
   # Spend fewer tokens per model call: read_file results over token_saving.read_file_max_lines are cut to their first
   # lines plus an outline; every phase gets a call cap, after which the harness forces its phase_done; old tool output
@@ -59,7 +59,8 @@ features:
   token_budgets: true
   # Extra PATCH and REVIEW rules for models that are careless about conventions: raise the most specific built-in
   # exception with a clear message (never assert), follow how the module reports similar errors, keep changes minimal.
-  weak_model_prompts: true
+  # OFF pending measurement on real instances (a toy-repo A/B showed no clear gain); turn it on only with evidence.
+  weak_model_prompts: false
   # Before FINALIZE, check the patch itself: it must not be empty, must apply (git apply --check) in a scratch worktree
   # at the base commit, and must not edit test files unless the issue is about tests (those changes are taken out of it).
   # An empty or non-applying patch gets ONE forced-fix retry with the reason in the prompt; the outcome is in report.md.

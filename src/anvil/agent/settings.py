@@ -19,8 +19,9 @@ DEFAULT_READ_FILE_HEAD_LINES = 60
 DEFAULT_TOKEN_SAVING_KEEP_STEPS = 3
 DEFAULT_TOKEN_SAVING_OUTPUT_CAP = 4000
 DEFAULT_REPO_MAP_CHARS = 3000
-# The features and whether each is on when ``config.yaml`` does not say. nav_tools is off until its token effect is measured.
-_FEATURE_DEFAULTS = {"token_budgets": True, "weak_model_prompts": True, "patch_sanity": True, "nav_tools": False}
+# The features and whether each is on when ``config.yaml`` does not say. weak_model_prompts and nav_tools are off until
+# a real-instance measurement shows they help.
+_FEATURE_DEFAULTS = {"token_budgets": True, "weak_model_prompts": False, "patch_sanity": True, "nav_tools": False}
 _LEGACY_OUTPUT_CAP = 8000  # the value used for tool_output_char_cap when it is absent and token_budgets is off
 
 
@@ -47,7 +48,7 @@ class AgentSettings:
     cost_per_million_prompt_tokens: float = 0.0
     cost_per_million_completion_tokens: float = 0.0
     token_budgets: bool = True
-    weak_model_prompts: bool = True
+    weak_model_prompts: bool = False
     patch_sanity: bool = True
     nav_tools: bool = False
     read_file_max_lines: int = DEFAULT_READ_FILE_MAX_LINES

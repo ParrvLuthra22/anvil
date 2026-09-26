@@ -47,7 +47,7 @@ def test_the_tools_are_added_after_the_ones_the_phase_already_had(phase):
 def test_the_switch_is_read_from_the_config_and_independent_of_the_others():
     on = AgentSettings.from_mapping({"features": {"nav_tools": True}})
     assert on.nav_tools is True and AgentSettings.from_mapping({"features": {"nav_tools": False}}).nav_tools is False
-    assert on.token_budgets and on.weak_model_prompts and on.patch_sanity, "turning it on changes nothing else"
+    assert on.token_budgets and on.patch_sanity and not on.weak_model_prompts, "turning it on changes nothing else"
     off_others = AgentSettings.from_mapping({"features": {"nav_tools": True, "token_budgets": False}})
     assert off_others.nav_tools is True and off_others.token_budgets is False
 

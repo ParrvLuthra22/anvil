@@ -38,9 +38,9 @@ def test_the_flag_selects_the_table(phase):
     assert WEAK_PHASE_SPECS[phase].system_prompt != PHASE_SPECS[phase].system_prompt
 
 
-def test_a_whole_run_sends_the_short_prompts_by_default_and_the_old_ones_with_the_switch_off(tmp_path):
-    short = execute(happy(), tmp_path / "a")
-    old = execute(happy(), tmp_path / "b", features={"weak_model_prompts": False})
+def test_a_whole_run_sends_the_old_prompts_by_default_and_the_short_ones_only_with_the_switch_on(tmp_path):
+    short = execute(happy(), tmp_path / "a", features={"weak_model_prompts": True})
+    old = execute(happy(), tmp_path / "b")
 
     assert all(m[0]["content"].startswith(WEAK_BASE_START) for m, _ in short.llm.calls)
     assert all(m[0]["content"].startswith(OLD_BASE_START) for m, _ in old.llm.calls)
@@ -49,7 +49,7 @@ def test_a_whole_run_sends_the_short_prompts_by_default_and_the_old_ones_with_th
         assert run.llm.remaining == 0
 
 
-def test_the_other_scenarios_still_pass_with_the_short_prompts(tmp_path):
+def test_the_other_scenarios_still_pass_with_the_short_prompts_switched_on(tmp_path):
     script = (
         understand() + localize() + reproduce()
         + wrong_patch("return a - b", "return a * b", "multiplied")
@@ -57,7 +57,7 @@ def test_the_other_scenarios_still_pass_with_the_short_prompts(tmp_path):
         + wrong_patch("return a ** b", "return a // b", "floor")
         + good_patch() + verify() + review_ok() + finalize()
     )
-    rollback = execute(script, tmp_path / "r", max_patch_attempts=3, max_rollbacks=1)
+    rollback = execute(script, tmp_path / "r", max_patch_attempts=3, max_rollbacks=1, features={"weak_model_prompts": True})
     assert "rollbacks: 1" in rollback.report and "Verified after patching: yes" in rollback.report
     assert all(m[0]["content"].startswith(WEAK_BASE_START) for m, _ in rollback.llm.calls)
 

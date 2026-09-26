@@ -1,5 +1,7 @@
 """The ``features`` switches and the ``token_saving`` numbers in config.yaml, and how they change the effective settings."""
 
+from pathlib import Path
+
 import pytest
 
 from anvil.agent.orchestrator import load_config
@@ -12,13 +14,27 @@ def settings(**config) -> AgentSettings:
     return AgentSettings.from_mapping(config)
 
 
-def test_both_features_are_on_by_default_and_in_the_shipped_config():
-    on_by_default = ("token_budgets", "weak_model_prompts", "patch_sanity")
-    assert all(getattr(settings(), flag) is True for flag in on_by_default)
-    shipped = AgentSettings.from_mapping(load_config())
-    assert all(getattr(shipped, flag) is True for flag in on_by_default)
-    assert load_config()["features"] == {"token_budgets": True, "weak_model_prompts": True, "patch_sanity": True, "nav_tools": False}
-    assert settings().nav_tools is False and shipped.nav_tools is False, "the one switch that is off until measured"
+# The agreed defaults: two switches on, two off until a measurement on real instances shows they help.
+FEATURE_DEFAULTS = {"token_budgets": True, "patch_sanity": True, "weak_model_prompts": False, "nav_tools": False}
+
+
+@pytest.mark.parametrize("flag, expected", FEATURE_DEFAULTS.items())
+def test_each_feature_default_is_pinned_in_the_code_and_in_the_shipped_config(flag, expected):
+    assert getattr(AgentSettings(), flag) is expected, f"the dataclass default of {flag}"
+    assert getattr(settings(), flag) is expected, f"{flag} when config.yaml does not mention it"
+    assert getattr(settings(features={}), flag) is expected, f"{flag} when the features: section is empty"
+    assert load_config()["features"][flag] is expected, f"{flag} in the shipped config.yaml"
+    assert getattr(AgentSettings.from_mapping(load_config()), flag) is expected
+
+
+def test_the_shipped_features_section_names_exactly_the_four_switches():
+    assert load_config()["features"] == FEATURE_DEFAULTS
+
+
+def test_the_shipped_config_says_why_weak_model_prompts_is_off():
+    lines = (Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8").splitlines()
+    at = next(i for i, line in enumerate(lines) if line.strip() == "weak_model_prompts: false")
+    assert "pending" in lines[at - 1] and "real instances" in lines[at - 1], "a one-line comment right above the switch"
 
 
 def test_the_shipped_phase_caps_are_the_agreed_ones():
@@ -59,10 +75,12 @@ def test_the_numbers_can_be_changed_in_the_config():
     assert custom.call_cap("review") == 3, "a phase left out keeps its default"
 
 
-def test_features_can_be_switched_off_one_at_a_time():
-    assert settings(features={"weak_model_prompts": False}).token_budgets is True
-    assert settings(features={"weak_model_prompts": False}).weak_model_prompts is False
-    assert settings(features={"token_budgets": False}).weak_model_prompts is True
+def test_features_are_switched_one_at_a_time_and_do_not_affect_each_other():
+    only_prompts = settings(features={"weak_model_prompts": True})
+    assert only_prompts.weak_model_prompts is True and only_prompts.token_budgets is True and only_prompts.patch_sanity is True
+    no_budgets = settings(features={"token_budgets": False})
+    assert no_budgets.token_budgets is False and no_budgets.weak_model_prompts is False and no_budgets.patch_sanity is True
+    assert settings(features={"patch_sanity": False}).token_budgets is True
     assert settings(features=None).token_budgets is True, "an empty features: key in YAML is not an error"
 
 

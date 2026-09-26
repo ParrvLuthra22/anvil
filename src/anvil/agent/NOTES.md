@@ -169,7 +169,7 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
   - `context_keep_steps` and `tool_output_char_cap` are only ever tightened (to 3 and 4000), and the repository map is
     `token_saving.repo_map_chars` (3000) instead of 6000 characters.
   - `report.md` gets a "Tokens by phase" table (calls, prompt and completion tokens, prompt tokens per call, and a total).
-- **`weak_model_prompts`**: every phase gets a shorter system prompt (a third fewer characters overall): one shared list of
+- **`weak_model_prompts`** (**off by default**, pending a measurement on real instances): with it on, every phase gets a shorter system prompt (a third fewer characters overall): one shared list of
   rules (exactly ONE tool call per turn, read a file before editing it, smallest change that fixes the issue, never edit
   tests, end with `phase_done`) and one example call per phase, which a test parses against the real tool schemas. PATCH and
   REVIEW add how errors are raised: the most specific built-in exception with a clear message, never `assert` for input
