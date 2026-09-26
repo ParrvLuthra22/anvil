@@ -98,147 +98,25 @@ def _git_env() -> dict[str, str]:
     return env
 
 
-def _clone_at_commit(repo: str, base_commit: str, dest: Path) -> tuple[bool, str]:
-    """Clone repo at a specific SHA. Returns (ok, error_msg)."""
-    url = f"https://github.com/{repo}.git"
-    env = _git_env()
-    dest.mkdir(parents=True, exist_ok=True)
+from anvil.repo.ingest import clone_repo, IssueRef
+from anvil.sandbox.worktree import WorktreeSandbox
+from anvil.repo.profile import profile_repo
+from anvil.repo.deps import ensure_deps
 
-    # Try: init + shallow fetch of exact SHA
-    subprocess.run(["git", "init"], cwd=dest, capture_output=True, env=env, timeout=15)
-    r = subprocess.run(
-        ["git", "fetch", "--depth", "1", url, base_commit],
-        cwd=dest, capture_output=True, text=True, timeout=120, env=env,
-    )
-    if r.returncode == 0:
-        co = subprocess.run(
-            ["git", "checkout", "FETCH_HEAD"],
-            cwd=dest, capture_output=True, text=True, timeout=30, env=env,
-        )
-        if co.returncode == 0:
-            return True, ""
-
-    # Fallback: full shallow clone + checkout
-    shutil.rmtree(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    r2 = subprocess.run(
-        ["git", "clone", "--depth", "50", url, str(dest)],
-        capture_output=True, text=True, timeout=180, env=env,
-    )
-    if r2.returncode != 0:
-        return False, f"git clone: {r2.stderr[:300]}"
-    co2 = subprocess.run(
-        ["git", "checkout", base_commit],
-        cwd=dest, capture_output=True, text=True, timeout=30, env=env,
-    )
-    if co2.returncode != 0:
-        return False, f"git checkout: {co2.stderr[:200]}"
-    return True, ""
-
-
-def _pick_python(repo_dir: Path) -> str | None:
-    """Return path to a working python3 interpreter."""
-    for cand in PYTHON_CANDIDATES:
-        r = subprocess.run(["which", cand], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    return None
-
-
-def _create_venv(repo_dir: Path, interp: str) -> tuple[str | None, str]:
-    """Create .anvil_venv inside repo_dir. Returns (python_path, error)."""
-    venv_dir = repo_dir / ".anvil_venv"
-    if venv_dir.exists():
-        shutil.rmtree(venv_dir)
-    r = subprocess.run(
-        [interp, "-m", "venv", str(venv_dir)],
-        capture_output=True, text=True, timeout=60,
-    )
-    if r.returncode != 0:
-        return None, f"venv create: {r.stderr[:200]}"
-    return str(venv_dir / "bin" / "python"), ""
-
-
-# Common test infrastructure packages always installed into the venv.
-_TEST_PKGS = ["pytest", "pytest-xdist", "pytest-timeout", "hypothesis"]
-# Repo-specific extra requirements files to install if present.
-_REQ_FILES = [
-    "requirements-test.txt", "requirements_test.txt",
-    "requirements-dev.txt",  "requirements_dev.txt",
-    "requirements-testing.txt",
-]
-
-
-def _pip_install(venv_python: str, repo_dir: Path) -> tuple[bool, str]:
-    """Install repo + test infrastructure in venv. Returns (ok, report)."""
-    env = _git_env()
-    env.pop("GITHUB_TOKEN", None)
-
-    # Upgrade pip (silently)
-    subprocess.run(
-        [venv_python, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-        capture_output=True, cwd=repo_dir, timeout=60, env=env,
-    )
-
-    # Install project: try extras in order, settle for plain -e .
-    installed_extras = False
-    for extras in [".[test]", ".[testing]", ".[dev]", ".[tests]", "."]:
-        r = subprocess.run(
-            [venv_python, "-m", "pip", "install", "--quiet", "-e", extras],
-            capture_output=True, text=True, cwd=repo_dir, timeout=180, env=env,
-        )
-        if r.returncode == 0:
-            installed_extras = True
-            break
-
-    if not installed_extras:
-        # Last resort: setup.py develop
-        setup_py = repo_dir / "setup.py"
-        if setup_py.exists():
-            r2 = subprocess.run(
-                [venv_python, "setup.py", "develop"],
-                capture_output=True, text=True, cwd=repo_dir, timeout=180, env=env,
-            )
-            if r2.returncode != 0:
-                return False, f"setup.py develop failed: {r2.stderr[-300:]}"
-        else:
-            return False, f"all install attempts failed: {r.stderr[-300:]}"
-
-    # Always install pytest + common test infrastructure
-    subprocess.run(
-        [venv_python, "-m", "pip", "install", "--quiet"] + _TEST_PKGS,
-        capture_output=True, cwd=repo_dir, timeout=120, env=env,
-    )
-
-    # Install any repo-level requirements-test / requirements-dev files
-    for req_name in _REQ_FILES:
-        req_path = repo_dir / req_name
-        if req_path.exists():
-            subprocess.run(
-                [venv_python, "-m", "pip", "install", "--quiet", "-r", req_name],
-                capture_output=True, cwd=repo_dir, timeout=120, env=env,
-            )
-
-    return True, "install OK"
-
-
-def _apply_patch(patch_text: str, repo_dir: Path) -> tuple[bool, str]:
-    """Apply a unified diff to repo_dir using 'patch -p1'. Returns (ok, stderr)."""
-    env = _git_env()
-    r = subprocess.run(
-        ["patch", "-p1", "--forward", "--batch", "--no-backup-if-mismatch"],
-        input=patch_text, text=True, capture_output=True,
-        cwd=repo_dir, timeout=30, env=env,
-    )
-    if r.returncode == 0:
+def _apply_patch(patch_text: str, sandbox: WorktreeSandbox) -> tuple[bool, str]:
+    """Apply a unified diff using patch -p1."""
+    # Write patch to a temporary file in the sandbox
+    sandbox.write_file(".anvil_temp.patch", patch_text)
+    res = sandbox.exec("patch -p1 --forward --batch --no-backup-if-mismatch < .anvil_temp.patch", timeout=30)
+    sandbox.exec("rm -f .anvil_temp.patch")
+    if res.exit_code == 0:
         return True, ""
+    
     # Try git apply as fallback
-    r2 = subprocess.run(
-        ["git", "apply", "--reject", "-"],
-        input=patch_text, text=True, capture_output=True,
-        cwd=repo_dir, timeout=30, env=env,
-    )
-    return r2.returncode == 0, (r2.stderr or r.stderr)[:400]
+    sandbox.write_file(".anvil_temp.patch", patch_text)
+    res2 = sandbox.exec("git apply --reject .anvil_temp.patch", timeout=30)
+    sandbox.exec("rm -f .anvil_temp.patch")
+    return res2.exit_code == 0, (res2.stderr or res.stderr)[:400]
 
 
 def _build_test_cmd(venv_python: str, repo: str, test_ids: list[str]) -> str:
@@ -255,16 +133,6 @@ def _build_test_cmd(venv_python: str, repo: str, test_ids: list[str]) -> str:
     return f"{venv_python} -m pytest -x -q --tb=short {ids}"
 
 
-def _run_cmd(cmd: str, cwd: Path, timeout: int) -> tuple[bool, str]:
-    env = _git_env()
-    r = subprocess.run(
-        cmd, shell=True, capture_output=True, text=True,
-        cwd=cwd, timeout=timeout, env=env,
-    )
-    out = (r.stdout + "\n" + r.stderr).strip()
-    return r.returncode == 0, out[-800:]
-
-
 def _difficulty_hint(patch: str) -> str:
     adds = sum(1 for ln in patch.splitlines()
                if ln.startswith("+") and not ln.startswith("+++"))
@@ -274,11 +142,14 @@ def _difficulty_hint(patch: str) -> str:
     return "hard"
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # Gold check — operates directly on repo_dir (no WorktreeSandbox)
 # ---------------------------------------------------------------------------
 def gold_check(inst: dict[str, Any], workdir: Path, verbose: bool) -> dict[str, Any]:
-    """Run full 6-step gold check. Never raises."""
+    """Run full 6-step gold check using WorktreeSandbox. Never raises."""
     iid    = inst["instance_id"]
     repo   = inst["repo"]
     base   = inst["base_commit"]
@@ -291,93 +162,113 @@ def gold_check(inst: dict[str, Any], workdir: Path, verbose: bool) -> dict[str, 
         return {"ok": False, "error": msg, "notes": "",
                 "install_seconds": install_s, "venv_python": None, "test_cmd": ""}
 
-    repo_dir = workdir / iid
-    if repo_dir.exists():
-        shutil.rmtree(repo_dir)
+    owner, repo_name = repo.split("/", 1)
+    # Use a persistent cache for the clone
+    repo_cache_dir = workdir / repo.replace("/", "_")
+    work_dir = workdir / iid
 
     t0 = time.time()
 
     # [1] Clone
     if verbose:
         print(f"    [1] clone {repo}@{base[:8]}", flush=True)
-    ok, err = _clone_at_commit(repo, base, repo_dir)
-    if not ok:
-        return _fail(f"clone: {err}")
+    
+    if not repo_cache_dir.exists():
+        repo_cache_dir.mkdir(parents=True, exist_ok=True)
+        clone_url = f"https://github.com/{owner}/{repo_name}.git"
+        res = subprocess.run(["git", "clone", clone_url, str(repo_cache_dir)], capture_output=True, text=True)
+        if res.returncode != 0:
+            return _fail(f"clone: {res.stderr[:200]}")
 
-    # [2] Install deps
-    if verbose:
-        print("    [2] install deps", flush=True)
-    interp = _pick_python(repo_dir)
-    if not interp:
-        return _fail("no python3 found on PATH")
-    t_deps = time.time()
-    venv_python, venv_err = _create_venv(repo_dir, interp)
-    if not venv_python:
-        return _fail(f"venv: {venv_err}")
-    pip_ok, pip_report = _pip_install(venv_python, repo_dir)
-    install_s = round(time.time() - t_deps, 1)
-    if not pip_ok:
-        return _fail(f"deps: {pip_report}", install_s)
-
-    ftp_cmd = _build_test_cmd(venv_python, repo, ftp)
-    ptp_cmd = _build_test_cmd(venv_python, repo, ptp) if ptp else None
-
-    # [3] Apply test_patch
-    if verbose:
-        print("    [3] apply test_patch", flush=True)
-    ok_tp, tp_err = _apply_patch(tpatch, repo_dir)
-    if not ok_tp:
-        return {"ok": False, "error": f"test_patch: {tp_err}", "notes": "",
-                "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
-
-    # [4] FAIL_TO_PASS must FAIL before gold
-    if verbose:
-        print(f"    [4] FAIL_TO_PASS (must fail pre-gold): {ftp_cmd[:70]}", flush=True)
+    sb = WorktreeSandbox(repo_root=repo_cache_dir, work_dir=work_dir)
     try:
-        pre_pass, pre_out = _run_cmd(ftp_cmd, repo_dir, TEST_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        pre_pass, pre_out = False, "TIMEOUT"
-    if pre_pass:
-        return {"ok": False, "error": "FAIL_TO_PASS passed before gold (test doesn't cover bug)",
-                "notes": pre_out[-300:], "install_seconds": install_s,
-                "venv_python": venv_python, "test_cmd": ftp_cmd}
+        # make sure we are at base_commit
+        checkout_res = sb.exec(f"git checkout {base}", timeout=30)
+        if checkout_res.exit_code != 0:
+            return _fail(f"checkout: {checkout_res.stderr[:200]}")
 
-    # [5] Apply gold patch
-    if verbose:
-        print("    [5] apply gold patch", flush=True)
-    ok_gp, gp_err = _apply_patch(gpatch, repo_dir)
-    if not ok_gp:
-        return {"ok": False, "error": f"gold patch: {gp_err}", "notes": "",
-                "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
-
-    # [6] FAIL_TO_PASS must PASS after gold
-    if verbose:
-        print("    [6] FAIL_TO_PASS (must pass post-gold)", flush=True)
-    try:
-        post_pass, post_out = _run_cmd(ftp_cmd, repo_dir, TEST_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        post_pass, post_out = False, "TIMEOUT"
-    if not post_pass:
-        return {"ok": False, "error": "FAIL_TO_PASS still fails after gold patch",
-                "notes": post_out[-300:], "install_seconds": install_s,
-                "venv_python": venv_python, "test_cmd": ftp_cmd}
-
-    # [7] PASS_TO_PASS smoke
-    if ptp and ptp_cmd:
+        # [2] Install deps
         if verbose:
-            print(f"    [7] PASS_TO_PASS smoke ({len(ptp)} tests)", flush=True)
-        try:
-            ptp_pass, ptp_out = _run_cmd(ptp_cmd, repo_dir, TEST_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            ptp_pass, ptp_out = False, "TIMEOUT"
-        if not ptp_pass:
-            return {"ok": False, "error": "PASS_TO_PASS smoke failed after gold",
-                    "notes": ptp_out[-300:], "install_seconds": install_s,
+            print("    [2] install deps", flush=True)
+        t_deps = time.time()
+        profile = profile_repo(work_dir)
+        deps_res = ensure_deps(sb, profile)
+        install_s = round(time.time() - t_deps, 1)
+        if not deps_res.ok:
+            return _fail(f"deps: {deps_res.report}", install_s)
+        
+        venv_python = deps_res.venv_python or "python3" # Fallback if not python? 
+        
+        ftp_cmd = _build_test_cmd(venv_python, repo, ftp)
+        ptp_cmd = _build_test_cmd(venv_python, repo, ptp) if ptp else None
+
+        # [3] Apply test_patch
+        if verbose:
+            print("    [3] apply test_patch", flush=True)
+        ok_tp, tp_err = _apply_patch(tpatch, sb)
+        if not ok_tp:
+            return {"ok": False, "error": f"test_patch: {tp_err}", "notes": "",
+                    "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
+
+        # [4] FAIL_TO_PASS must FAIL before gold
+        if verbose:
+            print(f"    [4] FAIL_TO_PASS (must fail pre-gold): {ftp_cmd[:70]}", flush=True)
+        pre_res = sb.exec(ftp_cmd, timeout=TEST_TIMEOUT)
+        pre_pass = pre_res.exit_code == 0
+        pre_out = (pre_res.stdout + "\\n" + pre_res.stderr).strip()
+        if pre_pass:
+            return {"ok": False, "error": "FAIL_TO_PASS passed before gold (test doesn't cover bug)",
+                    "notes": pre_out[-300:], "install_seconds": install_s,
+                    "venv_python": venv_python, "test_cmd": ftp_cmd}
+        elif pre_res.timed_out:
+            return {"ok": False, "error": "FAIL_TO_PASS timed out pre-gold",
+                    "notes": pre_out[-300:], "install_seconds": install_s,
                     "venv_python": venv_python, "test_cmd": ftp_cmd}
 
-    elapsed = round(time.time() - t0, 1)
-    return {"ok": True, "error": "", "notes": f"install={install_s:.0f}s total={elapsed:.0f}s",
-            "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
+        # [5] Apply gold patch
+        if verbose:
+            print("    [5] apply gold patch", flush=True)
+        ok_gp, gp_err = _apply_patch(gpatch, sb)
+        if not ok_gp:
+            return {"ok": False, "error": f"gold patch: {gp_err}", "notes": "",
+                    "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
+
+        # [6] FAIL_TO_PASS must PASS after gold
+        if verbose:
+            print("    [6] FAIL_TO_PASS (must pass post-gold)", flush=True)
+        post_res = sb.exec(ftp_cmd, timeout=TEST_TIMEOUT)
+        post_pass = post_res.exit_code == 0
+        post_out = (post_res.stdout + "\\n" + post_res.stderr).strip()
+        if not post_pass:
+            return {"ok": False, "error": "FAIL_TO_PASS still fails after gold patch",
+                    "notes": post_out[-300:], "install_seconds": install_s,
+                    "venv_python": venv_python, "test_cmd": ftp_cmd}
+        elif post_res.timed_out:
+            return {"ok": False, "error": "FAIL_TO_PASS timed out post-gold",
+                    "notes": post_out[-300:], "install_seconds": install_s,
+                    "venv_python": venv_python, "test_cmd": ftp_cmd}
+
+        # [7] PASS_TO_PASS smoke
+        if ptp and ptp_cmd:
+            if verbose:
+                print(f"    [7] PASS_TO_PASS smoke ({len(ptp)} tests)", flush=True)
+            ptp_res = sb.exec(ptp_cmd, timeout=TEST_TIMEOUT)
+            ptp_pass = ptp_res.exit_code == 0
+            ptp_out = (ptp_res.stdout + "\\n" + ptp_res.stderr).strip()
+            if not ptp_pass:
+                return {"ok": False, "error": "PASS_TO_PASS smoke failed after gold",
+                        "notes": ptp_out[-300:], "install_seconds": install_s,
+                        "venv_python": venv_python, "test_cmd": ftp_cmd}
+            elif ptp_res.timed_out:
+                return {"ok": False, "error": "PASS_TO_PASS timed out",
+                        "notes": ptp_out[-300:], "install_seconds": install_s,
+                        "venv_python": venv_python, "test_cmd": ftp_cmd}
+
+        elapsed = round(time.time() - t0, 1)
+        return {"ok": True, "error": "", "notes": f"install={install_s:.0f}s total={elapsed:.0f}s",
+                "install_seconds": install_s, "venv_python": venv_python, "test_cmd": ftp_cmd}
+    finally:
+        sb.close()
 
 
 # ---------------------------------------------------------------------------
