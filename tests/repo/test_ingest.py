@@ -342,6 +342,26 @@ class TestResolveBaseRef:
         assert "rate-limited" in result.reason.lower()
         assert result.already_fixed is False
 
+    @patch("anvil.repo.ingest._http_client")
+    def test_non_list_timeline_response_warns_and_uses_head(self, mock_client_factory, caplog):
+        issue_resp = _make_mock_response(200, {"state": "closed"})
+        timeline_resp = _make_mock_response(200, {"message": "API rate limit exceeded"})
+
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.get.side_effect = [issue_resp, timeline_resp]
+        mock_client_factory.return_value = cm
+
+        result = resolve_base_ref(self._ref())
+
+        assert result.ref is None
+        assert "unresolved" in result.reason.lower()
+        assert "using head" in result.reason.lower()
+        assert "not a list" in caplog.text.lower()
+        assert "rate limit" in caplog.text.lower()
+        assert result.already_fixed is False
+
 # ---------------------------------------------------------------------------
 # Regression tests for Bug 5 (ingest hardening)
 # ---------------------------------------------------------------------------

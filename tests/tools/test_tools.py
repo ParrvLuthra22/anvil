@@ -396,6 +396,28 @@ class TestGitDiffTool:
         assert result.ok
         assert result.meta.get("changed") is True
 
+    def test_excludes_generated_and_probe_paths(self):
+        mock_sandbox = MagicMock()
+        mock_sandbox.diff.return_value = "".join(
+            f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n+generated\n"
+            for path in (
+                "src/change.py",
+                "pkg.egg-info/PKG-INFO",
+                "pkg/__pycache__/module.pyc",
+                ".anvil_venv/pyvenv.cfg",
+                ".probe_python3_13/bin/python",
+            )
+        )
+
+        result = GitDiffTool().run({}, mock_sandbox)
+
+        assert result.ok and result.meta["changed"]
+        assert "src/change.py" in result.output
+        assert "egg-info" not in result.output
+        assert "__pycache__" not in result.output
+        assert ".anvil_venv" not in result.output
+        assert ".probe_" not in result.output
+
     def test_schema_is_empty(self):
         assert GitDiffTool().parameters["required"] == []
 
