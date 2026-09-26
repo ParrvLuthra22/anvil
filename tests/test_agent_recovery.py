@@ -7,6 +7,7 @@ import pytest
 from anvil.agent.loop import PhaseStatus, RunAborted
 from anvil.agent.prompts import PHASE_SPECS
 from anvil.agent.recovery import LOOP_STRIKE_LIMIT, NUDGE
+from anvil.agent.state import REVIEW_APPROVED, CheckRun, RunState
 from anvil.events import Phase
 from anvil.llm.client import LLMResponse
 from anvil.llm.errors import LLMConfigError, LLMError
@@ -14,6 +15,9 @@ from anvil.sandbox.base import ExecResult
 from anvil.tools.base import ToolResult
 from tests.fakes import (
     BUGGY,
+    FIX,
+    REPRO_CMD,
+    FakePipeline,
     FakeRegistry,
     FakeSandbox,
     FakeTool,
@@ -22,12 +26,26 @@ from tests.fakes import (
     done,
     project_exec,
     project_files,
+    RecordingLLM,
     project_sandbox,
     reply,
     schema,
 )
 from tests.test_agent_loop import Harness, tool_results
 from tests.test_context import assert_valid
+from tests.test_orchestrator import (
+    HAPPY_STEPS,
+    execute,
+    finalize,
+    good_patch,
+    happy,
+    localize,
+    reproduce,
+    review_ok,
+    understand,
+    verify,
+    wrong_patch,
+)
 
 LOCALIZE = PHASE_SPECS[Phase.LOCALIZE]
 REPRODUCE = PHASE_SPECS[Phase.REPRODUCE]
@@ -372,3 +390,173 @@ def test_an_llm_failure_never_reaches_the_tools():
     with pytest.raises(RunAborted):
         h.run()
     assert runs == []
+
+
+# ---- in a full run --------------------------------------------------------------------------
+
+
+def run_kinds(run) -> list[str]:
+    return [e.data["kind"] for e in run.of("error")]
+
+
+def stuck_grep(times: int) -> list:
+    return [reply(call("grep", pattern="add")) for _ in range(times)]
+
+
+def test_a_phase_that_loops_is_ended_and_the_run_carries_on_to_the_end(tmp_path):
+    script = understand() + stuck_grep(5) + reproduce() + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path)
+
+    assert run_kinds(run) == ["loop"] * LOOP_STRIKE_LIMIT
+    assert "The fault was not localized (looped: the model kept repeating itself" in run.report
+    assert "+    return a + b" in run.patch and run.llm.remaining == 0
+    assert run.phases == ["ingest", "profile", "understand", "localize", "reproduce", "patch", "verify", "review", "finalize"]
+
+
+def test_a_model_that_goes_silent_while_patching_is_nudged_once_then_the_attempt_is_retried(tmp_path):
+    silent = [reply(text="Let me think."), reply(text="Still thinking.")]
+    script = understand() + localize() + reproduce() + silent + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path)
+
+    assert run_kinds(run) == ["no_tool_call", "no_tool_call"]
+    assert "Patch attempts: 2" in run.report and "+    return a + b" in run.patch
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.9)
+    assert run.prompt_texts().count(NUDGE) >= 1
+
+
+def test_a_failed_edit_in_a_full_run_is_recovered_from_with_the_closest_lines(tmp_path):
+    bad_edit = reply(call("edit_file", path="calc.py", old="return a * b", new="return a + b"))
+    patch = [bad_edit, reply(call("edit_file", **FIX)), reply(call("run_cmd", cmd=REPRO_CMD)), done("changed - to +")]
+    run = execute(understand() + localize() + reproduce() + patch + verify() + review_ok() + finalize(), tmp_path)
+
+    assert run_kinds(run) == ["edit"]
+    assert any("Closest matching lines in calc.py:\n  2:     return a - b" in t for t in run.prompt_texts())
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.9)
+
+
+def test_calling_a_tool_that_does_not_exist_costs_a_step_but_not_the_run(tmp_path):
+    lost = [reply(call("search_code", query="add"))]
+    script = understand() + lost + localize() + reproduce() + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path)
+    assert run_kinds(run) == ["invalid_call"]
+    assert any("Tool 'search_code' is not available in the localize phase" in t for t in run.prompt_texts())
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.9)
+
+
+def test_a_failing_test_run_in_verify_is_announced_and_leads_with_the_failing_lines(tmp_path):
+    def flaky_suite(cmd, files):
+        if cmd.startswith("pytest"):
+            return ExecResult(1, "1 failed\n", "FAILED tests/test_other.py::test_unrelated\n", False, 0.1)
+        return project_exec(cmd, files)
+
+    pipeline = FakePipeline(FakeSandbox(project_files(), on_exec=flaky_suite))
+    script = (
+        understand() + localize() + reproduce() + good_patch()
+        + [reply(call("run_tests")), done("only a pre-existing unrelated failure")] + review_ok() + finalize()
+    )
+    run = execute(script, tmp_path, pipeline=pipeline)
+
+    assert run_kinds(run) == ["test_failure"]
+    (event,) = run.of("error")
+    assert event.phase.value == "verify" and "fix the cause, not the tests" in event.data["message"]
+    shown = [t for t in run.prompt_texts() if t.startswith("[test run failed]")]
+    assert shown and "Key failure lines:\n  FAILED tests/test_other.py::test_unrelated" in shown[0]
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.6), "the failing run still costs confidence"
+
+
+def test_a_rollback_resets_the_tree_announces_itself_and_the_model_learns_what_was_tried(tmp_path):
+    script = (
+        understand() + localize() + reproduce()
+        + wrong_patch("return a - b", "return a * b", "multiplied")
+        + wrong_patch("return a * b", "return a ** b", "exponent")
+        + good_patch()
+        + verify() + review_ok() + finalize()
+    )
+    run = execute(script, tmp_path, max_patch_attempts=2, max_rollbacks=1)
+
+    assert run_kinds(run) == ["rollback"]
+    (event,) = run.of("error")
+    assert "ckpt-1" in event.data["message"] and "2 approach(es)" in event.data["message"]
+    rollback_at = run.events.index(event)
+    before = run.events[rollback_at - 2 : rollback_at]
+    assert [(e.type, e.data["tool"]) for e in before] == [("tool_call", "rollback"), ("tool_result", "rollback")]
+    rethink = next(t for t in run.prompt_texts() if "DIFFERENT hypothesis" in t)
+    assert "- multiplied" in rethink and "- exponent" in rethink
+    assert ".anvil/repro.py" in run.pipeline.sandbox.files, "the repro outlives the rollback"
+    assert "+    return a + b" in run.patch and "a ** b" not in run.patch
+
+
+def test_a_sandbox_that_cannot_checkpoint_is_reported_and_the_run_goes_on_without_rollbacks(tmp_path):
+    class NoCheckpoints(FakeSandbox):
+        def checkpoint(self, label):
+            raise RuntimeError("not a git repository")
+
+    pipeline = FakePipeline(NoCheckpoints(project_files(), on_exec=project_exec))
+    script = understand() + localize() + reproduce() + good_patch() + verify() + review_ok() + finalize()
+    run = execute(script, tmp_path, pipeline=pipeline)
+    assert run_kinds(run) == ["sandbox"] and "not a git repository" in run.of("error")[0].data["message"]
+    assert "Checkpointing failed, so rolling back was not possible." in run.report
+    assert "+    return a + b" in run.patch
+
+
+# ---- budgets and dying LLMs -----------------------------------------------------------------
+
+
+def test_a_budget_stop_is_announced_and_finalises_with_lowered_confidence(tmp_path):
+    run = execute(understand() + localize() + reproduce() + good_patch() + verify() + review_ok() + finalize(), tmp_path, max_total_steps=HAPPY_STEPS - 3)
+
+    (event,) = run.of("error")
+    assert event.data["kind"] == "budget" and "step budget exhausted" in event.data["message"]
+    assert "lowering the confidence" in event.data["message"]
+    assert "confidence is lowered" in run.report
+    assert "+    return a + b" in run.patch and (run.out / "report.md").exists()
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.6), "verified but unreviewed: medium at best"
+    assert run.pipeline.sandbox.closed and run.phases[-1] == "finalize"
+
+
+@pytest.mark.parametrize("budget", [{"max_total_steps": 6}, {"max_tokens_total": 700}, {"wall_clock_seconds": 0}])
+def test_every_kind_of_budget_ends_in_outputs_a_done_event_and_a_low_confidence(tmp_path, budget):
+    run = execute(happy(), tmp_path, **budget)
+    assert run_kinds(run) == ["budget"]
+    assert run.done.data["resolved_confidence"] <= 0.3
+    assert (run.out / "patch.diff").exists() and (run.out / "report.md").exists()
+
+
+def test_a_run_cut_short_is_never_reported_as_high_confidence():
+    state = RunState("u", repro_confirmed=True, verified=True, review=REVIEW_APPROVED, checks=[CheckRun("t", True)])
+    assert state.confidence(True) == "high"
+    state.halted = "budget"
+    assert state.confidence(True) == "medium"
+    assert state.confidence_score(True) == 0.6 and state.confidence(False) == "none"
+
+
+class DyingLLM(RecordingLLM):
+    """Serves the script, then fails for good after ``after`` calls (the client's retries are used up)."""
+
+    def __init__(self, script, after: int, exc: LLMError) -> None:
+        super().__init__(script)
+        self.after, self.exc = after, exc
+
+    def chat(self, messages, tools=None):
+        if len(self.calls) >= self.after:
+            raise self.exc
+        return super().chat(messages, tools)
+
+
+@pytest.mark.parametrize(
+    "exc, advice",
+    [
+        (LLMError("HTTP 429", status_code=429, retryable=True, attempts=5), "rate limit or quota"),
+        (LLMError("HTTP 401", status_code=401), "rejected the credentials"),
+    ],
+)
+def test_an_llm_that_dies_after_the_patch_still_yields_the_patch_a_report_and_low_confidence(tmp_path, exc, advice):
+    script = understand() + localize() + reproduce() + good_patch()
+    llm = DyingLLM(script, after=len(script), exc=exc)
+    run = execute(None, tmp_path, llm=llm)
+
+    assert run_kinds(run) == ["llm"] and advice in run.of("error")[0].data["message"]
+    assert "+    return a + b" in run.patch, "the work done before the failure is kept"
+    assert "Stopped early: LLM call failed" in run.report and advice in run.report
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.3)
+    assert run.pipeline.sandbox.closed and run.events[-1] is run.done

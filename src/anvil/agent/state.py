@@ -42,6 +42,7 @@ class RunState:
     patch_attempts: int = 0
     rollbacks: int = 0
     limitations: list[str] = field(default_factory=list)
+    halted: str = ""  # why the run was cut short (budget, aborted, error, interrupted), if it was
 
     def limit(self, note: str) -> None:
         """Record a known limitation for the report (duplicates are ignored)."""
@@ -54,13 +55,14 @@ class RunState:
         High needs all of: the bug reproduced before the patch, verification
         passing after it, no failing test run, and the reviewer's approval. A
         verified patch with a caveat (unapproved review, failing tests) is
-        medium; anything unverified or never reproduced is low.
+        medium; anything unverified or never reproduced is low. A run that was
+        cut short (``halted``) is never higher than medium, whatever it had by then.
         """
         if not has_patch:
             return "none"
         if not (self.repro_confirmed and self.verified):
             return "low"
-        clean = self.review == REVIEW_APPROVED and all(c.passed for c in self.checks)
+        clean = self.review == REVIEW_APPROVED and all(c.passed for c in self.checks) and not self.halted
         return "high" if clean else "medium"
 
     def confidence_score(self, has_patch: bool) -> float:

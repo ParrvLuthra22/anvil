@@ -6,6 +6,9 @@ FINALIZE. INGEST and PROFILE are plain code behind ``Pipeline``; every other pha
 an LLM tool loop (``PhaseRunner``) whose facts the harness checks for itself: it
 runs the repro, reads the diff and counts failures rather than trusting the model.
 
+Failures are met by ``anvil.agent.recovery`` (loops, failed edits, invalid calls, silent replies,
+timeouts, rollbacks); a budget or LLM failure ends the run with a lowered confidence, never a crash.
+
 Every model call sees a history kept within ``max_context_tokens`` by the ``ContextManager``:
 a finished phase is replaced in it by its closing summary, old tool output shrinks to one line,
 and the issue, repo map and latest diff stay pinned.
@@ -20,7 +23,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import yaml
 
@@ -38,6 +41,7 @@ from anvil.agent.prompts import (
     phase_summary,
     verify_kickoff,
 )
+from anvil.agent.recovery import Checkpointer, ErrorClass
 from anvil.agent.repro import WriteReproTool
 from anvil.agent.settings import AgentSettings
 from anvil.agent.state import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, CheckRun, RunState
@@ -133,15 +137,18 @@ class Orchestrator:
         self._workspace: Workspace | None = None
         self._runner: PhaseRunner | None = None
         self._repro_tool = WriteReproTool()
-        self._halted = ""
+        self._checkpointer: Checkpointer | None = None
 
     def run(self) -> None:
         """Execute the run; see ``run_harness`` for the guarantees."""
         try:
             self._execute()
         except BudgetExceeded as exc:
-            self._emitter.error("budget", str(exc))
-            self._stop("budget", f"Stopped early: {exc}. The results reflect the work completed until then.")
+            self._emitter.error(ErrorClass.BUDGET.value, f"{exc}; finalising with what exists and lowering the confidence")
+            self._stop(
+                "budget",
+                f"Stopped early: {exc}. The results reflect the work completed until then, and confidence is lowered.",
+            )
         except RunAborted as exc:
             self._stop("aborted", f"Stopped early: {exc}")
         except Exception as exc:  # noqa: BLE001 - the run must always reach FINALIZE
@@ -151,13 +158,13 @@ class Orchestrator:
             self._emitter.error(kind, message)
             self._stop("error", f"Stopped early by an error ({kind}): {message}")
         except BaseException:
-            self._halted = "interrupted"
+            self._state.halted = "interrupted"
             raise
         finally:
             self._finalize()
 
     def _stop(self, reason: str, note: str) -> None:
-        self._halted = reason
+        self._state.halted = reason
         self._state.limit(note)
 
     def _execute(self) -> None:
@@ -189,6 +196,7 @@ class Orchestrator:
         self._enter(Phase.PROFILE)
         workspace = self._pipeline.profile(ingested)
         self._workspace = workspace
+        self._checkpointer = Checkpointer(workspace.sandbox, self._emitter, lambda: self._repro_tool.written)
         self._state.profile = workspace.profile
         try:
             workspace.tools.register(self._repro_tool)
@@ -306,7 +314,7 @@ class Orchestrator:
             feedback = verdict.feedback
             if failed < settings.max_patch_attempts:
                 kind = "retry"
-            elif rollbacks < max_rollbacks and self._rollback(ref):
+            elif rollbacks < max_rollbacks and self._rollback(ref, approaches):
                 rollbacks += 1
                 state.rollbacks += 1
                 failed, kind = 0, "rethink"
@@ -373,51 +381,15 @@ class Orchestrator:
     # ---- recovery -----------------------------------------------------------------------------
 
     def _checkpoint(self, label: str) -> str | None:
-        snapshot = self._scratch_snapshot()
-        self._emitter.tool_call("checkpoint", {"label": label})
-        try:
-            ref = self._ws.sandbox.checkpoint(label)
-        except Exception as exc:  # noqa: BLE001
-            self._emitter.tool_result("checkpoint", False, str(exc))
-            self._emitter.error("sandbox", f"checkpoint failed: {exc}")
+        if self._checkpointer is None:
+            raise RuntimeError("the workspace is not ready: PROFILE has not completed")
+        ref = self._checkpointer.checkpoint(label)
+        if ref is None:
             self._state.limit("Checkpointing failed, so rolling back was not possible.")
-            return None
-        self._restore_scratch(snapshot)
-        self._emitter.tool_result("checkpoint", True, str(ref))
-        return ref or None
+        return ref
 
-    def _rollback(self, ref: str | None) -> bool:
-        if not ref:
-            return False
-        snapshot = self._scratch_snapshot()
-        self._emitter.tool_call("rollback", {"ref": ref})
-        try:
-            self._ws.sandbox.rollback(ref)
-        except Exception as exc:  # noqa: BLE001
-            self._emitter.tool_result("rollback", False, str(exc))
-            self._emitter.error("sandbox", f"rollback failed: {exc}")
-            return False
-        self._restore_scratch(snapshot)
-        self._emitter.tool_result("rollback", True, f"restored {ref}")
-        return True
-
-    def _scratch_snapshot(self) -> dict[str, str]:
-        """Current contents of the repro files. A sandbox's checkpoint or rollback may sweep away
-        untracked files (git stash does), and the repro must survive, so it is put back if missing."""
-        snapshot = {}
-        for path in self._repro_tool.written:
-            try:
-                snapshot[path] = self._ws.sandbox.read_file(path)
-            except Exception:  # noqa: BLE001 - already gone: nothing to preserve
-                continue
-        return snapshot
-
-    def _restore_scratch(self, snapshot: dict[str, str]) -> None:
-        for path, content in snapshot.items():
-            try:
-                self._ws.sandbox.read_file(path)
-            except Exception:  # noqa: BLE001 - missing: write it back
-                self._ws.sandbox.write_file(path, content)
+    def _rollback(self, ref: str | None, tried: Sequence[str] = ()) -> bool:
+        return self._checkpointer is not None and self._checkpointer.rollback(ref, tried)
 
     # ---- helpers ------------------------------------------------------------------------------
 
@@ -489,7 +461,7 @@ class Orchestrator:
         try:
             self._enter(Phase.FINALIZE)
             patch = self._patch_text()
-            if patch and not self._halted:
+            if patch and not self._state.halted:
                 self._write_summary(patch)
         except Exception as exc:  # noqa: BLE001
             self._emitter.error("finalize", f"{type(exc).__name__}: {exc}")

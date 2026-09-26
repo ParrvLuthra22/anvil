@@ -122,7 +122,8 @@ _LOOP_HINTS: dict[Phase, str] = {
     "if the bug cannot be reproduced, call give_up",
     Phase.PATCH: "re-read the code, form a different hypothesis and edit something else; "
     "if no fix is possible, call give_up",
-    Phase.VERIFY: "the results cannot change unless the code does; diagnose the failure and call give_up(reason) with what you found",
+    Phase.VERIFY: "the results cannot change unless the code does; "
+    "diagnose the failure and call give_up(reason) with what you found",
     Phase.REVIEW: "you already have what you need: call phase_done to approve, or give_up(reason) to request changes",
 }
 _DEFAULT_LOOP_HINT = "use different arguments or a different tool, or end the phase with phase_done or give_up"
@@ -345,13 +346,15 @@ def review_result(
     ``run_cmd`` is only reviewed when it times out.
     """
     if timed_out(output, meta):
-        return Review(f"{output}\n\n{_TIMEOUT_ADVICE}", ErrorClass.TIMEOUT, f"{tool} timed out; told the model to run something narrower")
+        detail = f"{tool} timed out; told the model to run something narrower"
+        return Review(f"{output}\n\n{_TIMEOUT_ADVICE}", ErrorClass.TIMEOUT, detail)
     if ok:
         return Review(output)
     if tool == "edit_file":
         path = args.get("path") or "?"
         feedback = edit_failure_feedback(args, output, sandbox)
-        return Review(f"{output}\n\n{feedback}", ErrorClass.EDIT_FAILED, f"edit_file failed on {path}; sent the closest lines and a re-read reminder")
+        detail = f"edit_file failed on {path}; sent the closest lines and a re-read reminder"
+        return Review(f"{output}\n\n{feedback}", ErrorClass.EDIT_FAILED, detail)
     if tool == "run_tests":
         lines = failure_digest(output)
         digest = "Key failure lines:\n" + "\n".join(f"  {line}" for line in lines) + "\n" if lines else ""
@@ -363,7 +366,8 @@ def review_result(
     if tool == "run_cmd":
         return Review(output)
     advice = _LOCATE_ADVICE + " " if "not found" in output.lower() else ""
-    return Review(f"{output}\n\n{advice}{_TOOL_ADVICE}", ErrorClass.TOOL_ERROR, f"{tool} failed; told the model to adjust or use another tool")
+    detail = f"{tool} failed; told the model to adjust or use another tool"
+    return Review(f"{output}\n\n{advice}{_TOOL_ADVICE}", ErrorClass.TOOL_ERROR, detail)
 
 
 # ---- per-phase state ------------------------------------------------------------------------
@@ -426,10 +430,8 @@ class PhaseGuard:
         )
         call = format_call(name, args)
         ended = self._loops.exhausted
-        self.announce(
-            ErrorClass.LOOP,
-            f"{call}: {pattern}; strike {strikes}/{LOOP_STRIKE_LIMIT}" + ("; ending the phase" if ended else "; told the model to change approach"),
-        )
+        action = "ending the phase" if ended else "told the model to change approach"
+        self.announce(ErrorClass.LOOP, f"{call}: {pattern}; strike {strikes}/{LOOP_STRIKE_LIMIT}; {action}")
         reason = f"the model kept repeating itself ({pattern}; last call {call})"
         return LoopVerdict(reply, reason, ended)
 
@@ -472,7 +474,10 @@ def llm_failure_advice(exc: LLMError) -> str:
     if status == 413 or any(word in text for word in ("context length", "context window", "too many tokens", "too large")):
         return "The prompt is larger than the model accepts: lower max_context_tokens in config.yaml."
     if status == 429:
-        return f"The provider's rate limit or quota was still exhausted after {exc.attempts or 'several'} attempts: wait and re-run, or use another model."
+        return (
+            f"The provider's rate limit or quota was still exhausted after {exc.attempts or 'several'} attempts: "
+            "wait and re-run, or use another model."
+        )
     if status is not None and status >= 500:
         return f"The provider kept failing after {exc.attempts or 'several'} attempts; re-run later."
     if exc.retryable:
