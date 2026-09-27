@@ -174,13 +174,16 @@ def state(**fields) -> RunState:
     return s
 
 
+REPRO_ONLY = [CheckRun("repro (re-run by the harness)", True, repository_tests=False)]
+
+
 @pytest.mark.parametrize(
     "fields, expected",
     [
         ({}, "high"),
-        ({"verify_without_tests": True}, "medium"),
-        ({"verify_without_tests": True, "verified": False}, "low"),
-        ({"verify_without_tests": True, "repro_confirmed": False}, "low"),
+        ({"checks": REPRO_ONLY}, "medium"),
+        ({"checks": REPRO_ONLY, "verified": False}, "low"),
+        ({"checks": REPRO_ONLY, "repro_confirmed": False}, "low"),
     ],
 )
 def test_verified_on_the_repro_alone_is_never_high(fields, expected):

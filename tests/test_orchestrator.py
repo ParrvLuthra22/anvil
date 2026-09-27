@@ -418,6 +418,7 @@ def test_a_rework_that_fails_verification_restores_the_reviewed_patch(tmp_path):
     assert ("rollback", "ckpt-3") in run.pipeline.sandbox.events, "the checkpoint taken before the rework"
     assert "the reviewed patch was restored" in run.report
     assert "Verified after patching: yes" in run.report
+    assert "- pass: run_tests tests/test_calc.py" in run.report and "- FAIL" not in run.report, "the checks of the delivered patch, not of the rework"
     assert run.done.data["resolved_confidence"] == pytest.approx(0.6)
 
 
@@ -426,7 +427,7 @@ def test_a_review_that_never_finishes_leaves_the_patch_unreviewed(tmp_path):
     run = execute(script, tmp_path)
     assert "Review: inconclusive (stalled)" in run.report
     assert "the patch is unreviewed" in run.report
-    assert run.done.data["resolved_confidence"] == pytest.approx(0.6)
+    assert run.done.data["resolved_confidence"] == pytest.approx(0.75), "verified on the repository's tests: the missing review costs nothing but the approval bonus"
 
 
 # ---- sandboxes that are not contract-clean ----------------------------------------------------

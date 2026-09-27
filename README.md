@@ -65,8 +65,10 @@ Behaviour details and the reasons for them are in [`src/anvil/agent/NOTES.md`](s
 
 | Confidence | Meaning |
 |---|---|
-| **high** (0.90) | The bug was reproduced before the patch, the patch verified after it, no test run failed, the review approved, and the run was not cut short |
-| **medium** (0.60) | Verified, with a caveat: the review asked for changes or did not finish, a test run failed, or verification rested on the repro alone |
+| **high** (0.90) | The bug was reproduced before the patch, the patch verified after it, the repository's tests ran and none failed, the review approved, and the run was not cut short. Only this reaches 0.90 |
+| **medium** (0.75) | Verified on the repository's tests, but the self-review never reached a verdict. The missing review costs nothing; it only lacks the approval bonus, and the report says so |
+| **medium** (0.60) | Verified, with a caveat: the review asked for changes, a test or repro run failed, or the run was cut short |
+| **medium** (0.50) | Verified on the model's own repro only: the report says "no repository tests were run" and the confidence is capped here whatever the review said |
 | **low** (0.30) | Not reproduced, not verified, or the patch failed its sanity check |
 | **none** (0) | No patch |
 
@@ -220,8 +222,8 @@ Every run writes three files to `output/`:
 
 - **Verified on Python repositories only.** The pipeline is language-agnostic (profile, tools, sandbox), but a JavaScript,
   TypeScript, Go, Rust or Java issue has not been run end to end.
-- **Small or weak models often do not close phases.** The harness closes them itself and lowers the confidence, so results with
-  such a model are usually medium at best.
+- **Small or weak models often do not close phases.** The harness closes them itself and notes it, and a review that never
+  finishes only forgoes the approval bonus (0.75 instead of 0.90), so results with such a model are usually medium.
 - **Old repositories depend on the machine.** Their tests need a Python of the right era; without one installed the harness
   fetches it with `uv` (network required).
 - **Benchmarks use real provider quota** and clone from GitHub; they are not part of `make test`.

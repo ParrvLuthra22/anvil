@@ -79,9 +79,20 @@ install warnings), `context` (summariser failed), `config`, `io`, `finalize`, an
 registered, argument check, run the tool (a crash is caught), review the result. History is always valid: every tool call
 gets a reply, including the ones that were not run.
 
-**Confidence** (`RunState.confidence`): `none` if there is no patch; `low` unless the bug was reproduced before the patch
-*and* verification passed; `high` only with that, an approving review and no failed check; else `medium`. A halted run is
-capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
+**Confidence** (`RunState.confidence_score`; the label is read off the score): what the evidence supports, and no more.
+0 if there is no patch; 0.30 unless the bug was reproduced before the patch *and* verification passed (or the patch failed its
+sanity check). Then, by the evidence VERIFY left in `state.checks`:
+- **No repository test was run** (verification rested on the model's own `.anvil/` repro): capped at **0.50**, whatever the review
+  said, and `report.md` says "no repository tests were run". A `run_tests` call counts as repository tests, and so does a
+  `run_cmd` whose command is a test runner (`pytest`, `go test`, `npm test`, `cargo test`, `make test`, ... see `agent/testcmd.py`);
+  a script under `.anvil/` run by a test runner does not.
+- **A failing check, a run cut short (`halted`), or a review that asked for changes**: 0.60.
+- **Repository tests passed and the review approved**: 0.90, and only that reaches 0.90.
+- **Repository tests passed and the review never reached a verdict** (stalled, capped, not run): 0.75. An unfinished review is not
+  evidence against the patch, so it costs nothing; it only lacks the approval bonus, and `report.md` says so under the
+  Confidence line (weak models often fail to close REVIEW).
+The failed checks of a rejected rework or assert retry are not the delivered patch's: when the earlier patch is put back its
+checks come back with it. Labels: `high` from 0.85, `medium` from 0.45, else `low`.
 
 **Patch, verify, rollback (orchestrator + `Checkpointer`):**
 - A checkpoint is taken when PATCH starts (`patch-start`). After each PATCH the harness re-runs the repro itself, then
@@ -114,7 +125,7 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
   looped, step limit, or closed at its call cap) the harness looks at what it holds: its own repro re-run (which passed, or VERIFY
   would not have started) and the phase's `run_tests` calls. The last test run failed: verification failed, and its output goes to
   the retry. The last passed: verified, with a limitation note. No test run but a repro that passes: verified on the repro alone,
-  flagged (`verify_without_tests`) so the confidence cannot be high. Neither: failed. A `give_up` is the model's own verdict and
+  capped at 0.50 confidence (no repository test ran). Neither: failed. A `give_up` is the model's own verdict and
   stands. A real run went back through PATCH and VERIFY for a fix that worked because its VERIFY stalled after the tests passed.
 - **A hard total of PATCH attempts per run: `max_total_patch_attempts` (3: the first attempt and two retries).** It counts every
   PATCH attempt in the run, whatever asked for it: the attempt loop (retries after a failed VERIFY, and rethinks after a

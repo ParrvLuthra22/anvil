@@ -49,6 +49,7 @@ from anvil.agent.sanity import PatchCheck, inspect_patch, issue_is_about_tests
 from anvil.agent.settings import AgentSettings
 from anvil.agent.state import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, CheckRun, RunState
 from anvil.agent.summarizer import HistorySummarizer
+from anvil.agent.testcmd import is_repository_test_run
 from anvil.agent.text import clip_head, clip_middle
 from anvil.context import ContextManager
 from anvil.events import EventBus, Phase
@@ -435,6 +436,7 @@ class Orchestrator:
         max_rollbacks = 0 if rework else settings.max_rollbacks
         failed = rollbacks = 0
         approaches: list[str] = []
+        reviewed_checks = list(state.checks)  # what verified the patch a failed rework will put back
         state.verified = False
         while True:
             state.patch_attempts += 1
@@ -455,7 +457,7 @@ class Orchestrator:
             failed += 1
             feedback = verdict.feedback
             if self._patch_attempts_left() <= 0:
-                self._abandon_patching(rework, ref, limit_reached=True, last_result=verdict.feedback)
+                self._abandon_patching(rework, ref, reviewed_checks, limit_reached=True, last_result=verdict.feedback)
                 return
             if failed < settings.max_patch_attempts:
                 kind = "retry"
@@ -464,15 +466,18 @@ class Orchestrator:
                 state.rollbacks += 1
                 failed, kind = 0, "rethink"
             else:
-                self._abandon_patching(rework, ref)
+                self._abandon_patching(rework, ref, reviewed_checks)
                 return
 
-    def _abandon_patching(self, rework: bool, ref: str | None, *, limit_reached: bool = False, last_result: str = "") -> None:
+    def _abandon_patching(
+        self, rework: bool, ref: str | None, reviewed_checks: list[CheckRun], *, limit_reached: bool = False, last_result: str = ""
+    ) -> None:
         """Stop patching and go on to the end of the run with the best state there is.
 
         The best state is a verified one: for a failed rework the reviewed patch is put back. A first solve that never
         verified has none, so the last attempt's patch is delivered, unverified. ``limit_reached`` says the hard total
-        of PATCH attempts is what stopped the run, and the report says so.
+        of PATCH attempts is what stopped the run, and the report says so. The restored patch brings back the checks that
+        verified it, so the report and the confidence describe the patch that is delivered, not the rejected rework.
         """
         state = self._state
         if not rework:
@@ -482,6 +487,7 @@ class Orchestrator:
             )
         elif self._rollback(ref):
             state.verified = True
+            state.checks = reviewed_checks
             state.limit("The reviewer's requested rework failed verification; the reviewed patch was restored.")
         else:
             state.limit("The reviewer's requested rework failed verification and could not be rolled back.")
@@ -543,7 +549,7 @@ class Orchestrator:
         warning_only = not check.problem
         self._revert_files(check.removed_tests)  # the retry starts without the test edits it was told not to make
         ref = self._checkpoint("before-sanity-retry") if warning_only else None
-        was_verified = state.verified
+        was_verified, was_checks = state.verified, list(state.checks)
         state.patch_attempts += 1
         kickoff = patch_kickoff(
             attempt=state.patch_attempts,
@@ -559,7 +565,7 @@ class Orchestrator:
         state.verified = verdict.passed
         if warning_only and not verdict.passed:
             if self._rollback(ref):
-                state.verified = was_verified
+                state.verified, state.checks = was_verified, was_checks
                 state.limit("The retry to replace the assert failed verification; the earlier patch was restored.")
             else:
                 state.limit("The retry to replace the assert failed verification and the earlier patch could not be restored.")
@@ -647,13 +653,13 @@ class Orchestrator:
         if state.repro_cmd:
             result, text = self._run_repro(state.repro_cmd)
             passed = result.exit_code == 0 and not result.timed_out
-            state.checks.append(CheckRun(f"repro `{state.repro_cmd}` (re-run by the harness)", passed))
+            state.checks.append(CheckRun(f"repro `{state.repro_cmd}` (re-run by the harness)", passed, repository_tests=False))
             if not passed:
                 return _Verdict(False, self._trim(f"The repro still fails after your patch:\n{text}"), repro_failed=True)
         outcome = self._run_phase(Phase.VERIFY, verify_kickoff(repro_cmd=state.repro_cmd))
-        tests = [record for record in outcome.records if record.tool == "run_tests"]
+        tests = [record for record in outcome.records if is_repository_test_run(record.tool, record.args)]
         for record in tests:
-            state.checks.append(CheckRun(f"run_tests {_test_targets(record.args)}".strip(), record.ok))
+            state.checks.append(CheckRun(_test_label(record), record.ok))
         if outcome.done:
             return _Verdict(True)
         if outcome.status is PhaseStatus.GAVE_UP:
@@ -665,8 +671,8 @@ class Orchestrator:
 
         A model that has run the tests and then wanders off has still verified the patch, and sending it back to PATCH for
         that alone re-opens a fix that works (a real run did, twice). The evidence is the harness's own repro re-run, which
-        passed or VERIFY would not have started, and the ``run_tests`` calls of the phase: if the last one failed the patch
-        failed verification, if it passed the patch is verified. With no test run at all the repro alone verifies it, and the
+        passed or VERIFY would not have started, and the repository test runs of the phase (``run_tests``, or a test command
+        through ``run_cmd``): if the last one failed the patch failed verification, if it passed the patch is verified. With no test run at all the repro alone verifies it, and the
         confidence stays below high; with neither there is no evidence and verification failed.
         """
         state, status = self._state, outcome.status.value
@@ -679,7 +685,6 @@ class Orchestrator:
             )
             return _Verdict(True)
         if state.repro_cmd:
-            state.verify_without_tests = True
             state.limit(
                 f"VERIFY ended without the model's verdict ({status}) and ran no tests; the harness verified the patch on "
                 "the repro alone."
@@ -876,6 +881,13 @@ class Orchestrator:
                 close()
             except Exception:  # noqa: BLE001 - nothing useful left to do at shutdown
                 pass
+
+
+def _test_label(record: ToolRecord) -> str:
+    """How a test run reads in the report's checks: ``run_tests <targets>`` or ``run_cmd <command>``."""
+    if record.tool == "run_cmd":
+        return clip_head(f"run_cmd {str(record.args.get('cmd', '')).strip()}", 120)
+    return f"run_tests {_test_targets(record.args)}".strip()
 
 
 def _test_targets(args: dict) -> str:

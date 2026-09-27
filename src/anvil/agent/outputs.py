@@ -107,6 +107,7 @@ def render_report(
 
     out += ["", "## Outcome", ""]
     out.append(f"- Confidence: **{confidence}** ({state.confidence_score(bool(files)):.2f})")
+    out += [f"  - {note}" for note in state.confidence_notes(bool(files))]
     out.append(f"- Reproduced before patching: {f'yes (`{state.repro_cmd}`)' if state.repro_confirmed else 'no'}")
     out.append(f"- Verified after patching: {'yes' if state.verified else 'no'}")
     out.append(f"- Review: {state.review}")

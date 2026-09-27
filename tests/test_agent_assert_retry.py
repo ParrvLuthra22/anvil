@@ -110,6 +110,8 @@ def test_when_the_repository_tests_fail_too_the_earlier_patch_is_restored(tmp_pa
     assert "The retry to replace the assert failed verification; the earlier patch was restored." in run.report
     assert KEPT not in run.report
     assert "Verified after patching: yes" in run.report, "the earlier patch was verified"
+    assert "- FAIL" not in run.report and "- pass: run_tests" in run.report, "the checks that verified the delivered patch, not the retry's"
+    assert "Confidence: **high**" in run.report
     assert "WARNING: The patch adds a bare assert" in sanity_line(run)
 
 
@@ -131,7 +133,8 @@ def test_a_run_tests_tool_that_crashes_is_a_failed_judgement_not_a_crashed_run(t
     fake = pinned_to_the_assert(registry=FakeRegistry(tools))
     run = execute(script, tmp_path, pipeline=fake)
     assert "assert isinstance" in run.patch and rolled_back(fake)
-    assert "- FAIL: run_tests (run by the harness)" in run.report
+    (crash,) = [e for e in run.of("tool_result") if e.data["tool"] == "run_tests" and not e.data["ok"]]
+    assert "run_tests failed to run: RuntimeError: tool exploded" in crash.data["output_preview"]
 
 
 # ---- the repro was updated, or the failure is not about the repro -----------------------------------------------------------
