@@ -43,6 +43,15 @@ def test_test_argv_uses_the_instance_interpreter(tmp_path: Path):
     assert argv == [str(interpreter), "-m", "pytest", "-x", "-q", "--tb=short", "tests/test_x.py::test_b"]
 
 
+@pytest.mark.parametrize("runner", ["python", "python3", "python3.13", "python3.14", "/opt/python3.14/bin/python3.14"])
+def test_test_argv_replaces_recorded_python_with_ensure_deps_interpreter(tmp_path: Path, runner: str):
+    """Run oracle tests with ensure_deps' selected interpreter, not the recorded host Python."""
+    interpreter = tmp_path / "instance" / ".anvil_venv" / "bin" / "python"
+    argv = _test_argv(f"{runner} -m pytest -q tests/test_x.py::test_a", ["tests/test_x.py::test_b"], interpreter)
+
+    assert argv == [str(interpreter), "-m", "pytest", "-q", "tests/test_x.py::test_b"]
+
+
 def test_score_instance_resolved(tmp_path: Path, monkeypatch):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
