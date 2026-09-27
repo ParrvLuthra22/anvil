@@ -101,6 +101,12 @@ against the phase allowlist and registry.
 | Token, step, or wall-clock budget | Stop model work and finalize with reduced confidence. |
 | Setup, dependency, or output error | Emit an error/warning event, preserve what was produced, and attempt finalization. |
 
+An HTTP 402 response that asks the provider to retry after in-flight requests
+settle is retried up to 5 times, with jittered waits from 2 to 30 seconds. A
+different 402 response is classified as out of credit and fails immediately.
+Ordinary transient 429, 5xx, and network errors use the configured retry count
+and capped exponential backoff.
+
 The worktree sandbox uses Git worktrees where possible and a plain copy as a
 fallback. Checkpoints use Git snapshots and rollback restores the recorded tree
 state. Docker implements the same sandbox protocol but is opt-in and

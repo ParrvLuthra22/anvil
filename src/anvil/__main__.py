@@ -32,6 +32,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,26 @@ def _output_paths() -> tuple[Path, Path, Path]:
     return out / "patch.diff", out / "report.md", out / "trace.jsonl"
 
 
+def _local_repo_git_redirect(repo_url: str) -> tuple[str, dict[str, str]] | None:
+    """Map a local fixture path onto the real clone_repo GitHub URL contract."""
+    if repo_url.startswith("file://"):
+        local_repo = Path(unquote(urlparse(repo_url).path)).resolve()
+    else:
+        candidate = Path(repo_url)
+        if not candidate.exists():
+            return None
+        local_repo = candidate.resolve()
+
+    synthetic_url = f"https://github.com/anvil-local/{local_repo.name}.git"
+    rewrite_index = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+    git_env = {
+        "GIT_CONFIG_COUNT": str(rewrite_index + 1),
+        f"GIT_CONFIG_KEY_{rewrite_index}": f"url.{local_repo.as_uri()}.insteadOf",
+        f"GIT_CONFIG_VALUE_{rewrite_index}": synthetic_url,
+    }
+    return synthetic_url, git_env
+
+
 # ---------------------------------------------------------------------------
 # Shared EventBus — concrete implementation of the abstract base in events.py
 #
@@ -239,7 +260,11 @@ def _run_demo(config: dict) -> None:
 
     issue_url = "https://github.com/example/repo/issues/1  [DEMO]"
 
-    def _on_start(url: str) -> None:
+    def _on_start(
+        url: str,
+        ref: str | None = None,
+        manual_issue_text: str | None = None,
+    ) -> None:
         _wire_recorder(bus, trace_path)
         asyncio.get_event_loop().create_task(_emit_fake_stream(url, bus))
 
@@ -319,31 +344,14 @@ def _run_headless(args: argparse.Namespace, config: dict) -> None:
         )
         sys.exit(1)
 
-    # Use repo_url as a display URL if GitHub issue URL not given
+    # Local fixtures use Git's normal URL rewrite mechanism, so the real
+    # RepoPipeline and clone_repo hooks still run without replacing internals.
     display_url = issue_url or repo_url
-
-    if repo_url and (repo_url.startswith("file://") or Path(repo_url).exists()):
-        import anvil.agent.pipeline
-        import anvil.repo.ingest
-        import shutil
-        import subprocess
-
-        local_path = repo_url[7:] if repo_url.startswith("file://") else repo_url
-        local_p = Path(local_path).resolve()
-
-        # Patch pipeline to allow file:// URLs or local paths for test fixtures
-        anvil.agent.pipeline._owner_and_repo = lambda u: ("local", local_p.name or "fixture")
-        
-        def _mock_clone(ref, dest, git_ref=None):
-            shutil.copytree(str(local_p), dest, dirs_exist_ok=True)
-            if git_ref:
-                subprocess.run(["git", "checkout", git_ref], cwd=dest, check=True, capture_output=True)
-            return dest
-            
-        anvil.agent.pipeline.clone_repo = _mock_clone
-
-    if "ANVIL_OUTPUT_DIR" in os.environ:
-        config["output_dir"] = os.environ["ANVIL_OUTPUT_DIR"]
+    git_env: dict[str, str] = {}
+    if repo_url:
+        redirect = _local_repo_git_redirect(repo_url)
+        if redirect is not None:
+            repo_url, git_env = redirect
 
     bus = _make_event_bus()
     patch_path, report_path, trace_path = _output_paths()
@@ -405,7 +413,16 @@ def _run_headless(args: argparse.Namespace, config: dict) -> None:
             sys.exit(1)
         await record_task
 
-    asyncio.run(_main())
+    previous_env = {key: os.environ.get(key) for key in git_env}
+    os.environ.update(git_env)
+    try:
+        asyncio.run(_main())
+    finally:
+        for key, previous in previous_env.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
 
 
 def _run_replay(args: argparse.Namespace) -> None:

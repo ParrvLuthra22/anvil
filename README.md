@@ -57,7 +57,7 @@ key in `config.yaml`:
 | `base_url` | Gemini endpoint | Provider base URL |
 | `model_profile` | `auto` | Model defaults profile: `auto` \| `default` \| `deepseek` \| `deepseek-reasoning` \| `qwen` \| `qwen-reasoning` |
 | `temperature` | `0` | Sampling temperature — 0 = deterministic output |
-| `max_output_tokens` | profile default | Cap on tokens per LLM reply (`null` = provider default) |
+| `max_output_tokens` | Profile: Qwen `4096`, DeepSeek chat `8192`, reasoning models provider default | Cap on tokens per LLM reply (`null` = provider default) |
 | `strip_reasoning` | `true` | Strip `<think>...</think>` and `reasoning_content` blocks from replies |
 | `llm_extra_params` | `{}` | Extra dictionary of provider-specific parameters sent with every request body |
 | `tool_mode` | `auto` | How tools are offered: `native` (provider tool-calling API) \| `text` (describe in prompt) \| `auto` (try native, fall back to text) |
@@ -65,7 +65,7 @@ key in `config.yaml`:
 | `llm_timeout_seconds` | `120` | Per-request read/write timeout |
 | `llm_connect_timeout_seconds` | `10` | TCP connect timeout |
 | `llm_backoff_base_seconds` | `1.0` | Base for exponential backoff on 429/5xx/network errors |
-| `llm_backoff_max_seconds` | `60` | Cap on any single retry wait (including Retry-After header) |
+| `llm_backoff_max_seconds` | `60` | Cap on transient 429/5xx/network retry waits, including `Retry-After` |
 | `max_steps_per_phase` | `25` | LLM steps allowed per phase before the orchestrator advances |
 | `max_total_steps` | `120` | Hard cap on total LLM steps across all phases |
 | `max_tokens_total` | `1 500 000` | Token budget for the whole run; hitting it forces graceful FINALIZE |
@@ -76,7 +76,7 @@ key in `config.yaml`:
 | `token_saving.context_keep_steps` | `3` | Tool-result retention window when token budgets are enabled |
 | `token_saving.tool_output_char_cap` | `4000` | Tighter output cap when token budgets are enabled |
 | `token_saving.repo_map_chars` | `3000` | Repository-map size when token budgets are enabled |
-| `token_saving.phase_calls` | Per-phase map | Call caps for UNDERSTAND, LOCALIZE, REPRODUCE, PATCH, VERIFY, REVIEW |
+| `token_saving.phase_calls` | `understand=1, localize=8, reproduce=10, patch=15, verify=8, review=6` | Model-call caps for these phases; the harness allows one extra forced-close call |
 | `max_context_tokens` | `32000` | Estimated token budget for the prompt (chars ÷ 4); leave headroom for tool schemas |
 | `context_keep_steps` | `6` | Tool output from earlier steps is replaced by a one-line summary after this many steps |
 | `context_summarize_threshold` | `0.75` | Fraction of `max_context_tokens` that triggers folding old turns into a digest (one extra LLM call) |
@@ -89,14 +89,19 @@ key in `config.yaml`:
 | `cost_per_million_completion_tokens` | `0` | Optional cost reporting (USD per million completion tokens) |
 | `sandbox` | `worktree` | Sandbox backend: `worktree` (default) \| `docker` (opt-in and experimental, no network in containers) \| `auto` |
 | `features.token_budgets` | `true` | Applies tighter per-phase caps, context retention, read, output, and repo-map limits |
-| `features.weak_model_prompts` | `true` | Adds explicit minimal-change and exception-handling guidance to PATCH and REVIEW |
-| `features.patch_sanity` | `true` | Checks non-empty/applicable patch and removes unrelated test-file edits |
-| `features.nav_tools` | `true` | Offers `outline` and `find_symbol` in LOCALIZE and PATCH when registered |
+| `features.weak_model_prompts` | `false` | Adds extra minimal-change and exception-handling guidance to PATCH and REVIEW |
+| `features.patch_sanity` | `true` | Checks patch validity and test-file edits; a bare `assert` in non-test code is flagged |
+| `features.nav_tools` | `false` | Offers `outline` and `find_symbol` in LOCALIZE and PATCH when registered |
 
 `max_output_tokens` is optional and otherwise comes from the selected model
-profile/provider. `llm_extra_params` is an optional provider-specific mapping.
+profile/provider (Qwen defaults to 4096 tokens; DeepSeek chat to 8192; reasoning
+profiles leave the provider default). `llm_extra_params` is an optional provider-specific mapping.
 Nested `token_saving` values only tighten top-level settings when
 `features.token_budgets` is enabled. Feature switches accept `true` or `false`.
+An HTTP 402 asking the provider to retry after in-flight requests settle gets
+up to 5 attempts with jittered waits from 2 to 30 seconds. Other HTTP 402
+responses are treated as out of credit and fail without retrying. This is
+separate from `llm_max_attempts` and the 429/5xx/network backoff settings.
 
 ### Environment overrides (never put these in config.yaml)
 
