@@ -230,7 +230,31 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
             _INTERP_VERSION_CACHE[interp] = actual_version
             return interp
 
-    # If none was released by as_of, pick the OLDEST candidate (closest to that era).
+    # If none was released by as_of, try to install the best version using uv.
+    best_version = None
+    if as_of:
+        valid_versions = []
+        for ver, d in _PYTHON_RELEASE_DATES.items():
+            if d <= as_of[:10]:
+                valid_versions.append(ver)
+        if valid_versions:
+            best_version = max(valid_versions, key=lambda v: _version_tuple(v))
+            
+    if best_version:
+        probe_uv = sandbox.exec("command -v uv", timeout=5)
+        if probe_uv.exit_code == 0:
+            log.info("Attempting fallback: uv python install %s", best_version)
+            uv_install = sandbox.exec(f"uv python install {best_version}", timeout=60)
+            if uv_install.exit_code == 0:
+                uv_find = sandbox.exec(f"uv python find {best_version}", timeout=10)
+                if uv_find.exit_code == 0:
+                    installed_path = uv_find.stdout.strip()
+                    if installed_path and _can_create_python_venv(sandbox, installed_path):
+                        log.info("Successfully installed and selected fallback Python interpreter: %s", installed_path)
+                        _INTERP_VERSION_CACHE[installed_path] = best_version
+                        return installed_path
+
+    # If that fails or uv is unavailable, pick the OLDEST candidate (closest to that era).
     # Never pick a newer one just because it is newer.
     for interp, actual_version in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1])):
         if _can_create_python_venv(sandbox, interp):
@@ -439,7 +463,7 @@ def _ensure_python_deps(
     # Step 2: Bootstrap build tools without a cutoff so legacy build backends
     # can be used by the subsequent date-pinned, no-build-isolation install.
     bootstrap = sandbox.exec(
-        f"{venv_pip} install --quiet --upgrade pip uv 'setuptools<67.5' wheel",
+        f"{venv_pip} install --quiet --upgrade pip uv 'setuptools<67.5' wheel setuptools-scm",
         timeout=60,
     )
     if bootstrap.exit_code != 0 or bootstrap.timed_out:
@@ -457,17 +481,17 @@ def _ensure_python_deps(
     strategies = []
     if install_cmd and "pip install" in install_cmd:
         if has_uv:
-            uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
+            uv_cmd = f"SETUPTOOLS_SCM_PRETEND_VERSION=9.9.9 VIRTUAL_ENV={venv_path} {uv_path} pip install"
             if as_of:
                 uv_cmd += f" --exclude-newer {as_of} --no-build-isolation"
             strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
         elif as_of:
             # Item 5: When uv is absent, do not abort; fall back to pip
-            pip_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
+            pip_cmd = install_cmd.replace("pip install", f"SETUPTOOLS_SCM_PRETEND_VERSION=9.9.9 {venv_pip} install", 1)
             strategies.append(("pip_fallback", pip_cmd))
 
         if as_of is None:
-            strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
+            strategies.append(("pip_plain", install_cmd.replace("pip install", f"SETUPTOOLS_SCM_PRETEND_VERSION=9.9.9 {venv_pip} install", 1)))
     elif install_cmd:
         if as_of and not has_uv:
             strategies.append(("generic", install_cmd))
