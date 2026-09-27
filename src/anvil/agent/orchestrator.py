@@ -55,6 +55,7 @@ from anvil.events import EventBus, Phase
 from anvil.llm.client import LLMClient, make_client
 from anvil.llm.errors import LLMError
 from anvil.sandbox.base import ExecResult
+from anvil.tools.base import ToolResult
 
 MAX_ADOPTION_RERUNS = 2  # how many failing commands the harness will run again when it looks for a repro to adopt
 
@@ -114,6 +115,7 @@ _COMPRESSIBLE = (PhaseStatus.DONE, PhaseStatus.GAVE_UP, PhaseStatus.CLOSED)
 class _Verdict:
     passed: bool
     feedback: str = ""
+    repro_failed: bool = False  # the harness's own repro re-run failed, so VERIFY never reached the model
 
 
 class Orchestrator:
@@ -552,6 +554,8 @@ class Orchestrator:
         )
         self._run_phase(Phase.PATCH, kickoff, gate=self._patch_gate)
         verdict = self._verify()
+        if warning_only and verdict.repro_failed:
+            verdict = self._judge_by_repository_tests(verdict)
         state.verified = verdict.passed
         if warning_only and not verdict.passed:
             if self._rollback(ref):
@@ -559,6 +563,33 @@ class Orchestrator:
                 state.limit("The retry to replace the assert failed verification; the earlier patch was restored.")
             else:
                 state.limit("The retry to replace the assert failed verification and the earlier patch could not be restored.")
+
+    def _judge_by_repository_tests(self, failed: _Verdict) -> _Verdict:
+        """After the assert retry the repro may fail only because it was written for the assert: the repository's tests decide.
+
+        A repro that catches ``AssertionError`` fails on the exception the issue asked for, and restoring the assert on that
+        alone delivers the wrong exception type (a real run did). So the harness runs ``run_tests`` itself: if the tests pass
+        the patch with the specific exception is kept (and the failed repro stays in the report's checks, so the confidence
+        is not high); if they fail, or there is no ``run_tests`` tool to ask, the verdict stands and the assert is restored.
+        """
+        try:
+            tool = self._ws.tools.get("run_tests")
+        except KeyError:
+            return failed
+        self._emitter.tool_call("run_tests", {})
+        try:
+            result = tool.run({}, self._ws.sandbox)
+        except Exception as exc:  # noqa: BLE001 - a crashing tool is a failed judgement, never a crashed run
+            result = ToolResult(False, f"run_tests failed to run: {type(exc).__name__}: {exc}")
+        self._emitter.tool_result("run_tests", result.ok, self._trim(result.output))
+        self._state.checks.append(CheckRun("run_tests (run by the harness)", result.ok))
+        if not result.ok:
+            return failed
+        self._state.limit(
+            "After replacing the assert, the repro (written for the assert) no longer passed, but the repository's tests do, "
+            "so the patch with the specific exception was kept."
+        )
+        return _Verdict(True)
 
     def _revert_files(self, paths: Sequence[str]) -> None:
         """Put ``paths`` back as they are in the base commit (a file that is not tracked is removed)."""
@@ -618,7 +649,7 @@ class Orchestrator:
             passed = result.exit_code == 0 and not result.timed_out
             state.checks.append(CheckRun(f"repro `{state.repro_cmd}` (re-run by the harness)", passed))
             if not passed:
-                return _Verdict(False, self._trim(f"The repro still fails after your patch:\n{text}"))
+                return _Verdict(False, self._trim(f"The repro still fails after your patch:\n{text}"), repro_failed=True)
         outcome = self._run_phase(Phase.VERIFY, verify_kickoff(repro_cmd=state.repro_cmd))
         tests = [record for record in outcome.records if record.tool == "run_tests"]
         for record in tests:

@@ -254,6 +254,13 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
   ("It works, but: ... replace each such assert with a specific exception"), which is checkpointed first, so a retry that fails
   verification is undone and the earlier patch delivered. An assert that survives is reported in the sanity line and under
   Warnings at the top of `report.md`; it does not lower the confidence. Found on `pallets__flask-4045`.
+  The retry's kickoff tells the model to update `.anvil/repro.py` to expect the new exception type and re-run it, because the
+  repro it wrote earlier is usually pinned to `AssertionError`. If the harness's repro re-run still fails after the retry, that
+  alone does not restore the assert (a real Flask run delivered the wrong exception type that way): the harness runs the
+  `run_tests` tool itself, and if the repository's tests pass the raise patch is kept, with a limitation line in `report.md`
+  and the failed repro left in the checks (so the confidence is medium, not high). If the tests fail, or there is no
+  `run_tests` tool, the assert patch is restored as before. Only a *failed repro* is judged this way; a VERIFY the model itself
+  ended with `give_up` stands, and so does any non-assert retry.
 - **`nav_tools`** (**off by default**): with it on, the `outline(path)` and `find_symbol(name)` tools are offered in LOCALIZE and
   PATCH only, with a line in the prompt; `find_references` is never offered. A tool the registry does not have is skipped. Its
   effect on tokens has not been measured, so it stays off until a real run shows tokens per call dropping.

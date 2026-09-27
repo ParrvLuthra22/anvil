@@ -398,7 +398,8 @@ def patch_kickoff(
             f"Your patch was checked before delivery. It works, but:\n{feedback}\n"
             "Replace each such assert in the source with a raised exception: a specific one (ValueError, TypeError, or the "
             "type the issue names) with a clear message that names the bad value, in the style the module already uses. "
-            "Change nothing else and keep the repro passing. This is your last attempt."
+            "The repro was written for the assert, so after the change update .anvil/repro.py to expect the new exception "
+            "type, then re-run it and make sure it passes. Change nothing else. This is your last attempt."
         )
     elif kind == "sanity":
         parts.append(
