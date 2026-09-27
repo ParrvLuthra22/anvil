@@ -13,6 +13,10 @@ dialect they were trained on, so all of these are accepted, surrounded by prose 
 * Qwen3-Coder XML: ``<tool_call><function=read_file><parameter=path>a.py</parameter></function></tool_call>``
 * a bare JSON object with ``tool``/``args`` or ``name``/``arguments`` (also ``parameters``)
 * OpenAI-shaped JSON: ``{"function": {"name": ..., "arguments": "<json string>" or {...}}}`` or ``{"tool_calls": [...]}``
+* Python call syntax as the last thing in a reply: ``phase_done(summary="...")``, also inside brackets or parentheses
+  (``[phase_done(summary="...")]``) and with a stray closing fence
+* the same call with its argument name inside the parentheses and the value after an equals sign:
+  ``[phase_done(summary)="..."]`` (seen from Qwen3-Coder), with or without brackets and a stray ``)``
 * several of the above in one reply (the first is taken; ``ParsedCalls`` reports them all)
 
 Malformed JSON is repaired where that is safe (see ``loads_lenient``).
@@ -157,13 +161,14 @@ def _scan(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
     found += _bare_calls(text, index, found)
     found += _function_block_calls(text, index, found)
     if not found:
-        found = _python_syntax_calls(text, index)
+        found = _python_syntax_calls(text, index) or _assigned_argument_calls(text, index)
     return sorted(found, key=lambda item: item.start)
 
 
 _FUNCTION_BLOCK_RE = re.compile(r"<function=([^>\s]+)>(.*?)</function\s*>", re.DOTALL | re.IGNORECASE)
 _TOOL_TAG_AFTER_RE = re.compile(r"\s*</(?:tool_call|function_call|tool_use)\s*>", re.IGNORECASE)
-_ORPHAN_FENCE_RE = re.compile(r"\s*(?:`{1,3}\w*\s*)?")
+_ORPHAN_FENCE_RE = re.compile(r"[\s\])}]*(?:`{1,3}\w*\s*)?")  # what may follow a call: closing brackets, a stray fence
+_TRAILING_DECORATION_RE = re.compile(r"[\s\])}`]*\Z")
 _OPENING_FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\n?[ \t]*\Z")
 _QUOTES = ("\"\"\"", "'''", "\"", "'")
 
@@ -192,14 +197,14 @@ def _function_block_calls(text: str, index: Mapping[str, Mapping[str, str]], tak
 def _python_syntax_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
     """``tool_name(key="value", ...)``: the Python-call form models fall back to, as the last thing in the reply.
 
-    Only a known tool, starting a line (list and quote marks allowed before it), followed by nothing but an optional
-    stray closing fence. Arguments must be literals: they are read with ``ast.literal_eval`` and never executed. A
-    call that is cut off is not completed by guesswork.
+    Only a known tool, starting a line (list and quote marks and opening brackets allowed before it), followed by nothing
+    but closing brackets and an optional stray closing fence. Arguments must be literals: they are read with
+    ``ast.literal_eval`` and never executed. A call that is cut off is not completed by guesswork.
     """
     if not index:
         return []
     names = "|".join(re.escape(name) for name in sorted(index, key=len, reverse=True))
-    for opening in re.finditer(rf"^[ \t>*`\-]*({names})\(", text, re.MULTILINE):
+    for opening in re.finditer(rf"^[ \t>*`\-\[(]*({names})\(", text, re.MULTILINE):
         scanned = _call_arguments(text, opening.end())
         if scanned is None:
             continue
@@ -211,8 +216,47 @@ def _python_syntax_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> l
         if call is None:
             continue
         start = opening.start(1)
+        while start > 0 and text[start - 1] in "[(":
+            start -= 1  # the brackets around the call go with it
         fence = _OPENING_FENCE_RE.search(text, 0, start)
         return [_Found(fence.start() if fence else start, len(text), [call])]
+    return []
+
+
+def _assigned_argument_calls(text: str, index: Mapping[str, Mapping[str, str]]) -> list[_Found]:
+    """``tool(arg)="value"``: the argument named inside the parentheses, its value after an equals sign.
+
+    What Qwen3-Coder wrote for phase_done, often inside brackets and with a stray closing parenthesis before the closing
+    bracket: ``[phase_done(summary)="..."]``. The same safety rules as the Python form: a known tool, a declared argument,
+    the call is the last thing in the reply, and one that is cut off (no closing quote) is not a call. The value runs from
+    the opening quote to the last quote before the trailing brackets, because a summary contains quotes of its own.
+    """
+    if not index:
+        return []
+    names = "|".join(re.escape(name) for name in sorted(index, key=len, reverse=True))
+    end = _TRAILING_DECORATION_RE.search(text).start()
+    for opening in re.finditer(rf"^[ \t>*`\-\[(]*({names})\(\s*(\w+)\s*\)\s*=\s*", text, re.MULTILINE):
+        name, argument = opening.group(1), opening.group(2)
+        if argument not in index[name]:
+            continue
+        quote = next((q for q in _QUOTES if text.startswith(q, opening.end())), None)
+        if quote is None:
+            continue
+        begin = opening.end() + len(quote)
+        if end - len(quote) < begin or not text.startswith(quote, end - len(quote)):
+            continue  # cut off, or prose follows the value: not the last thing in the reply
+        raw = text[begin : end - len(quote)]
+        try:
+            value = ast.literal_eval(f"{quote}{raw}{quote}")  # escape sequences as written
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            value = raw  # quotes of the same kind inside the value, or real line breaks: take it as it is
+        start = opening.start(1)
+        while start > 0 and text[start - 1] in "[(":
+            start -= 1
+        declared = index[name][argument]
+        if declared != "string" and isinstance(value, str):
+            value = _coerce(value, declared)  # a number or list written as text; a string is kept exactly as written
+        return [_Found(start, len(text), [{"tool": name, "args": {argument: value}}])]
     return []
 
 

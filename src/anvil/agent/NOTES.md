@@ -174,6 +174,13 @@ Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no othe
   thing in a reply for a known tool (read with `ast.literal_eval`; nothing is executed). Only the first call of a reply runs;
   the model is told how many more there were.
 - Reasoning (`<think>` blocks, `reasoning_content`) is removed before parsing and never enters the history; its tokens are counted.
+- **Brackets and misplaced arguments.** Python-call syntax is also read inside brackets or parentheses
+  (`[phase_done(summary="...")]`), and so is `tool(arg)="value"` with the argument name inside the parentheses and the value after
+  an equals sign, with or without brackets and a stray `)` (`[phase_done(summary)="...")]`, the exact shape Qwen3-Coder wrote on
+  `pallets__flask-4045`, where it made VERIFY and REVIEW end as "stalled" and FINALIZE lose its summary). The value runs from
+  the first quote to the last quote before the trailing brackets, since a summary has quotes of its own. Same safety rules as
+  before: a known tool, a declared argument, the call is the last thing in the reply, a cut-off call is not completed. Swept over
+  507 real assistant replies: 9 newly read as calls (all genuine), none read differently than before.
 - **HTTP 402 comes in two kinds, told apart by the body.** OpenRouter returned both to a free-tier key. One says to retry after
   in-flight requests settle (`in_flight_budget_exhausted`, with a `Retry-After` of about 2 minutes): a temporary budget, retried
   on a budget of its own, separate from the attempts 429 and 5xx share: 5 requests in all, waits of 2 to 4, 4 to 8, 8 to 16 and
