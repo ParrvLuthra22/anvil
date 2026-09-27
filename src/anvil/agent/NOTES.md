@@ -167,6 +167,15 @@ Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no othe
   thing in a reply for a known tool (read with `ast.literal_eval`; nothing is executed). Only the first call of a reply runs;
   the model is told how many more there were.
 - Reasoning (`<think>` blocks, `reasoning_content`) is removed before parsing and never enters the history; its tokens are counted.
+- **HTTP 402 comes in two kinds, told apart by the body.** OpenRouter returned both to a free-tier key. One says to retry after
+  in-flight requests settle (`in_flight_budget_exhausted`, with a `Retry-After` of about 2 minutes): a temporary budget, retried
+  on a budget of its own, separate from the attempts 429 and 5xx share: 5 requests in all, waits of 2 to 4, 4 to 8, 8 to 16 and
+  15 to 30 seconds (equal jitter), a `Retry-After` hint as a floor and never more than 30 s per wait; if it never settles the
+  error says so in one line (retryable, with the seconds waited) and what to do. Any other 402 is "out of credit": not retried,
+  one line naming the provider host, the model and `AI_API_KEY` (never the key, never credentials in `base_url`), with the
+  provider's own words kept in `LLMError.detail` for the trace. The same rule applies to a 402 reported inside a 200 body.
+  A provider reserves `max_tokens` against the account before answering, which is why the Qwen profile's reply cap is 4096
+  (the largest reply seen was 541 tokens; 8192 was refused, 4096 accepted); `max_output_tokens` in `config.yaml` overrides it.
 
 ## 5. Not implemented (do not document as features)
 

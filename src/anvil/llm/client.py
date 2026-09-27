@@ -4,6 +4,8 @@
 provider quirks from the agent:
 
 * transient failures (429, 5xx, network) are retried with jittered backoff;
+* an HTTP 402 that says to retry after in-flight requests settle (a provider's temporary budget, seen on OpenRouter's
+  free tier) is retried on a budget of its own, and any other 402 is "out of credit" and is not retried;
 * token usage is always reported, estimated at chars/4 when the provider omits it;
 * tools work whether or not the provider supports native tool calling (see
   ``tool_mode`` in config.yaml).
@@ -28,6 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -97,13 +100,23 @@ class UsageTotals:
     ignored_calls: int = 0  # tool calls beyond the first in a text-mode reply, which were not run
 
 
+# An HTTP 402 whose message says to retry once in-flight requests settle is a temporary budget, not an empty account.
+# It gets its own retry budget, so it does not use up the attempts that 429 and 5xx failures share.
+IN_FLIGHT_TRIES = 5  # requests sent in all, so at most IN_FLIGHT_TRIES - 1 waits
+IN_FLIGHT_BASE_SECONDS = 4.0  # the first wait is 2 to 4 s (equal jitter: never less than half), doubling each time
+IN_FLIGHT_MAX_SECONDS = 30.0  # also the ceiling for a longer Retry-After hint
+_IN_FLIGHT = re.compile(r"in[-_ ]flight", re.IGNORECASE)
+_SETTLE_HINT = re.compile(r"retry[- ]after|settle", re.IGNORECASE)
+
+
 class _Retryable(Exception):
     """Internal signal: this attempt failed in a way worth retrying."""
 
-    def __init__(self, error: LLMError, retry_after: float | None = None) -> None:
+    def __init__(self, error: LLMError, retry_after: float | None = None, *, in_flight: bool = False) -> None:
         super().__init__(str(error))
         self.error = error
         self.retry_after = retry_after
+        self.in_flight = in_flight  # an HTTP 402 asking to retry after in-flight requests settle
 
 
 class OpenAICompatClient(LLMClient):
@@ -403,16 +416,28 @@ class OpenAICompatClient(LLMClient):
         A good body is guaranteed to have ``choices[0].message`` as a dict.
         """
         attempts = self._config.max_attempts
-        for attempt in range(1, attempts + 1):
+        sent = failures = waits = 0
+        waited = 0.0
+        while True:
+            sent += 1
             try:
-                return self._send_once(payload, attempt)
+                return self._send_once(payload, sent)
             except _Retryable as failure:
-                if attempt == attempts:
+                if failure.in_flight:  # its own budget: it does not count against ``attempts``
+                    waits += 1
+                    if waits == IN_FLIGHT_TRIES:
+                        raise self._in_flight_exhausted(failure.error, sent, waited) from None
+                    delay = self._in_flight_delay(waits, failure.retry_after)
+                    waited += delay
+                    logger.warning("%s; in-flight retry %d/%d in %.1fs", failure.error, waits, IN_FLIGHT_TRIES - 1, delay)
+                    self._sleep(delay)
+                    continue
+                failures += 1
+                if failures == attempts:
                     raise failure.error from None
-                delay = self._delay(attempt, failure.retry_after)
-                logger.warning("%s; retry %d/%d in %.1fs", failure.error, attempt, attempts - 1, delay)
+                delay = self._delay(failures, failure.retry_after)
+                logger.warning("%s; retry %d/%d in %.1fs", failure.error, failures, attempts - 1, delay)
                 self._sleep(delay)
-        raise AssertionError("unreachable: max_attempts >= 1")  # pragma: no cover
 
     def _send_once(self, payload: dict[str, Any], attempt: int) -> dict:
         try:
@@ -426,6 +451,8 @@ class OpenAICompatClient(LLMClient):
             raise self._error(f"request failed: {type(exc).__name__}: {exc}", attempt) from None
 
         status = response.status_code
+        if status == 402:
+            raise self._payment_required(response.text, attempt, _retry_after_seconds(response.headers.get("retry-after")))
         if not response.is_success:
             detail = _excerpt(response.text)
             transient = status == 429 or status >= 500
@@ -452,6 +479,8 @@ class OpenAICompatClient(LLMClient):
         if not isinstance(error, dict):
             return _Retryable(self._error("response contained no completion", attempt, retryable=True))
         code = error.get("code")
+        if code == 402:
+            return self._payment_required(json.dumps(error), attempt, None)
         transient = isinstance(code, int) and (code == 429 or code >= 500)
         failure = self._error(
             "provider returned an error payload",
@@ -461,6 +490,35 @@ class OpenAICompatClient(LLMClient):
             detail=_excerpt(json.dumps(error)),
         )
         return _Retryable(failure) if transient else failure
+
+    def _payment_required(self, body: str, attempt: int, retry_after: float | None) -> LLMError | _Retryable:
+        """Classify an HTTP 402 by what its body says: wait for in-flight requests to settle, or the account is out of credit."""
+        detail = _excerpt(body)
+        if _IN_FLIGHT.search(body) and _SETTLE_HINT.search(body):
+            error = self._error("LLM request failed with HTTP 402", attempt, status=402, retryable=True, detail=detail)
+            return _Retryable(error, retry_after, in_flight=True)
+        host = _provider_host(self._config.base_url)
+        message = self._redact(
+            f"Out of credit: {host} refused the request (HTTP 402) for the key in {API_KEY_ENV} and model "
+            f"{self._config.model}. Add credit to that account, or set {API_KEY_ENV}, AI_BASE_URL and AI_MODEL for another provider."
+        )
+        return LLMError(message, status_code=402, retryable=False, attempts=attempt, detail=self._redact(detail))
+
+    def _in_flight_exhausted(self, last: LLMError, attempt: int, waited: float) -> LLMError:
+        message = self._redact(
+            f"The provider's in-flight budget stayed exhausted (HTTP 402, retry after in-flight requests settle) "
+            f"through {attempt} tries over about {waited:.0f}s. Add credit to the account behind {API_KEY_ENV}, "
+            "lower max_output_tokens, or wait and re-run."
+        )
+        return LLMError(message, status_code=402, retryable=True, attempts=attempt, detail=last.detail)
+
+    def _in_flight_delay(self, wait: int, retry_after: float | None) -> float:
+        """Seconds to wait before the next try of an in-flight 402: 2 to 30, doubling, jittered; a Retry-After hint is a floor."""
+        backoff = min(IN_FLIGHT_MAX_SECONDS, IN_FLIGHT_BASE_SECONDS * 2 ** (wait - 1))
+        delay = backoff / 2 + self._rng() * backoff / 2
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return min(IN_FLIGHT_MAX_SECONDS, delay)
 
     def _delay(self, attempt: int, retry_after: float | None) -> float:
         """Exponential backoff with equal jitter; a Retry-After hint sets the floor. Always capped."""
@@ -566,6 +624,14 @@ def _read_api_key() -> str:
             f"{API_KEY_ENV} contains spaces, line breaks or non-ASCII characters; check how it was exported"
         )
     return key
+
+
+def _provider_host(base_url: str) -> str:
+    """The host (and port) of ``base_url`` for a message: never the user:password part a URL may carry."""
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        return base_url
+    return f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
 
 
 def _mentions(text: str, name: str) -> bool:

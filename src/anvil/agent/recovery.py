@@ -474,6 +474,13 @@ def llm_failure_advice(exc: LLMError) -> str:
         return "The model or endpoint was not found: check model and base_url in config.yaml (or AI_MODEL and AI_BASE_URL)."
     if status == 413 or any(word in text for word in ("context length", "context window", "too many tokens", "too large")):
         return "The prompt is larger than the model accepts: lower max_context_tokens in config.yaml."
+    if status == 402 and exc.retryable:
+        return (
+            "The provider's in-flight budget stayed exhausted (a free or low-credit account): add credit, lower "
+            "max_output_tokens in config.yaml, or wait and re-run."
+        )
+    if status == 402:
+        return "The account is out of credit: add credit to it, or set AI_API_KEY, AI_BASE_URL and AI_MODEL for another provider."
     if status == 429:
         return (
             f"The provider's rate limit or quota was still exhausted after {exc.attempts or 'several'} attempts: "
