@@ -396,6 +396,8 @@ class TestPickPythonInterpreter:
         available = {"python3.13"}
 
         def mock_exec(cmd, **kwargs):
+            if cmd.startswith("command -v uv"):
+                return _exec_result(1)  # uv not available, so it skips the install fallback
             if cmd.startswith("command -v "):
                 return _exec_result(0 if cmd.rsplit(" ", 1)[-1] in available else 1)
             if "import sys" in cmd:
@@ -408,6 +410,32 @@ class TestPickPythonInterpreter:
 
         sb.exec.side_effect = mock_exec
         assert _pick_python_interpreter(sb, as_of="2021-05-13") == "python3.13"
+
+    def test_uv_python_install_fallback_when_date_cap_unavailable(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        available = {"python3.13"}
+
+        def mock_exec(cmd, **kwargs):
+            if cmd.startswith("command -v uv"):
+                return _exec_result(0)  # uv is available
+            if cmd.startswith("uv python install"):
+                return _exec_result(0)
+            if cmd.startswith("uv python find"):
+                return _exec_result(0, stdout="/mock/uv/python3.9/bin/python\n")
+            if cmd.startswith("command -v "):
+                return _exec_result(0 if cmd.rsplit(" ", 1)[-1] in available else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.13\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-uv\n")
+            if "-m venv" in cmd or "import ensurepip" in cmd or cmd.startswith("rm -rf"):
+                return _exec_result(0)
+            return _exec_result(1)
+
+        sb.exec.side_effect = mock_exec
+        # 2021-05-13 should map to best version 3.9 (released in 2020)
+        assert _pick_python_interpreter(sb, as_of="2021-05-13") == "/mock/uv/python3.9/bin/python"
 
 
 # ---------------------------------------------------------------------------

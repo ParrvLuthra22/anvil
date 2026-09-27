@@ -169,16 +169,44 @@ class TestEditFileTool:
 
     def test_not_found_includes_close_lines(self, sandbox):
         sandbox.write_file("close.py", "def foo():\n    pass\n")
-        result = EditFileTool().run({"path": "close.py", "old": "def fob():", "new": "def fob():"}, sandbox)
+        result = EditFileTool().run({"path": "close.py", "old": "def fob():\n    pass\n", "new": "def fob():"}, sandbox)
         assert not result.ok
-        # Should hint at the closest line
+        # Should hint at the closest block
         assert "foo" in result.output
+        assert "block" in result.output
 
     def test_multiple_occurrences_fails(self, sandbox):
         sandbox.write_file("dup.py", "x = 1\nx = 1\n")
         result = EditFileTool().run({"path": "dup.py", "old": "x = 1", "new": "x = 2"}, sandbox)
         assert not result.ok
         assert "2" in result.output  # mentions count
+
+    def test_fuzzy_match_dedented_old(self, sandbox):
+        sandbox.write_file("dedent.py", "def foo():\n    x = 1\n    y = 2\n")
+        old_str = "x = 1\ny = 2\n"
+        new_str = "x = 99\ny = 100\n"
+        result = EditFileTool().run({"path": "dedent.py", "old": old_str, "new": new_str}, sandbox)
+        assert result.ok
+        assert "    x = 99\n    y = 100\n" in sandbox.read_file("dedent.py")
+
+    def test_fuzzy_match_tabs_vs_spaces(self, sandbox):
+        sandbox.write_file("tabs.py", "def foo():\n\tx = 1\n")
+        old_str = "    x = 1\n"
+        new_str = "    x = 99\n"
+        result = EditFileTool().run({"path": "tabs.py", "old": old_str, "new": new_str}, sandbox)
+        assert result.ok
+        assert "\tx = 99\n" in sandbox.read_file("tabs.py")
+
+    def test_fuzzy_match_multiple_blocks(self, sandbox):
+        sandbox.write_file("dup_blocks.py", "def f1():\n  x = 1\ndef f2():\n\tx = 1\n")
+        # fuzzy match finds both, they both lack leading whitespace
+        # We make old_str not a substring by adding 4 spaces, while the file has 2 spaces and a tab.
+        old_str = "    x = 1\n"
+        new_str = "    x = 2\n"
+        result = EditFileTool().run({"path": "dup_blocks.py", "old": old_str, "new": new_str}, sandbox)
+        assert not result.ok
+        assert "ambiguous" in result.output.lower()
+        assert "2 times (ignoring indentation)" in result.output
 
     def test_missing_file(self, sandbox):
         result = EditFileTool().run({"path": "nope.py", "old": "x", "new": "y"}, sandbox)
