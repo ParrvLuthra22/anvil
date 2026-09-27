@@ -57,7 +57,7 @@ def test_the_other_scenarios_still_pass_with_the_short_prompts_switched_on(tmp_p
         + wrong_patch("return a ** b", "return a // b", "floor")
         + good_patch() + verify() + review_ok() + finalize()
     )
-    rollback = execute(script, tmp_path / "r", max_patch_attempts=3, max_rollbacks=1, features={"weak_model_prompts": True})
+    rollback = execute(script, tmp_path / "r", max_patch_attempts=3, max_rollbacks=1, max_total_patch_attempts=10, features={"weak_model_prompts": True})
     assert "rollbacks: 1" in rollback.report and "Verified after patching: yes" in rollback.report
     assert all(m[0]["content"].startswith(WEAK_BASE_START) for m, _ in rollback.llm.calls)
 

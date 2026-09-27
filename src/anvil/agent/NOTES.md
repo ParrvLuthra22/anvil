@@ -85,7 +85,8 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 **Patch, verify, rollback (orchestrator + `Checkpointer`):**
 - A checkpoint is taken when PATCH starts (`patch-start`). After each PATCH the harness re-runs the repro itself, then
   the model runs the tests. On failure the model retries (up to `max_patch_attempts`, 3); after that the tree is rolled back
-  (up to `max_rollbacks`, 2) and the model is told the approaches already tried plus the last failing output.
+  (up to `max_rollbacks`, 2) and the model is told the approaches already tried plus the last failing output. Whatever these two allow,
+  a run makes at most `max_total_patch_attempts`, 3, PATCH attempts in all (next section).
   When both are used up the last patch is kept, unverified, at low confidence.
 - The repro script (written with `write_repro` under `.anvil/`) is saved and restored around every checkpoint and rollback.
 - **REPRODUCE must not fix the bug.** A checkpoint (`reproduce-start`) is taken when the phase begins, and the phase has no
@@ -114,12 +115,16 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
   the retry. The last passed: verified, with a limitation note. No test run but a repro that passes: verified on the repro alone,
   flagged (`verify_without_tests`) so the confidence cannot be high. Neither: failed. A `give_up` is the model's own verdict and
   stands. A real run went back through PATCH and VERIFY for a fix that worked because its VERIFY stalled after the tests passed.
-- **How many times VERIFY can send the run back to PATCH.** A failed verification is a loop-back: the first attempt plus
-  `max_patch_attempts - 1` (2 by default) retries per approach. After that the tree is rolled back and the model must take a
-  different approach (at most `max_rollbacks`, 2 by default), each approach again getting up to 3 attempts, so PATCH runs at most
-  `max_patch_attempts * (1 + max_rollbacks)` times (9 by default). A VERIFY that merely stops without a verdict never loops
-  back by itself when the evidence passes, so it cannot re-open a fix that works, and a VERIFY after a loop-back is decided the
-  same way as the first.
+- **A hard total of PATCH attempts per run: `max_total_patch_attempts` (3: the first attempt and two retries).** It counts every
+  PATCH attempt in the run, whatever asked for it: the attempt loop (retries after a failed VERIFY, and rethinks after a
+  rollback), the reviewer's rework round and the sanity retry. Rollbacks and approaches (`max_patch_attempts` per approach,
+  `max_rollbacks`) still work but can only spend attempts from the same three, so with the defaults a rollback never happens
+  (a third failure is the last attempt). After the last attempt the run stops patching and goes on to FINALIZE with the best
+  verified state there is: a failed rework puts the reviewed (verified) patch back; a first solve that never verified delivers the
+  last attempt's patch, unverified, with the confidence capped at low. `report.md` says why it stopped (a known limitation naming
+  the limit and the last verification result). A rework the attempts do not allow is skipped and says so, and so is a sanity retry
+  ("no retry: the limit of 3 PATCH attempts per run was already used"). A VERIFY that merely stops without a verdict never loops
+  back by itself when the evidence passes, so it cannot re-open a fix that works.
 - REVIEW reads and may run tests but cannot edit: its tools are `git_diff`, `read_file` and `run_tests` (not `run_cmd`, not
   `edit_file`). `run_tests` is there because a real model spent its REVIEW calls on it and was refused; it changes nothing in the
   repository.

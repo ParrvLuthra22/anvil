@@ -408,8 +408,18 @@ class Orchestrator:
         changes = self._review()
         if not changes:
             return
+        if self._patch_attempts_left() <= 0:
+            self._state.limit(
+                f"The reviewer requested changes, but the limit of {self._settings.max_total_patch_attempts} PATCH attempts "
+                "per run was already used, so no rework was made; the reviewed patch is delivered as it is."
+            )
+            return
         self._state.limit("The reviewer requested changes; one rework round was made and was not re-reviewed.")
         self._patch_until_verified("rework", changes)
+
+    def _patch_attempts_left(self) -> int:
+        """PATCH attempts the run may still make: ``max_total_patch_attempts`` counts every one (attempts, rework, sanity retry)."""
+        return self._settings.max_total_patch_attempts - self._state.patch_attempts
 
     def _patch_until_verified(self, kind: str, feedback: str = "") -> None:
         """Alternate PATCH and VERIFY; retry on failure, roll back and rethink after too many failures.
@@ -442,6 +452,9 @@ class Orchestrator:
                 return
             failed += 1
             feedback = verdict.feedback
+            if self._patch_attempts_left() <= 0:
+                self._abandon_patching(rework, ref, limit_reached=True, last_result=verdict.feedback)
+                return
             if failed < settings.max_patch_attempts:
                 kind = "retry"
             elif rollbacks < max_rollbacks and self._rollback(ref, approaches):
@@ -452,7 +465,13 @@ class Orchestrator:
                 self._abandon_patching(rework, ref)
                 return
 
-    def _abandon_patching(self, rework: bool, ref: str | None) -> None:
+    def _abandon_patching(self, rework: bool, ref: str | None, *, limit_reached: bool = False, last_result: str = "") -> None:
+        """Stop patching and go on to the end of the run with the best state there is.
+
+        The best state is a verified one: for a failed rework the reviewed patch is put back. A first solve that never
+        verified has none, so the last attempt's patch is delivered, unverified. ``limit_reached`` says the hard total
+        of PATCH attempts is what stopped the run, and the report says so.
+        """
         state = self._state
         if not rework:
             state.limit(
@@ -464,6 +483,13 @@ class Orchestrator:
             state.limit("The reviewer's requested rework failed verification; the reviewed patch was restored.")
         else:
             state.limit("The reviewer's requested rework failed verification and could not be rolled back.")
+        if limit_reached:
+            delivered = "the reviewed patch it restored" if rework and state.verified else "the last attempt's patch"
+            state.limit(
+                f"PATCH stopped at its limit of {self._settings.max_total_patch_attempts} attempts per run "
+                f"(max_total_patch_attempts), whatever rollbacks or approaches remained; {delivered} is delivered. "
+                f"Last verification result: {clip_head(' '.join(last_result.split()), 300) or 'none'}"
+            )
 
     # ---- the patch sanity check (features.patch_sanity) -----------------------------------------
 
@@ -484,7 +510,7 @@ class Orchestrator:
             return
         try:
             check = self._inspect_patch()
-            if (check.problem or check.warnings) and allow_retry:
+            if (check.problem or check.warnings) and allow_retry and self._patch_attempts_left() > 0:
                 reason = check.problem or check.warning_text
                 self._sanity_retried = True
                 self._sanity_first_problem = reason
@@ -566,6 +592,8 @@ class Orchestrator:
                     if retried
                     else f" (no retry: the run had already stopped: {state.halted})"
                 )
+            elif not retried and self._patch_attempts_left() <= 0:
+                outcome += f" (no retry: the limit of {self._settings.max_total_patch_attempts} PATCH attempts per run was already used)"
             state.limit(f"The patch failed its sanity check: {check.problem}")
         state.sanity = outcome
         self._emitter.message("system", f"Patch sanity: {outcome}")

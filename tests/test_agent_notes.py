@@ -30,6 +30,7 @@ def test_the_recovery_limits_are_the_ones_the_notes_state():
     assert "3 times in a row" in NOTES and "Strike n of 3" in NOTES and "nudged once" in NOTES
     assert f"`max_patch_attempts`, {settings.max_patch_attempts}" in NOTES
     assert f"`max_rollbacks`, {settings.max_rollbacks}" in NOTES
+    assert f"`max_total_patch_attempts`, {settings.max_total_patch_attempts}" in NOTES and "`max_total_patch_attempts` (3" in NOTES
 
 
 def test_the_config_keys_the_pipeline_reads_are_in_config_yaml():

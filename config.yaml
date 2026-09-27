@@ -99,6 +99,9 @@ context_summarize_threshold: 0.75
 # After max_rollbacks rollbacks the run stops trying and reports low confidence.
 max_patch_attempts: 3
 max_rollbacks: 2
+# A hard limit on PATCH attempts in one whole run: the first attempt and two retries, whatever the rollbacks, approaches,
+# reviewer rework or sanity retry that would ask for more. After the last one the run stops patching and finalizes.
+max_total_patch_attempts: 3
 
 # Install the repository's dependencies after profiling (Python: into a venv in .anvil_venv, put first on
 # PATH for every command). Without them the tests usually cannot import the code. Set false to skip.

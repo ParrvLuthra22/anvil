@@ -42,6 +42,7 @@ class AgentSettings:
     context_keep_steps: int = DEFAULT_TOKEN_SAVING_KEEP_STEPS
     context_summarize_threshold: float = DEFAULT_SUMMARIZE_THRESHOLD
     max_patch_attempts: int = 3
+    max_total_patch_attempts: int = 3
     max_rollbacks: int = 2
     command_timeout_seconds: int = 120
     output_dir: str = "output"
@@ -95,6 +96,7 @@ class AgentSettings:
                 config, "context_summarize_threshold", cls.context_summarize_threshold, 0.1, 1.0
             ),
             max_patch_attempts=_whole(config, "max_patch_attempts", cls.max_patch_attempts, 1),
+            max_total_patch_attempts=_whole(config, "max_total_patch_attempts", cls.max_total_patch_attempts, 1),
             max_rollbacks=_whole(config, "max_rollbacks", cls.max_rollbacks, 0),
             command_timeout_seconds=_whole(config, "command_timeout_seconds", cls.command_timeout_seconds, 1),
             output_dir=output_dir.strip(),

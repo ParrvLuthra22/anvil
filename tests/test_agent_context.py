@@ -119,7 +119,7 @@ def test_the_diff_is_pinned_from_the_first_phase_after_the_patch_exists(tmp_path
 def test_no_phase_after_a_rollback_is_shown_the_discarded_patch(tmp_path):
     wrong = wrong_patch("return a - b", "return a * b", "used multiplication")
     script = understand() + localize() + reproduce() + (wrong + verify()) * 6 + finalize()
-    run = execute(script, tmp_path)
+    run = execute(script, tmp_path, max_total_patch_attempts=10)
     patch_calls = calls_in_phase(run, "patch")
     rethink = [m for m in patch_calls if any("DIFFERENT hypothesis" in x["content"] for x in m)]
     assert rethink
