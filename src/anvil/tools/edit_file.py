@@ -64,22 +64,81 @@ class EditFileTool:
         except OSError as exc:
             return ToolResult(ok=False, output=f"Could not read file: {exc}")
 
+        # Warn if old and new are identical when stripped (whitespace-only diff)
+        whitespace_only = (old.strip() == new.strip() and old != new)
+
         count = content.count(old)
+        updated = ""
 
-        if count == 0:
-            # Help the model by returning the closest matching lines
-            close = self._closest_lines(old, content)
-            hint = (
-                f"\nClosest existing lines (for reference):\n{close}"
-                if close else ""
-            )
-            return ToolResult(
-                ok=False,
-                output=f"String not found in {path!r}.{hint}",
-                meta={"match_count": 0},
-            )
+        if count == 1:
+            updated = content.replace(old, new, 1)
+        elif count == 0:
+            # Fallback 1: try a match ignoring leading whitespace per line
+            def _strip_leading(s: str) -> str:
+                return "\n".join(line.lstrip() for line in s.splitlines())
 
-        if count > 1:
+            old_stripped = _strip_leading(old)
+            # Find all potential matches in content that map to old_stripped
+            import re
+            
+            lines = content.splitlines(keepends=True)
+            # We want to find a sequence of lines whose lstripped version matches old_stripped.
+            # To be safe, we will just find instances of old_stripped in a stripped version of content,
+            # but that destroys the original spacing. Let's do a line-by-line sliding window.
+            old_lines_stripped = old.splitlines()
+            old_lines_stripped_norm = [l.lstrip() for l in old_lines_stripped]
+            
+            matches = []
+            for i in range(len(lines) - len(old_lines_stripped_norm) + 1):
+                window = lines[i:i + len(old_lines_stripped_norm)]
+                window_stripped = [l.lstrip().rstrip("\n\r") for l in window]
+                # Compare without trailing newlines just for matching
+                old_cmp = [l.rstrip("\n\r") for l in old_lines_stripped_norm]
+                if window_stripped == old_cmp:
+                    matches.append((i, i + len(old_lines_stripped_norm), window))
+
+            if len(matches) == 1:
+                # Exactly one match ignoring leading whitespace. Re-indent new_string.
+                start_idx, end_idx, matched_lines = matches[0]
+                
+                # Determine original indentation of the first line of the block
+                first_line = matched_lines[0]
+                indent = first_line[:len(first_line) - len(first_line.lstrip())]
+                
+                # Re-indent new
+                new_lines = new.splitlines(keepends=True)
+                reindented_new = []
+                for j, nl in enumerate(new_lines):
+                    # Only add indent if the new line doesn't already have it
+                    # But actually, the instruction says "re-indent new_string to the file's indentation".
+                    # Let's see how much indent to add. If old was dedented, new is dedented.
+                    # We just prepend `indent` if it's relative, but it's simpler to assume new has same relative indentation.
+                    # Let's calculate the delta between `indent` and the first line of `old`
+                    old_first = old_lines_stripped[0] if old_lines_stripped else ""
+                    old_indent_str = old_first[:len(old_first) - len(old_first.lstrip())]
+                    
+                    if nl.startswith(old_indent_str):
+                        reindented_new.append(indent + nl[len(old_indent_str):])
+                    else:
+                        reindented_new.append(indent + nl)
+                
+                new_block = "".join(reindented_new)
+                
+                # Replace the matched lines in content
+                lines[start_idx:end_idx] = [new_block]
+                updated = "".join(lines)
+            else:
+                # 0 or multiple fuzzy matches
+                close = self._closest_actual_block(old, content)
+                hint = f"\nClosest existing block (with original indentation):\n{close}" if close else ""
+                
+                msg = f"String not found in {path!r}." if len(matches) == 0 else f"String found {len(matches)} times (ignoring indentation) in {path!r} — edit is ambiguous."
+                return ToolResult(
+                    ok=False,
+                    output=f"{msg}{hint}",
+                    meta={"match_count": 0},
+                )
+        else:
             return ToolResult(
                 ok=False,
                 output=(
@@ -89,11 +148,6 @@ class EditFileTool:
                 meta={"match_count": count},
             )
 
-        # Exactly one match — apply
-        # Warn if old and new are identical when stripped (whitespace-only diff)
-        whitespace_only = (old.strip() == new.strip() and old != new)
-
-        updated = content.replace(old, new, 1)
         try:
             sandbox.write_file(path, updated)
         except (PermissionError, OSError) as exc:
@@ -132,9 +186,7 @@ class EditFileTool:
                 return f"SyntaxError: {e.msg} at line {e.lineno}, column {e.offset}"
             return None
         elif path.endswith((".js", ".ts")):
-            # Quote the path to avoid issues with spaces (though usually not present)
             res = sandbox.exec(f"node --check '{path}'")
-            # 127 is command not found
             if res.exit_code == 127 or not res.stderr.strip() and res.exit_code == 0:
                 pass
             elif res.exit_code != 0:
@@ -148,22 +200,25 @@ class EditFileTool:
         return None
 
     @staticmethod
-    def _closest_lines(query: str, content: str) -> str:
-        """Return the *_CLOSE_MATCH_LINES* lines from *content* most similar to *query*."""
-        # Use the first line of the query for matching heuristic
-        query_first = query.splitlines()[0] if query.strip() else query
+    def _closest_actual_block(query: str, content: str) -> str:
+        """Return a block of ~15 lines from *content* most similar to *query*."""
+        query_lines = query.splitlines()
         content_lines = content.splitlines()
-        matches = difflib.get_close_matches(
-            query_first, content_lines, n=_CLOSE_MATCH_LINES, cutoff=0.3
-        )
-        if not matches:
-            # Fall back to sequence matcher on the whole string
-            sm = difflib.SequenceMatcher(None, query, content)
-            _, j, _ = sm.find_longest_match(0, len(query), 0, len(content))
-            # Return lines around the best match position
-            char_pos = j
-            before = content[:char_pos].count("\n")
-            start = max(0, before - 2)
-            end = min(len(content_lines), before + 3)
-            matches = content_lines[start:end]
+        
+        if not content_lines:
+            return ""
+            
+        sm = difflib.SequenceMatcher(None, query, content)
+        _, j, _ = sm.find_longest_match(0, len(query), 0, len(content))
+        
+        char_pos = j
+        before = content[:char_pos].count("\n")
+        
+        # ~15 lines around the best match
+        start = max(0, before - 7)
+        end = min(len(content_lines), before + 8)
+        
+        # Format with line numbers for clarity if needed, or just plain lines.
+        # The prompt says "ACTUAL block from the file around the best fuzzy match (with real indentation, up to ~15 lines)".
+        matches = content_lines[start:end]
         return "\n".join(matches)
