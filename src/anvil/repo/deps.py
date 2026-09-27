@@ -28,6 +28,12 @@ _VENV_DIR = ".anvil_venv"  # relative to sandbox root; separate from the harness
 
 # Interpreter candidates probed in order (newest first).
 _PYTHON_CANDIDATES = ["python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python3"]
+_PYTHON_RELEASE_DATES = {
+    "3.10": "2021-10-04",
+    "3.11": "2022-10-24",
+    "3.12": "2023-10-02",
+    "3.13": "2024-10-07",
+}
 
 
 @dataclass
@@ -164,14 +170,6 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
         The interpreter name (e.g. ``"python3.11"``), or ``None`` if none qualifies.
     """
     spec_str = _parse_requires_python(sandbox)
-    if as_of:
-        # Python 3.13 removed cgi, imp, etc. (released Oct 2024)
-        if as_of < "2024-10-01":
-            spec_str = f"{spec_str},<3.13" if spec_str else "<3.13"
-        # Python 3.12 removed distutils (released Oct 2023)
-        if as_of < "2023-10-01":
-            spec_str = f"{spec_str},<3.12" if spec_str else "<3.12"
-            
     specifier = None
     if spec_str:
         try:
@@ -181,6 +179,7 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
             log.warning("Could not parse requires-python %r: %s", spec_str, e)
             specifier = None
 
+    newer_than_cutoff = []
     for interp in _PYTHON_CANDIDATES:
         # 1. Is it on PATH?
         probe = sandbox.exec(f"command -v {interp}", timeout=5)
@@ -205,25 +204,86 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
                 )
                 continue
 
-        # 3. Can it create a venv and does it have required modules?
-        probe_dir = f".probe_{interp.replace('.', '_')}"
-        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
-        venv_create = sandbox.exec(f"{interp} -m venv {probe_dir}", timeout=30)
-        if venv_create.exit_code != 0:
-            log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
-            continue
-            
-        verify = sandbox.exec(f"{probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'", timeout=10)
-        sandbox.exec(f"rm -rf {probe_dir}", timeout=10)
-        
-        if verify.exit_code != 0:
-            log.debug("Skipping %s — broken interpreter (missing ensurepip, pyexpat, or ssl): %s", interp, verify.stderr[:100])
+        if as_of and not _python_version_available_by(actual_version, as_of):
+            newer_than_cutoff.append((interp, actual_version))
             continue
 
-        log.info("Selected Python interpreter: %s", interp)
-        return interp
+        # 3. Can it create a venv and does it have required modules?
+        if _can_create_python_venv(sandbox, interp):
+            log.info("Selected Python interpreter: %s", interp)
+            return interp
+
+    # The cutoff is a preference, not a hard constraint: old interpreters may
+    # be unavailable on the host, so try the newest working newer candidate.
+    for interp, _ in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1]), reverse=True):
+        if _can_create_python_venv(sandbox, interp):
+            log.info("Selected Python interpreter %s as a fallback newer than cutoff %s", interp, as_of)
+            return interp
 
     return None
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Return a sortable numeric Python major/minor version tuple."""
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _python_version_available_by(version: str, as_of: str) -> bool:
+    """Whether a known Python minor release existed by the dependency cutoff."""
+    release_date = _PYTHON_RELEASE_DATES.get(version)
+    return release_date is None or release_date <= as_of[:10]
+
+
+def _can_create_python_venv(sandbox: Sandbox, interp: str) -> bool:
+    """Probe venv support in an external temporary directory and always clean it up."""
+    temp_result = sandbox.exec(
+        f'{interp} -c "import tempfile; print(tempfile.mkdtemp(prefix=\'anvil-probe-\'))"',
+        timeout=10,
+    )
+    if temp_result.exit_code != 0 or temp_result.timed_out:
+        log.debug("Skipping %s — cannot create temporary probe directory: %s", interp, temp_result.stderr[:100])
+        return False
+    probe_dir = temp_result.stdout.strip()
+    if not probe_dir or not Path(probe_dir).is_absolute():
+        log.debug("Skipping %s — invalid temporary probe directory path", interp)
+        return False
+
+    try:
+        try:
+            Path(probe_dir).resolve().relative_to(sandbox.root.resolve())
+        except ValueError:
+            pass
+        else:
+            log.warning("Skipping %s — temporary probe directory is inside the repository", interp)
+            return False
+
+        quoted_probe_dir = shlex.quote(probe_dir)
+        venv_create = sandbox.exec(f"{interp} -m venv {quoted_probe_dir}", timeout=30)
+        if venv_create.exit_code != 0 or venv_create.timed_out:
+            log.debug("Skipping %s — cannot create venv: %s", interp, venv_create.stderr[:100])
+            return False
+
+        verify = sandbox.exec(
+            f"{quoted_probe_dir}/bin/python -c 'import ensurepip, pyexpat, ssl'",
+            timeout=10,
+        )
+        if verify.exit_code != 0 or verify.timed_out:
+            log.debug(
+                "Skipping %s — broken interpreter (missing ensurepip, pyexpat, or ssl): %s",
+                interp, verify.stderr[:100],
+            )
+            return False
+        return True
+    finally:
+        try:
+            cleanup = sandbox.exec(f"rm -rf -- {shlex.quote(probe_dir)}", timeout=10)
+            if cleanup.exit_code != 0:
+                log.warning("Could not remove temporary interpreter probe %s: %s", probe_dir, cleanup.stderr[:100])
+        except Exception:  # noqa: BLE001 - cleanup must not hide probe failures
+            log.warning("Could not remove temporary interpreter probe %s", probe_dir)
 
 
 def _normalize_as_of(value: str | date | datetime) -> str:
@@ -289,8 +349,14 @@ def _ensure_python_deps(
             ),
         )
 
-    # Step 2: Upgrade pip and try to install uv
-    sandbox.exec(f"{venv_pip} install --quiet --upgrade pip uv", timeout=60)
+    # Step 2: Bootstrap build tools without a cutoff so legacy build backends
+    # can be used by the subsequent date-pinned, no-build-isolation install.
+    bootstrap = sandbox.exec(
+        f"{venv_pip} install --quiet --upgrade pip uv 'setuptools<67.5' wheel",
+        timeout=60,
+    )
+    if bootstrap.exit_code != 0 or bootstrap.timed_out:
+        log.warning("Could not bootstrap pip/uv/setuptools/wheel: %s", bootstrap.stderr[:200])
 
     # Step 3: Run the install command using the venv's pip or uv
     install_cmd = profile.install_cmd
@@ -301,15 +367,20 @@ def _ensure_python_deps(
     if install_cmd and "pip install" in install_cmd:
         uv_path = f"{venv_path}/bin/uv"
         uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
-        
+
         if uv_probe.exit_code == 0:
             uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
             if as_of:
-                uv_cmd += f" --exclude-newer {as_of}"
+                uv_cmd += f" --exclude-newer {as_of} --no-build-isolation"
             strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
-        
-        strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
+
+        if as_of is None:
+            strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
+        elif uv_probe.exit_code != 0:
+            return _date_pin_failure("uv is unavailable for the requested cutoff.", venv_python)
     elif install_cmd:
+        if as_of:
+            return _date_pin_failure("the repository install command cannot be date-pinned.", venv_python)
         strategies.append(("generic", install_cmd))
         
     result = None
@@ -327,14 +398,17 @@ def _ensure_python_deps(
 
         if result is None or result.timed_out or result.exit_code != 0:
             status = "Install timed out" if (result and result.timed_out) else "Install failed"
+            details = (
+                f"{status} after trying all strategies.\n"
+                f"Command: {strategies[-1][1] if strategies else 'None'}\n"
+                f"stdout: {result.stdout[:400] if result else ''}\n"
+                f"stderr: {result.stderr[:400] if result else ''}"
+            )
+            if as_of:
+                return _date_pin_failure(details, venv_python)
             return DepsResult(
                 ok=False,
-                report=(
-                    f"{status} after trying all strategies.\n"
-                    f"Command: {strategies[-1][1] if strategies else 'None'}\n"
-                    f"stdout: {result.stdout[:400] if result else ''}\n"
-                    f"stderr: {result.stderr[:400] if result else ''}"
-                ),
+                report=details,
                 venv_python=venv_python,
             )
 
@@ -345,26 +419,50 @@ def _ensure_python_deps(
         cmd_framework = f"{venv_pip} install --quiet {test_framework_pkg}"
         if as_of:
             uv_path = f"{venv_path}/bin/uv"
-            if sandbox.exec(f"test -x {uv_path}", timeout=5).exit_code == 0:
-                cmd_framework = f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet --exclude-newer {as_of} {test_framework_pkg}"
+            if sandbox.exec(f"test -x {uv_path}", timeout=5).exit_code != 0:
+                return _date_pin_failure("uv is unavailable to install the test framework with the requested cutoff.", venv_python)
+            cmd_framework = (
+                f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet "
+                f"--exclude-newer {as_of} --no-build-isolation {test_framework_pkg}"
+            )
             
         framework_result = sandbox.exec(cmd_framework, timeout=60)
         if framework_result.exit_code != 0 or framework_result.timed_out:
+            if as_of:
+                return _date_pin_failure(
+                    f"the pinned test-framework install failed: {framework_result.stderr[:400]}",
+                    venv_python,
+                )
             return DepsResult(
                 ok=False,
                 report=f"Test framework install failed: {framework_result.stderr[:400]}",
                 venv_python=venv_python,
             )
 
-    return DepsResult(
-        ok=True,
-        report=(
+    if as_of and not install_cmd and not test_framework_pkg:
+        report = (
+            f"Python venv prepared at {venv_path}/ using {interp}; "
+            "no dependencies were installed, so no date pin was needed."
+        )
+    else:
+        report = (
             f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy})."
             if as_of is None
             else f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of} (strategy: {used_strategy})."
-        ),
+        )
+
+    return DepsResult(
+        ok=True,
+        report=report,
         venv_python=venv_python,
     )
+
+
+def _date_pin_failure(reason: str, venv_python: str) -> DepsResult:
+    """Report a failed cutoff install without implying that it was applied."""
+    report = f"WARNING: date pin NOT applied. {reason}"
+    log.warning("%s", report)
+    return DepsResult(ok=False, report=report, venv_python=venv_python)
 
 
 def _ensure_js_deps(sandbox: Sandbox, profile: RepoProfile) -> DepsResult:

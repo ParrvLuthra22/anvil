@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
@@ -201,6 +202,11 @@ def resolve_base_ref(ref: IssueRef) -> BaseRefResult:
                 return BaseRefResult(None, "GitHub API rate-limited on timeline", True)
             t_resp.raise_for_status()
             timeline = t_resp.json()
+
+            if not isinstance(timeline, list):
+                message = "GitHub timeline response was not a list; unresolved, using HEAD"
+                logging.getLogger(__name__).warning("%s: %s", message, timeline)
+                return BaseRefResult(None, message, False)
             
             fix_commit = None
             fix_pr = None
