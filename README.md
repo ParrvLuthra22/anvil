@@ -77,6 +77,89 @@ adopted, a retry that was undone, a limit that stopped patching. Read it before 
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph UI["Interface"]
+        TUI["Textual TUI<br/>make run"]
+        HL["Headless CLI<br/>--headless --issue"]
+        RP["Replay<br/>anvil replay trace.jsonl"]
+    end
+    subgraph CORE["Agent core"]
+        ORCH["Orchestrator<br/>phase state machine"]
+        REC["Recovery<br/>rollback, forced close,<br/>loop detector, budgets"]
+        CTX["Context manager<br/>truncate, prune, pin, summarise"]
+        PR["Per-phase prompts<br/>and tool allowlists"]
+    end
+    subgraph LLM["LLM layer"]
+        CL["OpenAI-compatible client<br/>retry, 402 backoff, think-strip"]
+        PAR["Tool-call parser<br/>native, fenced JSON, Qwen XML,<br/>tool(key=value), bracket forms"]
+        EP["Endpoint resolver<br/>AI_BASE_URL, AI_MODEL,<br/>key only to resolved host"]
+    end
+    subgraph TOOLS["Tools"]
+        T1["list_dir, grep, read_file"]
+        T2["edit_file<br/>exact + whitespace-tolerant"]
+        T3["run_cmd (safety layer), run_tests, git_diff"]
+        T4["outline, find_symbol<br/>(flag: nav_tools)"]
+    end
+    subgraph ENV["Repo and sandbox"]
+        ING["Ingest<br/>issue fetch, clone, base-ref resolve"]
+        PRO["Profile and deps<br/>interpreter probe, date-pinned venv"]
+        SB["WorktreeSandbox<br/>checkpoint, rollback, diff<br/>(Docker opt-in)"]
+    end
+    subgraph OBS["Observability"]
+        BUS["EventBus"]
+        TR["TraceRecorder<br/>trace.jsonl"]
+    end
+    OUT["output/<br/>patch.diff, report.md, trace.jsonl"]
+    MODEL[("Foundation model<br/>DeepSeek or Qwen")]
+    TUI --> ORCH
+    HL --> ORCH
+    RP --> TR
+    ORCH --> PR
+    ORCH --> CTX
+    ORCH --> REC
+    ORCH --> CL
+    CL --> EP
+    CL --> PAR
+    CL <--> MODEL
+    PAR --> TOOLS
+    TOOLS --> SB
+    ING --> PRO
+    PRO --> SB
+    ORCH --> ING
+    ORCH -.events.-> BUS
+    BUS --> TUI
+    BUS --> TR
+    ORCH --> OUT
+    TR --> OUT
+```
+
+You start a run from the TUI, the headless command or a replay, and the orchestrator drives everything from there. It gives each phase its own prompt and tool list, keeps the conversation small, and steps in when the model loops, fails an edit or runs out of budget. The LLM layer talks to whatever OpenAI-compatible endpoint `AI_BASE_URL` and `AI_MODEL` name (read in `llm/config.py`), sends the key only to that host, and turns the model's reply into a tool call even when the model writes it as plain text. Tools change files only inside a git-worktree sandbox, and every event goes out on one bus to the TUI and to `trace.jsonl`, so a finished run can be replayed with no model at all.
+
+```mermaid
+stateDiagram-v2
+    [*] --> INGEST
+    INGEST --> PROFILE: repo cloned at pre-fix commit
+    PROFILE --> UNDERSTAND: venv built, tests detected
+    UNDERSTAND --> LOCALIZE
+    LOCALIZE --> REPRODUCE
+    REPRODUCE --> PATCH: failing repro (model-closed or adopted)
+    PATCH --> VERIFY
+    VERIFY --> REVIEW: tests pass
+    VERIFY --> PATCH: fail, rollback to checkpoint (max 3 attempts total)
+    REVIEW --> FINALIZE: approved
+    REVIEW --> PATCH: changes requested
+    FINALIZE --> [*]: patch.diff, report.md, trace.jsonl
+    LOCALIZE --> FINALIZE: give_up
+    PATCH --> FINALIZE: budget exhausted
+```
+
+A run moves through nine phases, and the first two, INGEST and PROFILE, are plain code with no model. A failed check sends the run back to PATCH, at most three attempts in total, and with the default settings a retry keeps the edits already made instead of rolling back. REVIEW either approves the patch or asks for one rework round, and a run can also end early when LOCALIZE gives up or a budget runs out. FINALIZE always runs and writes `patch.diff`, `report.md` and `trace.jsonl`.
+
+---
+
 ## Demo mode (no API key needed)
 
 ```bash
@@ -282,6 +365,7 @@ anvil/
 │   │   ├── repro.py           # write_repro tool; does a failing output match the issue?
 │   │   ├── sanity.py          # checks on the patch before delivery (empty, applies, tests, bare assert)
 │   │   ├── prompts.py         # phase prompts, tool allowlists, kickoff messages
+│   │   ├── testcmd.py         # which commands count as runs of the repository's own tests
 │   │   ├── settings.py · budget.py · usage.py · state.py   # typed settings, budgets, token use, run state
 │   │   ├── outputs.py · emitter.py · summarizer.py · text.py · prepared_sandbox.py
 │   │   └── NOTES.md           # behaviour notes: what the harness does, and why

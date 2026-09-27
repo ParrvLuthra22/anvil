@@ -92,35 +92,54 @@ the scorer and analyzer. `--only <id>` restricts the run to one known instance.
 Use a new results file when intentionally rerunning completed IDs, because
 resumption is keyed by completed instance id.
 
-environment selected Python 3.14, where the historically pinned pytest stack
-gold-check result, not evidence that the gold implementation is wrong. Akshat's
-## Early Results
-
-These four early runs used **Qwen3-Coder-30B on OpenRouter**. They are early
-observations, not a pass rate: the two toy runs are exploratory and are not
-scored issue instances, while the two repository runs ended in different
-failure categories. No per-run timing or token totals are reported here
-because the run records for these four results are not present in this
-checkout.
-
-| Run | Target | Result |
-|---|---|---|
-| Toy run 1 | Toy repository | Exploratory run; no issue-resolution score |
-| Toy run 2 | Toy repository | Exploratory run; no issue-resolution score |
-| Flask | `pallets__flask-4045` | `f2p_fail`; the patch used `assert` where the issue required `ValueError` |
-| pytest | `pytest-dev__pytest-11143` | `empty_patch`; no source patch was produced |
-
-These outcomes should not be combined into a resolved-rate denominator. The
-toy runs are not SWE-bench instances, and the issue-run records are too few to
-support a pass-rate claim. The locally saved integration audit under
-`bench/results-integration-real-audit.jsonl` is a separate run set and is not
-one of these four results.
-
 Failure categories emitted by the scorer are `no_patch`, `empty_patch`,
 `patch_does_not_apply`, `f2p_fail`, `p2p_regression`, `timeout`, and
 `harness_error`. The resolved rate is resolved instances divided by scored
 instances. Mean tokens per run includes all scored runs; tokens per resolved
 instance is also reported separately by the analyzer.
+
+## Early results (Qwen3-Coder-30B; not a pass rate)
+
+These are the only real runs recorded so far. They used **Qwen3-Coder-30B on
+OpenRouter**, with the settings that were current at the time. They are early
+observations, not a pass rate: four runs are too few for one, and two of them
+are on a toy repository written for the harness, not on scored issue instances.
+No per-run timing or token totals are reported because the run records for these
+four results are not in this checkout.
+
+| Run | Target | Result |
+|---|---|---|
+| Toy run 1 | Toy repository | Correct patch |
+| Toy run 2 | Toy repository | Correct patch |
+| Flask | `pallets__flask-4045` | Unresolved (`f2p_fail`): the patch used `assert` where the issue asked for `ValueError` |
+| pytest | `pytest-dev__pytest-11143` | Empty patch (`empty_patch`): `edit_file` could not apply the model's edits |
+
+So: the toy repository, 2 of 2 correct patches; the two real issues, 0 of 2
+resolved. Do not add these up into a resolved rate. The locally saved audit
+under `bench/results-integration-real-audit.jsonl` is a separate run set and is
+not one of these four results.
+
+## Known limitations
+
+- **There is no pass rate.** Four runs, one model, one provider. Nothing here
+  supports a claim about how often ANVIL resolves an issue.
+- **Neither real issue was resolved.** The Flask patch raised the wrong kind of error
+  (`assert`, not `ValueError`), and the pytest run produced no patch because the edit
+  tool could not apply the model's edits. Since then `edit_file` has been made
+  tolerant of indentation differences, and the retry that replaces a bare `assert`
+  has been changed so that a repro written for the assert cannot undo it. No rerun
+  is recorded in this document, so neither change is shown to fix these two issues.
+- **The toy successes prove little.** The toy repository was written to exercise
+  the harness. A correct patch there says the pipeline runs end to end, not that
+  it can fix a real project.
+- **Only Python repositories have been run.** JavaScript, TypeScript, Go, Rust and
+  Java are implemented but not verified end to end.
+- **A weak model often fails to close phases.** The harness closes them and says so
+  in `report.md`; results with a small model are usually medium confidence at
+  best, and confidence is not a measured probability of being right.
+- **Scoring needs a period-correct environment.** Old repositories need an old
+  Python and date-pinned dependencies, and a scorer failure on that is a harness
+  result, not evidence about the patch.
 
 ## Trace format
 

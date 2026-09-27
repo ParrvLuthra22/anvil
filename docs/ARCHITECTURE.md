@@ -6,20 +6,87 @@ while `RepoPipeline`, `PhaseRunner`, the tool registry, and the sandbox keep
 repository setup, model turns, and filesystem operations separate.
 
 ```mermaid
-flowchart LR
-  CLI[CLI / TUI] --> ORCH[Orchestrator]
-  ORCH --> PIPE[RepoPipeline: ingest + profile]
-  ORCH --> LOOP[PhaseRunner]
-  LOOP --> CTX[ContextManager]
-  LOOP --> LLM[OpenAI-compatible LLMClient]
-  LOOP --> REG[ToolRegistry]
-  REG --> SANDBOX[PreparedSandbox]
-  SANDBOX --> BACKEND[Worktree or Docker]
-  ORCH --> BUS[EventBus]
-  BUS --> TUI[Textual UI]
-  BUS --> TRACE[TraceRecorder]
-  ORCH --> FILES[patch.diff + report.md]
+flowchart TB
+    subgraph UI["Interface"]
+        TUI["Textual TUI<br/>make run"]
+        HL["Headless CLI<br/>--headless --issue"]
+        RP["Replay<br/>anvil replay trace.jsonl"]
+    end
+    subgraph CORE["Agent core"]
+        ORCH["Orchestrator<br/>phase state machine"]
+        REC["Recovery<br/>rollback, forced close,<br/>loop detector, budgets"]
+        CTX["Context manager<br/>truncate, prune, pin, summarise"]
+        PR["Per-phase prompts<br/>and tool allowlists"]
+    end
+    subgraph LLM["LLM layer"]
+        CL["OpenAI-compatible client<br/>retry, 402 backoff, think-strip"]
+        PAR["Tool-call parser<br/>native, fenced JSON, Qwen XML,<br/>tool(key=value), bracket forms"]
+        EP["Endpoint resolver<br/>AI_BASE_URL, AI_MODEL,<br/>key only to resolved host"]
+    end
+    subgraph TOOLS["Tools"]
+        T1["list_dir, grep, read_file"]
+        T2["edit_file<br/>exact + whitespace-tolerant"]
+        T3["run_cmd (safety layer), run_tests, git_diff"]
+        T4["outline, find_symbol<br/>(flag: nav_tools)"]
+    end
+    subgraph ENV["Repo and sandbox"]
+        ING["Ingest<br/>issue fetch, clone, base-ref resolve"]
+        PRO["Profile and deps<br/>interpreter probe, date-pinned venv"]
+        SB["WorktreeSandbox<br/>checkpoint, rollback, diff<br/>(Docker opt-in)"]
+    end
+    subgraph OBS["Observability"]
+        BUS["EventBus"]
+        TR["TraceRecorder<br/>trace.jsonl"]
+    end
+    OUT["output/<br/>patch.diff, report.md, trace.jsonl"]
+    MODEL[("Foundation model<br/>DeepSeek or Qwen")]
+    TUI --> ORCH
+    HL --> ORCH
+    RP --> TR
+    ORCH --> PR
+    ORCH --> CTX
+    ORCH --> REC
+    ORCH --> CL
+    CL --> EP
+    CL --> PAR
+    CL <--> MODEL
+    PAR --> TOOLS
+    TOOLS --> SB
+    ING --> PRO
+    PRO --> SB
+    ORCH --> ING
+    ORCH -.events.-> BUS
+    BUS --> TUI
+    BUS --> TR
+    ORCH --> OUT
+    TR --> OUT
 ```
+
+You start a run from the TUI, the headless command or a replay, and the orchestrator drives everything from there. It gives each phase its own prompt and tool list, keeps the conversation small, and steps in when the model loops, fails an edit or runs out of budget. The LLM layer talks to whatever OpenAI-compatible endpoint `AI_BASE_URL` and `AI_MODEL` name (read in `llm/config.py`), sends the key only to that host, and turns the model's reply into a tool call even when the model writes it as plain text. Tools change files only inside a git-worktree sandbox, and every event goes out on one bus to the TUI and to `trace.jsonl`, so a finished run can be replayed with no model at all.
+
+## Where each box of the first diagram lives
+
+Every box was checked against the source tree. Two labels are roles rather than
+modules: "Endpoint resolver" has no module of its own, and "Recovery" spans three.
+
+| Box | Where in `src/anvil/` |
+|---|---|
+| Textual TUI | `tui/app.py`; started by `__main__.py` (`make run`) |
+| Headless CLI, Replay | `__main__.py` (`--headless`, `replay`); replay loads the trace with `trace/recorder.py` |
+| Orchestrator | `agent/orchestrator.py` (phase order, the facts it checks itself), with `agent/pipeline.py` for INGEST and PROFILE |
+| Recovery | `agent/recovery.py` (loop detector, repeated-call refusal, checkpoints and rollback), `agent/closure.py` (the harness's own phase close), `agent/budget.py` (step, token and wall-clock budgets) |
+| Context manager | `context/manager.py`, `context/truncate.py`, `context/tokens.py`; summaries by `agent/summarizer.py` |
+| Per-phase prompts and tool allowlists | `agent/prompts.py` |
+| OpenAI-compatible client | `llm/client.py` (retry, the 402 rules), `llm/reasoning.py` (think-strip), `llm/profiles.py` |
+| Tool-call parser | `llm/toolcalls.py` |
+| Endpoint resolver | `llm/config.py` applies `AI_BASE_URL` and `AI_MODEL` over `config.yaml`; `llm/client.py` reads `AI_API_KEY` and sends it only in the request to that base URL |
+| list_dir, grep, read_file, edit_file, run_cmd, run_tests, git_diff | `tools/*.py`; the safety layer is in `tools/run_cmd.py` |
+| outline, find_symbol | `tools/outline.py`, `tools/find.py`; offered only with `features.nav_tools`. `find_references` and `related_tests` are registered but never offered to the model |
+| Ingest | `repo/ingest.py` (`fetch_issue`, `clone_repo`, `resolve_base_ref`) |
+| Profile and deps | `repo/profile.py`, `repo/deps.py` (interpreter choice by release date, date-pinned installs) |
+| WorktreeSandbox | `sandbox/worktree.py`; `sandbox/docker.py` is the opt-in alternative |
+| EventBus, TraceRecorder | `events.py`, `trace/recorder.py` |
+| output/ | written by `agent/outputs.py` |
 
 ## Run lifecycle and phases
 
@@ -27,6 +94,26 @@ flowchart LR
 always enters finalization. INGEST and PROFILE are deterministic pipeline work;
 the remaining phases are LLM tool loops. Each transition is emitted as a trace
 event.
+
+```mermaid
+stateDiagram-v2
+    [*] --> INGEST
+    INGEST --> PROFILE: repo cloned at pre-fix commit
+    PROFILE --> UNDERSTAND: venv built, tests detected
+    UNDERSTAND --> LOCALIZE
+    LOCALIZE --> REPRODUCE
+    REPRODUCE --> PATCH: failing repro (model-closed or adopted)
+    PATCH --> VERIFY
+    VERIFY --> REVIEW: tests pass
+    VERIFY --> PATCH: fail, rollback to checkpoint (max 3 attempts total)
+    REVIEW --> FINALIZE: approved
+    REVIEW --> PATCH: changes requested
+    FINALIZE --> [*]: patch.diff, report.md, trace.jsonl
+    LOCALIZE --> FINALIZE: give_up
+    PATCH --> FINALIZE: budget exhausted
+```
+
+A run moves through nine phases, and the first two, INGEST and PROFILE, are plain code with no model. A failed check sends the run back to PATCH, at most three attempts in total, and with the default settings a retry keeps the edits already made instead of rolling back. REVIEW either approves the patch or asks for one rework round, and a run can also end early when LOCALIZE gives up or a budget runs out. FINALIZE always runs and writes `patch.diff`, `report.md` and `trace.jsonl`.
 
 | Phase | Work |
 |---|---|
@@ -58,7 +145,10 @@ stdin, output caps, and the prepared dependency environment.
 Before delivery, `features.patch_sanity` checks that the patch is non-empty and
 applies to a scratch checkout at the original base. Test-file changes are
 removed from the delivered diff unless the issue is specifically about tests.
-An empty or invalid patch gets one forced-fix retry. Harness scratch files,
+An empty or invalid patch gets one forced-fix retry, and so does a patch that
+adds a bare `assert` to non-test code: that retry asks for a specific exception,
+tells the model to update its repro to expect it, and is judged by the
+repository's tests if the old repro fails on the new exception. Harness scratch files,
 virtual environments, bytecode, and package metadata are excluded from the
 delivered diff.
 
@@ -82,9 +172,11 @@ so it skips issue-specific base-ref lookup. `--repo` can be used with
 The client supports three `tool_mode` settings. `native` sends OpenAI-compatible
 tool schemas. `text` adds tool instructions to the prompt and parses returned
 text. `auto` starts with native calls and falls back when the provider does not
-support the format or swallows the response. Text parsing accepts fenced JSON,
-tool tags, XML-style function parameters, OpenAI-shaped JSON, and literal
-Python-call syntax; arguments are parsed as data, never evaluated. In every
+support the format or swallows the response, and then stays in text mode for the
+rest of the run. Text parsing accepts fenced JSON, tool tags, XML-style function
+parameters, OpenAI-shaped JSON, literal Python-call syntax, and calls wrapped in
+brackets or parentheses (`[phase_done(summary)="..."]`); arguments are parsed as
+data, never evaluated. In every
 mode the canonical internal call is normalized before `PhaseRunner` checks it
 against the phase allowlist and registry.
 
@@ -133,14 +225,19 @@ recorded events and feeds them to the TUI without constructing an LLM client or
 making API calls. Every run attempts to write `patch.diff`, `report.md`, and
 `trace.jsonl` under the configured output directory.
 
+`report.md` states a confidence that follows the evidence: 0.90 needs repository
+tests that passed and an approved review, a review that never finished costs
+nothing but the approval bonus (0.75), and a patch verified only on the model's
+own repro is capped at 0.50 and says no repository tests were run.
+
 ## Design decisions measured
 
-No implementation decision is labelled measured yet. This checkout had no
-archived real baseline. The first real run is recorded in
-`docs/EVALUATION.md`, but it ended on provider quota and its scorer could not
-install the historical test environment; it cannot support a design or
-token-efficiency comparison. Add a measured decision here only after
-comparable before/after runs complete successfully.
+No implementation decision is labelled measured yet. The only real runs so far
+are the early Qwen3-Coder-30B results in `docs/EVALUATION.md`: two toy
+repositories and two SWE-bench-style issues, one unresolved and one with an empty
+patch. They are not a pass rate and cannot support a design or token-efficiency
+comparison. Add a measured decision here only after comparable before/after runs
+complete successfully.
 
 ## Support status and future work
 
