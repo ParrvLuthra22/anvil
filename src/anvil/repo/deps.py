@@ -27,13 +27,26 @@ _INSTALL_TIMEOUT = 300   # 5 minutes maximum for any install command
 _VENV_DIR = ".anvil_venv"  # relative to sandbox root; separate from the harness venv
 
 # Interpreter candidates probed in order (newest first).
-_PYTHON_CANDIDATES = ["python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python3"]
+_PYTHON_CANDIDATES = [
+    "python3.14",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3.9",
+    "python3",
+    "/usr/bin/python3",
+]
 _PYTHON_RELEASE_DATES = {
+    "3.8": "2019-10-14",
+    "3.9": "2020-10-05",
     "3.10": "2021-10-04",
     "3.11": "2022-10-24",
     "3.12": "2023-10-02",
     "3.13": "2024-10-07",
+    "3.14": "2025-10-07",
 }
+_INTERP_VERSION_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -158,16 +171,14 @@ def _parse_requires_python(sandbox: Sandbox) -> str | None:
 
 
 def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str | None:
-    """Return the first interpreter that satisfies requires-python and can create a venv.
+    """Return an interpreter that satisfies requires-python and can create a venv.
 
-    Probes ``python3.13`` down to ``python3`` in order.
-    For each candidate:
-    1. Check it is on PATH (``command -v``).
-    2. Verify its version satisfies ``requires-python`` using packaging.specifiers.
-    3. Verify it can create a venv (``-m venv --help``).
-
-    Returns:
-        The interpreter name (e.g. ``"python3.11"``), or ``None`` if none qualifies.
+    Selection rule:
+    - candidates = installed interpreters that can really create a venv (probe)
+      AND satisfy requires-python.
+    - Among candidates released on or before as_of, pick the newest.
+    - If none was released by as_of, pick the OLDEST candidate (closest to that era).
+    - Never pick a newer one just because it is newer.
     """
     spec_str = _parse_requires_python(sandbox)
     specifier = None
@@ -180,7 +191,12 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
             specifier = None
 
     newer_than_cutoff = []
+    seen_candidates = set()
     for interp in _PYTHON_CANDIDATES:
+        if interp in seen_candidates:
+            continue
+        seen_candidates.add(interp)
+
         # 1. Is it on PATH?
         probe = sandbox.exec(f"command -v {interp}", timeout=5)
         if probe.exit_code != 0:
@@ -193,14 +209,14 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
         )
         if ver_result.exit_code != 0:
             continue
-            
+
         actual_version = ver_result.stdout.strip()
-        
+
         if specifier is not None:
             if not specifier.contains(actual_version):
                 log.debug(
                     "Skipping %s (version %s does not satisfy %s)",
-                    interp, actual_version, spec_str
+                    interp, actual_version, spec_str,
                 )
                 continue
 
@@ -210,14 +226,19 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
 
         # 3. Can it create a venv and does it have required modules?
         if _can_create_python_venv(sandbox, interp):
-            log.info("Selected Python interpreter: %s", interp)
+            log.info("Selected Python interpreter: %s (version %s)", interp, actual_version)
+            _INTERP_VERSION_CACHE[interp] = actual_version
             return interp
 
-    # The cutoff is a preference, not a hard constraint: old interpreters may
-    # be unavailable on the host, so try the newest working newer candidate.
-    for interp, _ in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1]), reverse=True):
+    # If none was released by as_of, pick the OLDEST candidate (closest to that era).
+    # Never pick a newer one just because it is newer.
+    for interp, actual_version in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1])):
         if _can_create_python_venv(sandbox, interp):
-            log.info("Selected Python interpreter %s as a fallback newer than cutoff %s", interp, as_of)
+            log.info(
+                "Selected Python interpreter %s (version %s) as fallback newer than cutoff %s",
+                interp, actual_version, as_of,
+            )
+            _INTERP_VERSION_CACHE[interp] = actual_version
             return interp
 
     return None
@@ -226,15 +247,39 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
 def _version_tuple(version: str) -> tuple[int, ...]:
     """Return a sortable numeric Python major/minor version tuple."""
     try:
-        return tuple(int(part) for part in version.split("."))
-    except ValueError:
+        nums = []
+        for part in version.split("."):
+            m = re.match(r"^(\d+)", part)
+            if m:
+                nums.append(int(m.group(1)))
+            else:
+                break
+        return tuple(nums) if nums else (0,)
+    except Exception:
         return (0,)
+
+
+def _python_release_date(version: str) -> str:
+    """Return the ISO release date for *version*.
+
+    A version newer than the table counts as released AFTER every cutoff.
+    A version older than the table counts as released BEFORE every cutoff.
+    """
+    parts = version.split(".")
+    major_minor = ".".join(parts[:2]) if len(parts) >= 2 else version
+    if major_minor in _PYTHON_RELEASE_DATES:
+        return _PYTHON_RELEASE_DATES[major_minor]
+    v_tuple = _version_tuple(major_minor)
+    max_known = max((_version_tuple(k) for k in _PYTHON_RELEASE_DATES), default=(0,))
+    if v_tuple > max_known:
+        return "9999-12-31"
+    return "1970-01-01"
 
 
 def _python_version_available_by(version: str, as_of: str) -> bool:
     """Whether a known Python minor release existed by the dependency cutoff."""
-    release_date = _PYTHON_RELEASE_DATES.get(version)
-    return release_date is None or release_date <= as_of[:10]
+    release_date = _python_release_date(version)
+    return release_date <= as_of[:10]
 
 
 def _can_create_python_venv(sandbox: Sandbox, interp: str) -> bool:
