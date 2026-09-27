@@ -114,7 +114,8 @@ run were 246,759.
 |---|---|---|---|---|
 | `upstream-gold-check-20260927` | `pallets__flask-4045` | Merged upstream fix, commit `08e459e` | Fail | `f2p_fail` |
 
-The gold implementation patch applied successfully and passed patch sanity.
+The gold implementation patch passed `git apply --check` and applied to the
+pinned base revision.
 The FAIL_TO_PASS command did not reach assertions: the scorer's isolated
 environment selected Python 3.14, where the historically pinned pytest stack
 fails during collection with `AttributeError: __spec__` from `py.path`. The
