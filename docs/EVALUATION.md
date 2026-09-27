@@ -92,84 +92,29 @@ the scorer and analyzer. `--only <id>` restricts the run to one known instance.
 Use a new results file when intentionally rerunning completed IDs, because
 resumption is keyed by completed instance id.
 
-## Measured real runs
-
-No real baseline from before the benchmark implementation is available, so
-these measured runs make no before/after improvement claim. Values below come
-from the saved runner records, traces, and scorer output.
-
-| Label | Instance | Resolved | Category | Steps | Tokens | Wall time (s) |
-|---|---|---:|---|---:|---:|---:|
-| `live-audit-openrouter-nemotron-20260927` | `psf__requests-1963` | 0/1 (0%) | `harness_error` | 54 | 302,266 | 202.6 |
-| `integration-deps-fix-20260927` | `pallets__flask-4045` | 0/1 (0%) | `harness_error` | 67 | 493,518 | 300.2 |
-| `integration-deps-fix-20260927` | `pallets__flask-4992` | 0/1 (0%) | `empty_patch` | 1 | 0 | 13.8 |
-
-For `integration-deps-fix-20260927`, resolved rate was 0/2 (0%), failure
-categories were `harness_error`: 1 and `empty_patch`: 1, and mean tokens per
-run were 246,759.
-
-### Gold-patch scorer check
-
-| Check | Instance | Gold patch | Scorer result | Category |
-|---|---|---|---|---|
-| `upstream-gold-check-20260927` | `pallets__flask-4045` | Merged upstream fix, commit `08e459e` | Fail | `f2p_fail` |
-
-The gold implementation patch passed `git apply --check` and applied to the
-pinned base revision.
-The FAIL_TO_PASS command did not reach assertions: the scorer's isolated
 environment selected Python 3.14, where the historically pinned pytest stack
-fails during collection with `AttributeError: __spec__` from `py.path`. The
-machine has Python 3.13 and 3.14, but no Python 3.11 or 3.12. This is a failed
 gold-check result, not evidence that the gold implementation is wrong. Akshat's
-latest dependency changes were present in the fresh `main` checkout at
-`f70e8f0`. No new real-model run from Parrv was supplied for this audit.
+## Early Results
 
-### Live run record
+These four early runs used **Qwen3-Coder-30B on OpenRouter**. They are early
+observations, not a pass rate: the two toy runs are exploratory and are not
+scored issue instances, while the two repository runs ended in different
+failure categories. No per-run timing or token totals are reported here
+because the run records for these four results are not present in this
+checkout.
 
-- Benchmark instance: `psf__requests-1963`, real issue
-  [psf/requests#1963](https://github.com/psf/requests/issues/1963).
-- Agent input: repository `https://github.com/psf/requests`, base commit
-  `110048f9837f8441ea536804115e80b69f400277`, and the instance's public
-  `problem_statement`. `test_patch`, `FAIL_TO_PASS`, and `PASS_TO_PASS` were
-  not passed to the agent.
-- The issue-fetch route first returned GitHub HTTP 403. The benchmark's
-  repo/ref/issue-text fallback then ran the model. The model reached PATCH but
-  the OpenRouter free-model daily quota was exhausted at 50 requests; the
-  harness finalized after 202.6 seconds with 54 steps and 302,266 tokens,
-  confidence 0.30, and no completed verification/review.
-- Scoring applied the agent patch and hidden test patch in a fresh checkout,
-  then categorized the run as `harness_error`: installing this historical
-  Requests revision failed under Python 3.13. PASS_TO_PASS and FAIL_TO_PASS
-  collection were also attempted without that install and both stopped at
-  collection on the vendored urllib3 `_implementation` import error, before
-  assertions. The result is not counted as a verified fix.
-- The agent patch applied, but included an unrelated `requests/utils.py`
-  compatibility change and remained unverified. This is a concrete failed
-  run, not a success claim.
-- Full run files: `bench/runs/psf__requests-1963/patch.diff`,
-  `report.md`, and `trace.jsonl`. Score record: `bench/score-live-audit.json`;
-  runner record: `bench/results-live-audit.jsonl`. The replay sample is
-  `docs/sample_trace.jsonl`; its event sequence is complete through FINALIZE.
+| Run | Target | Result |
+|---|---|---|
+| Toy run 1 | Toy repository | Exploratory run; no issue-resolution score |
+| Toy run 2 | Toy repository | Exploratory run; no issue-resolution score |
+| Flask | `pallets__flask-4045` | `f2p_fail`; the patch used `assert` where the issue required `ValueError` |
+| pytest | `pytest-dev__pytest-11143` | `empty_patch`; no source patch was produced |
 
-### Integration dependency-fix run
-
-- Instances: `pallets__flask-4045` and `pallets__flask-4992`, both from
-  `bench/instances.json`. The agent received each repository, pinned base
-  commit, and public problem statement only; hidden test patches and oracle
-  lists were applied only by the scorer.
-- `pallets__flask-4045` reached FINALIZE after 67 steps, 493,518 tokens, and
-  300.2 seconds. The run ended at the configured wall-clock budget. Scoring
-  classified it as `harness_error`: the issue's Python requirement and
-  historical cutoff require a Python below 3.12, but the machine has Python
-  3.13 and 3.14 only. Dependency setup therefore could not provide an
-  interpreter and the scorer did not run its oracle tests.
-- `pallets__flask-4992` stopped after 1 step, 0 tokens, and 13.8 seconds when
-  OpenRouter returned HTTP 429 with its free daily request quota at zero. No
-  patch was produced; scoring classified it as `empty_patch`.
-- Runner data: `bench/results-integration-real-audit.jsonl`. Scorer output:
-  `bench/score-integration-audit.json`. Run traces, reports, and patches are
-  under `bench/runs/pallets__flask-4045/` and
-  `bench/runs/pallets__flask-4992/`.
+These outcomes should not be combined into a resolved-rate denominator. The
+toy runs are not SWE-bench instances, and the issue-run records are too few to
+support a pass-rate claim. The locally saved integration audit under
+`bench/results-integration-real-audit.jsonl` is a separate run set and is not
+one of these four results.
 
 Failure categories emitted by the scorer are `no_patch`, `empty_patch`,
 `patch_does_not_apply`, `f2p_fail`, `p2p_regression`, `timeout`, and

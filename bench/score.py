@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -47,7 +48,7 @@ def _test_argv(test_cmd: str, targets: list[str], venv_python: Path) -> list[str
     prefix = words[:first_target]
     if not prefix:
         raise RuntimeError("test_cmd must name a Python test runner")
-    if prefix[0] in {"python", "python3", ".anvil_venv/bin/python"} or prefix[0].endswith("/.anvil_venv/bin/python"):
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", Path(prefix[0]).name):
         prefix[0] = str(venv_python)
     elif Path(prefix[0]).name == "pytest":
         prefix = [str(venv_python), "-m", "pytest", *prefix[1:]]

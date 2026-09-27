@@ -54,7 +54,7 @@ key in `config.yaml`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `model` | `gemini-2.0-flash` | Model name passed to the OpenAI-compatible chat-completions endpoint |
-| `base_url` | Gemini endpoint | Provider base URL |
+| `base_url` | `https://generativelanguage.googleapis.com/v1beta/openai/` | Provider base URL |
 | `model_profile` | `auto` | Model defaults profile: `auto` \| `default` \| `deepseek` \| `deepseek-reasoning` \| `qwen` \| `qwen-reasoning` |
 | `temperature` | `0` | Sampling temperature — 0 = deterministic output |
 | `max_output_tokens` | Profile: Qwen `4096`, DeepSeek chat `8192`, reasoning models provider default | Cap on tokens per LLM reply (`null` = provider default) |
@@ -82,6 +82,7 @@ key in `config.yaml`:
 | `context_summarize_threshold` | `0.75` | Fraction of `max_context_tokens` that triggers folding old turns into a digest (one extra LLM call) |
 | `max_patch_attempts` | `3` | Failed PATCH/VERIFY attempts before rolling back to the pre-PATCH checkpoint |
 | `max_rollbacks` | `2` | Maximum rollbacks before the run reports low confidence and stops retrying |
+| `max_total_patch_attempts` | `3` | Hard limit of 3 PATCH attempts across the entire run, including the first attempt and retries |
 | `install_dependencies` | `true` | Install repo dependencies after profiling (Python: into `.anvil_venv/`); set `false` to skip |
 | `command_timeout_seconds` | `120` | Timeout for commands the harness itself runs (repro checks etc.) |
 | `output_dir` | `output` | Directory where `patch.diff`, `report.md`, and `trace.jsonl` are written |
