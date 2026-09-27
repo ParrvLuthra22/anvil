@@ -65,7 +65,9 @@ passed to the agent. The scorer uses the hidden test fields after the model run.
 The runner is resumable: ids already present in `bench/results.jsonl` are
 skipped. It is sequential by default. It supports per-instance timeouts,
 `--jobs N`, `--limit N`, `--only <id>`, and `--label <name>`. A failed run whose
-trace has a retryable LLM error waits 60 seconds and retries. One run record
+trace has a retryable LLM error waits 60 seconds and retries. HTTP 402 responses
+that ask for in-flight requests to settle use up to 5 attempts with jittered
+2-to-30-second waits; other 402 responses fail as out of credit. One run record
 contains the id, resolved/category fields, step/token/second counts, label, and
 artifact paths. `bench/score.py` adds the result category and resolved verdict;
 `bench/analyze.py` summarizes failures, tokens per resolved instance, phases,
@@ -105,6 +107,21 @@ from the saved runner records, traces, and scorer output.
 For `integration-deps-fix-20260927`, resolved rate was 0/2 (0%), failure
 categories were `harness_error`: 1 and `empty_patch`: 1, and mean tokens per
 run were 246,759.
+
+### Gold-patch scorer check
+
+| Check | Instance | Gold patch | Scorer result | Category |
+|---|---|---|---|---|
+| `upstream-gold-check-20260927` | `pallets__flask-4045` | Merged upstream fix, commit `08e459e` | Fail | `f2p_fail` |
+
+The gold implementation patch applied successfully and passed patch sanity.
+The FAIL_TO_PASS command did not reach assertions: the scorer's isolated
+environment selected Python 3.14, where the historically pinned pytest stack
+fails during collection with `AttributeError: __spec__` from `py.path`. The
+machine has Python 3.13 and 3.14, but no Python 3.11 or 3.12. This is a failed
+gold-check result, not evidence that the gold implementation is wrong. Akshat's
+latest dependency changes were present in the fresh `main` checkout at
+`f70e8f0`. No new real-model run from Parrv was supplied for this audit.
 
 ### Live run record
 

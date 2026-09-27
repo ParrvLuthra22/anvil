@@ -260,7 +260,11 @@ def _run_demo(config: dict) -> None:
 
     issue_url = "https://github.com/example/repo/issues/1  [DEMO]"
 
-    def _on_start(url: str) -> None:
+    def _on_start(
+        url: str,
+        ref: str | None = None,
+        manual_issue_text: str | None = None,
+    ) -> None:
         _wire_recorder(bus, trace_path)
         asyncio.get_event_loop().create_task(_emit_fake_stream(url, bus))
 
