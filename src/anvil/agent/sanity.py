@@ -9,7 +9,10 @@ FINALIZE the harness looks at the patch itself:
 * changes to test files are taken out of it unless the issue is about tests;
 * it must not be empty;
 * ``git apply --check`` must accept it in a scratch worktree at the base commit, that is, the very
-  state a reviewer or an evaluator will apply it to.
+  state a reviewer or an evaluator will apply it to;
+* it should not introduce a bare ``assert`` in non-test code: an assert is not input validation (it disappears under
+  ``python -O`` and raises ``AssertionError``, not the exception an issue asks for). That is a warning, not a problem: the
+  patch works, but it is worth the one retry.
 
 ``inspect_patch`` does the looking and never raises; the orchestrator decides what a problem costs.
 """
@@ -26,6 +29,10 @@ from pathlib import Path, PurePosixPath
 from anvil.agent.outputs import split_patch
 from anvil.sandbox.base import Sandbox
 
+_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_BARE_ASSERT = re.compile(r"^\s*assert\b(?!\s*[=.\[])")  # ``assert x`` and ``assert(x)``, not ``assert = 1`` or ``assert.equal``
+_ASSERT_SUFFIXES = (".py", ".java")  # languages where assert is a statement (and is switched off by default in both)
+MAX_LISTED_ASSERTS = 3
 _APPLY_TIMEOUT = 60
 _STDERR_CHARS = 600
 _TEST_DIRS = frozenset({"tests", "test", "__tests__", "spec", "specs"})
@@ -69,10 +76,17 @@ class PatchCheck:
     """Whether ``git apply --check`` actually ran (it cannot outside a git checkout)."""
     skipped: str = ""
     """Why ``git apply --check`` did not run, if it did not."""
+    warnings: tuple[str, ...] = ()
+    """Things that do not stop delivery but are worth the one retry (a bare assert added in non-test code); empty if none."""
 
     @property
     def ok(self) -> bool:
         return not self.problem
+
+    @property
+    def warning_text(self) -> str:
+        """The warnings as one line of text, for the report and for the retry's prompt."""
+        return " ".join(self.warnings)
 
 
 def inspect_patch(sandbox: Sandbox, patch: str, *, allow_tests: bool) -> PatchCheck:
@@ -98,7 +112,53 @@ def inspect_patch(sandbox: Sandbox, patch: str, *, allow_tests: bool) -> PatchCh
     applies, detail = _applies_to_base(sandbox, patch)
     if applies is False:
         return PatchCheck(patch, f"The patch does not apply to the original code (git apply --check): {detail}", tuple(removed), True)
-    return PatchCheck(patch, "", tuple(removed), applies is True, "" if applies is not None else detail)
+    return PatchCheck(
+        patch, "", tuple(removed), applies is True, "" if applies is not None else detail, tuple(_assert_warnings(patch))
+    )
+
+
+def added_asserts(patch: str) -> list[tuple[str, int, str]]:
+    """The bare ``assert`` statements ``patch`` adds to non-test Python and Java files, as ``(path, line, text)``.
+
+    Only added lines count, and one that merely moves or re-indents an assert the patch also removes is not new.
+    """
+    found: list[tuple[str, int, str]] = []
+    for path, text in split_patch(patch):
+        if not path.endswith(_ASSERT_SUFFIXES) or is_test_path(path):
+            continue
+        added: list[tuple[int, str]] = []
+        removed: set[str] = set()
+        line_no = 0
+        for line in text.splitlines():
+            hunk = _HUNK.match(line)
+            if hunk:
+                line_no = int(hunk.group(1))
+            elif line.startswith("\\"):  # "\ No newline at end of file": not a line of either file
+                continue
+            elif line.startswith("+"):
+                if _BARE_ASSERT.match(line[1:]):
+                    added.append((line_no, line[1:].strip()))
+                line_no += 1
+            elif line.startswith("-"):
+                if _BARE_ASSERT.match(line[1:]):
+                    removed.add(line[1:].strip())
+            else:
+                line_no += 1
+        found.extend((path, number, code) for number, code in added if code not in removed)
+    return found
+
+
+def _assert_warnings(patch: str) -> list[str]:
+    asserts = added_asserts(patch)
+    if not asserts:
+        return []
+    listed = ", ".join(f"{path}:{number} (`{code[:80]}`)" for path, number, code in asserts[:MAX_LISTED_ASSERTS])
+    more = f" and {len(asserts) - MAX_LISTED_ASSERTS} more" if len(asserts) > MAX_LISTED_ASSERTS else ""
+    return [
+        f"The patch adds a bare assert in non-test code: {listed}{more}. An assert is not input validation: it is removed "
+        "under python -O and raises AssertionError. If it validates input, raise a specific exception (ValueError, "
+        "TypeError, or the type the issue names) with a clear message instead."
+    ]
 
 
 def _applies_to_base(sandbox: Sandbox, patch: str) -> tuple[bool | None, str]:

@@ -235,6 +235,11 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
   the problem). The outcome (`passed`, `passed after one forced-fix retry`, `FAILED ...`, or a skipped check) is a line in
   the Outcome section of `report.md` and a fact in the closing summary. A patch that still fails is delivered anyway,
   flagged, with confidence capped at low. A run the budget stopped is checked without a retry.
+  It also looks for a **bare `assert` the patch adds to non-test code** (Python and Java files; only added lines, so an assert the
+  patch merely moves or re-indents does not count): a *warning*, not a problem, since the patch works. It earns the same one retry
+  ("It works, but: ... replace each such assert with a specific exception"), which is checkpointed first, so a retry that fails
+  verification is undone and the earlier patch delivered. An assert that survives is reported in the sanity line and under
+  Warnings at the top of `report.md`; it does not lower the confidence. Found on `pallets__flask-4045`.
 - **`nav_tools`** (**off by default**): with it on, the `outline(path)` and `find_symbol(name)` tools are offered in LOCALIZE and
   PATCH only, with a line in the prompt; `find_references` is never offered. A tool the registry does not have is skipped. Its
   effect on tokens has not been measured, so it stays off until a real run shows tokens per call dropping.

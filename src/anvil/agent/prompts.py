@@ -365,7 +365,8 @@ def patch_kickoff(
     ``kind`` is ``"first"``, ``"retry"`` (verification failed; edits still applied),
     ``"rethink"`` (tree rolled back; try a different hypothesis), ``"rework"``
     (the reviewer asked for changes; the patch is still applied) or ``"sanity"``
-    (the finished patch was empty or did not apply: one last attempt).
+    (the finished patch was empty or did not apply: one last attempt) or ``"sanity_warning"``
+    (the patch works but adds a bare assert: replace it, one last attempt).
     """
     parts = [f"This is patch attempt {attempt}."]
     if repro_cmd:
@@ -391,6 +392,13 @@ def patch_kickoff(
         parts.append(
             f"A reviewer asked for changes to your current patch (still applied):\n{feedback}\n"
             "Address them and keep the repro passing."
+        )
+    elif kind == "sanity_warning":
+        parts.append(
+            f"Your patch was checked before delivery. It works, but:\n{feedback}\n"
+            "Replace each such assert in the source with a raised exception: a specific one (ValueError, TypeError, or the "
+            "type the issue names) with a clear message that names the bad value, in the style the module already uses. "
+            "Change nothing else and keep the repro passing. This is your last attempt."
         )
     elif kind == "sanity":
         parts.append(

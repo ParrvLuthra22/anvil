@@ -65,6 +65,7 @@ features:
   # Before FINALIZE, check the patch itself: it must not be empty, must apply (git apply --check) in a scratch worktree
   # at the base commit, and must not edit test files unless the issue is about tests (those changes are taken out of it).
   # An empty or non-applying patch gets ONE forced-fix retry with the reason in the prompt; the outcome is in report.md.
+  # A patch that adds a bare assert in non-test code (an assert is not validation) is a warning that earns the same one retry.
   patch_sanity: true
   # Offer the outline(path) and find_symbol(name) tools in LOCALIZE and PATCH (only there; find_references is never
   # offered), so the model can pick a line range instead of reading a whole file. Tools the registry lacks are skipped.

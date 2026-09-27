@@ -166,6 +166,7 @@ class Orchestrator:
         self._sanity_done = False
         self._sanity_retried = False  # the one forced-fix retry of features.patch_sanity has been spent
         self._sanity_first_problem = ""
+        self._sanity_first_was_warning = False  # the first patch was flagged (a warning), not refused (a problem)
         self._sanity_patch: str | None = None  # the patch as delivered, after the sanity check took test files out
 
     def run(self) -> None:
@@ -472,19 +473,23 @@ class Orchestrator:
         return self._sanity_patch if self._sanity_patch is not None else self._patch_text()
 
     def _sanity(self, *, allow_retry: bool) -> None:
-        """Check the patch before it is delivered; an empty or non-applying one gets one forced-fix retry.
+        """Check the patch before it is delivered; an empty or non-applying one, or one that adds a bare assert, gets one forced-fix retry.
 
         Runs once. With ``allow_retry`` false (the run is already over) it only looks and records. The outcome
-        goes to ``report.md``; a patch that still fails is delivered anyway, with the confidence capped at low.
+        goes to ``report.md``; a patch that still fails is delivered anyway, with the confidence capped at low. A warning
+        (a bare assert) that survives the retry does not lower the confidence: it is delivered with the warning at the top
+        of the report.
         """
         if not self._settings.patch_sanity or self._sanity_done or self._workspace is None:
             return
         try:
             check = self._inspect_patch()
-            if check.problem and allow_retry:
+            if (check.problem or check.warnings) and allow_retry:
+                reason = check.problem or check.warning_text
                 self._sanity_retried = True
-                self._sanity_first_problem = check.problem
-                self._emitter.message("system", f"Patch sanity: {check.problem} One forced-fix retry follows.")
+                self._sanity_first_problem = reason
+                self._sanity_first_was_warning = not check.problem
+                self._emitter.message("system", f"Patch sanity: {reason} One forced-fix retry follows.")
                 self._forced_fix(check)
                 check = self._inspect_patch()
         except (BudgetExceeded, RunAborted):
@@ -501,19 +506,33 @@ class Orchestrator:
         return inspect_patch(self._ws.sandbox, self._patch_text(), allow_tests=about_tests)
 
     def _forced_fix(self, check: PatchCheck) -> None:
-        """The one retry: a PATCH attempt told why the patch cannot be delivered, then the usual verification."""
+        """The one retry: a PATCH attempt told why the patch cannot be delivered (or what is wrong with it), then verification.
+
+        When the patch only drew a warning it already works, so the retry must not make things worse: the tree is
+        checkpointed first, and if the retry fails verification the earlier patch is put back.
+        """
         state = self._state
+        warning_only = not check.problem
         self._revert_files(check.removed_tests)  # the retry starts without the test edits it was told not to make
+        ref = self._checkpoint("before-sanity-retry") if warning_only else None
+        was_verified = state.verified
         state.patch_attempts += 1
         kickoff = patch_kickoff(
             attempt=state.patch_attempts,
             repro_cmd=state.repro_cmd,
             repro_output=state.repro_output,
-            feedback=check.problem,
-            kind="sanity",
+            feedback=check.warning_text if warning_only else check.problem,
+            kind="sanity_warning" if warning_only else "sanity",
         )
         self._run_phase(Phase.PATCH, kickoff, gate=self._patch_gate)
-        state.verified = self._verify().passed
+        verdict = self._verify()
+        state.verified = verdict.passed
+        if warning_only and not verdict.passed:
+            if self._rollback(ref):
+                state.verified = was_verified
+                state.limit("The retry to replace the assert failed verification; the earlier patch was restored.")
+            else:
+                state.limit("The retry to replace the assert failed verification and the earlier patch could not be restored.")
 
     def _revert_files(self, paths: Sequence[str]) -> None:
         """Put ``paths`` back as they are in the base commit (a file that is not tracked is removed)."""
@@ -529,9 +548,13 @@ class Orchestrator:
         if check.ok:
             outcome = "passed"
             if retried:
-                outcome += f" after one forced-fix retry (the first patch was refused: {self._sanity_first_problem})"
+                said = "flagged" if self._sanity_first_was_warning else "refused"
+                outcome += f" after one forced-fix retry (the first patch was {said}: {self._sanity_first_problem})"
             if check.removed_tests:
                 outcome += f". Changes to test files were taken out of the patch: {', '.join(check.removed_tests)}"
+            if check.warnings:
+                outcome += f". WARNING: {check.warning_text}"
+                state.warn(check.warning_text)
             if not check.apply_checked:
                 outcome += f". git apply --check was skipped: {check.skipped or 'not run'}"
         else:
