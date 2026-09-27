@@ -6,22 +6,87 @@ while `RepoPipeline`, `PhaseRunner`, the tool registry, and the sandbox keep
 repository setup, model turns, and filesystem operations separate.
 
 ```mermaid
-flowchart LR
-  CLI[CLI / TUI] --> ORCH[Orchestrator]
-  ORCH --> PIPE[RepoPipeline: ingest + profile]
-  ORCH --> LOOP[PhaseRunner]
-  LOOP --> CTX[ContextManager]
-  LOOP --> LLM[OpenAI-compatible LLMClient]
-  LOOP --> REG[ToolRegistry]
-  REG --> SANDBOX[PreparedSandbox]
-  SANDBOX --> BACKEND[Worktree or Docker]
-  ORCH --> BUS[EventBus]
-  BUS --> TUI[Textual UI]
-  BUS --> TRACE[TraceRecorder]
-  ORCH --> FILES[patch.diff + report.md]
+flowchart TB
+  subgraph UI["Interface"]
+    TUI["Textual TUI<br/>make run"]
+    HL["Headless CLI<br/>--headless --issue"]
+    RP["Replay<br/>anvil replay trace.jsonl"]
+  end
+  subgraph CORE["Agent core"]
+    ORCH["Orchestrator<br/>phase state machine"]
+    REC["Recovery<br/>rollback, forced close,<br/>loop detector, budgets"]
+    CTX["Context manager<br/>truncate, prune, pin, summarise"]
+    PR["Per-phase prompts<br/>and tool allowlists"]
+  end
+  subgraph LLM["LLM layer"]
+    CL["OpenAI-compatible client<br/>retry, 402 backoff, think-strip"]
+    PAR["Tool-call parser<br/>native, fenced JSON, Qwen XML,<br/>tool(key=value), bracket forms"]
+    EP["Provider settings<br/>AI_BASE_URL, AI_MODEL,<br/>AI_API_KEY read from env and sent only to configured endpoint"]
+  end
+  subgraph TOOLS["Tools"]
+    T1["list_dir, grep, read_file"]
+    T2["edit_file<br/>exact + leading-whitespace tolerant"]
+    T3["run_cmd (safety layer), run_tests, git_diff"]
+    T4["outline, find_symbol<br/>(flag: nav_tools)"]
+  end
+  subgraph ENV["Repo and sandbox"]
+    ING["Ingest<br/>issue fetch, clone, base-ref resolve"]
+    PRO["Profile and deps<br/>Python interpreter probe,<br/>date-pinned dependency install"]
+    SB["WorktreeSandbox<br/>checkpoint, rollback, diff<br/>(Docker opt-in)"]
+  end
+  subgraph OBS["Observability"]
+    BUS["EventBus"]
+    TR["TraceRecorder<br/>trace.jsonl"]
+  end
+  OUT["output/<br/>patch.diff, report.md, trace.jsonl"]
+  MODEL[("Text foundation model<br/>provider/model configured")]
+  TUI --> ORCH
+  HL --> ORCH
+  RP --> TR
+  ORCH --> PR
+  ORCH --> CTX
+  ORCH --> REC
+  ORCH --> CL
+  EP --> CL
+  CL --> PAR
+  CL <--> MODEL
+  PAR --> TOOLS
+  TOOLS --> SB
+  ING --> PRO
+  PRO --> SB
+  ORCH --> ING
+  ORCH -.events.-> BUS
+  BUS --> TUI
+  BUS --> TR
+  ORCH --> OUT
+  TR --> OUT
 ```
 
+The interface starts live work or replays a saved trace. The orchestrator coordinates model phases, context, and recovery. Repository tools operate through the sandbox. Events and output files make each run inspectable.
+
 ## Run lifecycle and phases
+
+```mermaid
+stateDiagram-v2
+  [*] --> INGEST
+  INGEST --> PROFILE: repo cloned at resolved ref or default
+  PROFILE --> UNDERSTAND: repo profiled, dependency setup attempted
+  UNDERSTAND --> LOCALIZE
+  LOCALIZE --> REPRODUCE
+  LOCALIZE --> REPRODUCE: give_up recorded; continue with low confidence
+  REPRODUCE --> PATCH: failing repro confirmed or adopted
+  REPRODUCE --> PATCH: give_up; continue with low confidence
+  PATCH --> VERIFY
+  VERIFY --> REVIEW: verification accepted
+  VERIFY --> PATCH: fail; retry or rollback (max 3 PATCH attempts total)
+  REVIEW --> FINALIZE: approved
+  REVIEW --> PATCH: changes requested; attempts remain
+  REVIEW --> FINALIZE: changes requested; no attempts remain
+  FINALIZE --> [*]: patch.diff, report.md, trace.jsonl
+  PATCH --> FINALIZE: budget exhausted
+```
+
+Repository setup precedes the model phases. The normal path confirms a failing reproduction before patching, while an unavailable reproduction lowers confidence. Verification evidence determines whether patching retries or rolls back. Finalization writes the run artifacts when work succeeds or stops.
 
 `Orchestrator.run()` catches budget, model, pipeline, and internal failures and
 always enters finalization. INGEST and PROFILE are deterministic pipeline work;
@@ -51,8 +116,8 @@ The model can write only through registered tools operating on the sandbox.
 Sandbox paths are resolved under the repository root; absolute paths and paths
 that escape the root are rejected. The `write_repro` tool is the exception in
 purpose, not location: it creates repro material only beneath `.anvil/`.
-`edit_file` performs an exact string replacement and returns a closest-match
-hint when the old text is not found. Shell commands run with timeouts, closed
+`edit_file` tries an exact string replacement, then a unique match that ignores
+leading indentation, and returns a closest-match hint when neither is found. Shell commands run with timeouts, closed
 stdin, output caps, and the prepared dependency environment.
 
 Before delivery, `features.patch_sanity` checks that the patch is non-empty and
@@ -135,12 +200,9 @@ making API calls. Every run attempts to write `patch.diff`, `report.md`, and
 
 ## Design decisions measured
 
-No implementation decision is labelled measured yet. This checkout had no
-archived real baseline. The first real run is recorded in
-`docs/EVALUATION.md`, but it ended on provider quota and its scorer could not
-install the historical test environment; it cannot support a design or
-token-efficiency comparison. Add a measured decision here only after
-comparable before/after runs complete successfully.
+The early runs in `docs/EVALUATION.md` are not a controlled comparison and do
+not support a design or token-efficiency claim. Add a measured decision here
+only after comparable before/after runs complete successfully.
 
 ## Support status and future work
 

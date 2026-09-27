@@ -34,19 +34,96 @@ make run ISSUE=https://github.com/owner/repo/issues/42
 
 ---
 
-## How a run works
+## Architecture
 
+```mermaid
+flowchart TB
+  subgraph UI["Interface"]
+    TUI["Textual TUI<br/>make run"]
+    HL["Headless CLI<br/>--headless --issue"]
+    RP["Replay<br/>anvil replay trace.jsonl"]
+  end
+  subgraph CORE["Agent core"]
+    ORCH["Orchestrator<br/>phase state machine"]
+    REC["Recovery<br/>rollback, forced close,<br/>loop detector, budgets"]
+    CTX["Context manager<br/>truncate, prune, pin, summarise"]
+    PR["Per-phase prompts<br/>and tool allowlists"]
+  end
+  subgraph LLM["LLM layer"]
+    CL["OpenAI-compatible client<br/>retry, 402 backoff, think-strip"]
+    PAR["Tool-call parser<br/>native, fenced JSON, Qwen XML,<br/>tool(key=value), bracket forms"]
+    EP["Provider settings<br/>AI_BASE_URL, AI_MODEL,<br/>AI_API_KEY read from env and sent only to configured endpoint"]
+  end
+  subgraph TOOLS["Tools"]
+    T1["list_dir, grep, read_file"]
+    T2["edit_file<br/>exact + leading-whitespace tolerant"]
+    T3["run_cmd (safety layer), run_tests, git_diff"]
+    T4["outline, find_symbol<br/>(flag: nav_tools)"]
+  end
+  subgraph ENV["Repo and sandbox"]
+    ING["Ingest<br/>issue fetch, clone, base-ref resolve"]
+    PRO["Profile and deps<br/>Python interpreter probe,<br/>date-pinned dependency install"]
+    SB["WorktreeSandbox<br/>checkpoint, rollback, diff<br/>(Docker opt-in)"]
+  end
+  subgraph OBS["Observability"]
+    BUS["EventBus"]
+    TR["TraceRecorder<br/>trace.jsonl"]
+  end
+  OUT["output/<br/>patch.diff, report.md, trace.jsonl"]
+  MODEL[("Text foundation model<br/>provider/model configured")]
+  TUI --> ORCH
+  HL --> ORCH
+  RP --> TR
+  ORCH --> PR
+  ORCH --> CTX
+  ORCH --> REC
+  ORCH --> CL
+  EP --> CL
+  CL --> PAR
+  CL <--> MODEL
+  PAR --> TOOLS
+  TOOLS --> SB
+  ING --> PRO
+  PRO --> SB
+  ORCH --> ING
+  ORCH -.events.-> BUS
+  BUS --> TUI
+  BUS --> TR
+  ORCH --> OUT
+  TR --> OUT
 ```
-INGEST → PROFILE → UNDERSTAND → LOCALIZE → REPRODUCE → PATCH ⇄ VERIFY → REVIEW → FINALIZE
+
+The interface starts live work or replays a saved trace. The orchestrator coordinates model phases, context, and recovery. Repository tools operate through the sandbox. Events and output files make each run inspectable.
+
+```mermaid
+stateDiagram-v2
+  [*] --> INGEST
+  INGEST --> PROFILE: repo cloned at resolved ref or default
+  PROFILE --> UNDERSTAND: repo profiled, dependency setup attempted
+  UNDERSTAND --> LOCALIZE
+  LOCALIZE --> REPRODUCE
+  LOCALIZE --> REPRODUCE: give_up recorded; continue with low confidence
+  REPRODUCE --> PATCH: failing repro confirmed or adopted
+  REPRODUCE --> PATCH: give_up; continue with low confidence
+  PATCH --> VERIFY
+  VERIFY --> REVIEW: verification accepted
+  VERIFY --> PATCH: fail; retry or rollback (max 3 PATCH attempts total)
+  REVIEW --> FINALIZE: approved
+  REVIEW --> PATCH: changes requested; attempts remain
+  REVIEW --> FINALIZE: changes requested; no attempts remain
+  FINALIZE --> [*]: patch.diff, report.md, trace.jsonl
+  PATCH --> FINALIZE: budget exhausted
 ```
+
+Repository setup precedes the model phases. The normal path confirms a failing reproduction before patching, while an unavailable reproduction lowers confidence. Verification evidence determines whether patching retries or rolls back. Finalization writes the run artifacts when work succeeds or stops.
 
 - **INGEST and PROFILE are plain code.** The issue comes from the GitHub API (or from `--issue-text`), the repository is cloned
-  at the revision the issue was reported against (or `--ref`), the language and test command are detected, and the
-  dependencies are installed into `.anvil_venv/`. For an old repository that means a Python of its era and packages dated to the
-  base commit.
+  at the revision the issue was reported against (or from `--ref`), the language and test command are detected, and dependency
+  setup prepares `.anvil_venv/` when it succeeds. For an old repository, the installer prefers a Python from its era and date-pins
+  package installs when supported.
 - **The other phases are model tool loops.** Each phase sees only the tools it needs (LOCALIZE cannot edit, REVIEW can run tests
   but cannot edit) and works from the summaries of the phases before it.
-- **Reproduce first.** The model must write a script under `.anvil/` that fails for the reason in the issue. Anything it changes
+- **Reproduce first.** The confirmed path uses a script under `.anvil/` that fails for the reason in the issue. Anything it changes
   outside `.anvil/` during REPRODUCE is reverted, and if it shows the bug but never confirms it, the harness adopts that failing
   command as the repro.
 - **The harness checks the facts itself.** It re-runs the repro, reads the diff and counts test failures instead of trusting the
@@ -56,7 +133,7 @@ INGEST → PROFILE → UNDERSTAND → LOCALIZE → REPRODUCE → PATCH ⇄ VERIF
 - **Recovery.** Loops are caught (the same call three times in a row, or a fourth identical call in a phase), failed edits get
   the closest real lines, and repeated failures roll back to a checkpoint.
 - **The patch is checked before delivery.** It must be non-empty, apply to the base commit, leave the tests alone (unless the
-  issue is about tests) and not add a bare `assert`; a patch that fails gets one forced-fix retry.
+  issue is about tests) and not add a bare `assert`; a patch that fails gets one forced-fix retry when the attempt budget allows it.
 - **FINALIZE always runs.** Whatever goes wrong, `patch.diff`, `report.md` and `trace.jsonl` are written.
 
 Behaviour details and the reasons for them are in [`src/anvil/agent/NOTES.md`](src/anvil/agent/NOTES.md).

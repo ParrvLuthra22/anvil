@@ -69,3 +69,18 @@ def test_readme_documents_qwen_output_and_http_402_retry_policy():
     assert "Qwen defaults to 4096 tokens" in readme
     assert "up to 5 attempts with jittered waits from 2 to 30 seconds" in readme
     assert "Other HTTP 402" in readme and "fail without retrying" in readme
+
+
+def test_readme_mermaid_blocks_use_supported_syntax_and_match_architecture():
+    """README Mermaid fences must use supported starters and match the architecture doc."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+    pattern = r"```mermaid\s*\n(.*?)```"
+    readme_blocks = [block.strip() for block in re.findall(pattern, readme, re.DOTALL)]
+    architecture_blocks = [block.strip() for block in re.findall(pattern, architecture, re.DOTALL)]
+
+    assert readme_blocks
+    assert readme_blocks == architecture_blocks
+    for block in readme_blocks:
+        first_line = next(line.strip() for line in block.splitlines() if line.strip())
+        assert re.match(r"^(?:flowchart\b|stateDiagram-v2\b)", first_line), first_line

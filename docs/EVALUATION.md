@@ -92,29 +92,24 @@ the scorer and analyzer. `--only <id>` restricts the run to one known instance.
 Use a new results file when intentionally rerunning completed IDs, because
 resumption is keyed by completed instance id.
 
-environment selected Python 3.14, where the historically pinned pytest stack
-gold-check result, not evidence that the gold implementation is wrong. Akshat's
 ## Early Results
 
-These four early runs used **Qwen3-Coder-30B on OpenRouter**. They are early
-observations, not a pass rate: the two toy runs are exploratory and are not
-scored issue instances, while the two repository runs ended in different
-failure categories. No per-run timing or token totals are reported here
-because the run records for these four results are not present in this
-checkout.
+These real runs used **Qwen3-Coder-30B via OpenRouter with default settings**.
+They are early results, **not a pass rate**.
 
-| Run | Target | Result |
+| Run | Result |
 |---|---|---|
-| Toy run 1 | Toy repository | Exploratory run; no issue-resolution score |
-| Toy run 2 | Toy repository | Exploratory run; no issue-resolution score |
-| Flask | `pallets__flask-4045` | `f2p_fail`; the patch used `assert` where the issue required `ValueError` |
-| pytest | `pytest-dev__pytest-11143` | `empty_patch`; no source patch was produced |
+| Toy repository | 2 of 2 patches correct |
+| `pallets__flask-4045` | Unresolved: the patch used `assert`, but the hidden test expects `ValueError` |
+| `pytest-dev__pytest-11143` | Empty patch: `edit_file` could not apply edits; fix in progress |
 
-These outcomes should not be combined into a resolved-rate denominator. The
-toy runs are not SWE-bench instances, and the issue-run records are too few to
-support a pass-rate claim. The locally saved integration audit under
-`bench/results-integration-real-audit.jsonl` is a separate run set and is not
-one of these four results.
+## Known Limitations
+
+- These are a small number of early runs, not a pass rate or a controlled benchmark.
+- The two toy-repository results are not issue-based repository runs.
+- The Flask patch did not satisfy the hidden exception-type assertion.
+- The pytest run produced no patch because `edit_file` could not apply its edits; the fix is in progress.
+- Parrv will send newer numbers; update this table when they arrive.
 
 Failure categories emitted by the scorer are `no_patch`, `empty_patch`,
 `patch_does_not_apply`, `f2p_fail`, `p2p_regression`, `timeout`, and
