@@ -90,19 +90,21 @@ the scorer and analyzer. `--only <id>` restricts the run to one known instance.
 Use a new results file when intentionally rerunning completed IDs, because
 resumption is keyed by completed instance id.
 
-## Before/after results
+## Measured real runs
 
-There is no archived real baseline from before the benchmark implementation
-in this checkout. No before values are inferred from the simulated trace or
-offline fixture. The current column records the first live, labelled attempt;
-it is a failed run and does not establish an improvement or regression from a
-baseline.
+No real baseline from before the benchmark implementation is available, so
+these measured runs make no before/after improvement claim. Values below come
+from the saved runner records, traces, and scorer output.
 
-| Measure | Before (real baseline) | After (`live-audit-openrouter-nemotron-20260927`) |
-|---|---:|---:|
-| Resolved rate | Not measured | 0/1 (0%) |
-| Failure categories | Not measured | `harness_error`: 1 |
-| Mean tokens per run | Not measured | 302,266 |
+| Label | Instance | Resolved | Category | Steps | Tokens | Wall time (s) |
+|---|---|---:|---|---:|---:|---:|
+| `live-audit-openrouter-nemotron-20260927` | `psf__requests-1963` | 0/1 (0%) | `harness_error` | 54 | 302,266 | 202.6 |
+| `integration-deps-fix-20260927` | `pallets__flask-4045` | 0/1 (0%) | `harness_error` | 67 | 493,518 | 300.2 |
+| `integration-deps-fix-20260927` | `pallets__flask-4992` | 0/1 (0%) | `empty_patch` | 1 | 0 | 13.8 |
+
+For `integration-deps-fix-20260927`, resolved rate was 0/2 (0%), failure
+categories were `harness_error`: 1 and `empty_patch`: 1, and mean tokens per
+run were 246,759.
 
 ### Live run record
 
@@ -129,8 +131,27 @@ baseline.
 - Full run files: `bench/runs/psf__requests-1963/patch.diff`,
   `report.md`, and `trace.jsonl`. Score record: `bench/score-live-audit.json`;
   runner record: `bench/results-live-audit.jsonl`. The replay sample is
-  `docs/sample_trace.jsonl`; its event sequence is complete through FINALIZE,
-  with the provider account identifier redacted.
+  `docs/sample_trace.jsonl`; its event sequence is complete through FINALIZE.
+
+### Integration dependency-fix run
+
+- Instances: `pallets__flask-4045` and `pallets__flask-4992`, both from
+  `bench/instances.json`. The agent received each repository, pinned base
+  commit, and public problem statement only; hidden test patches and oracle
+  lists were applied only by the scorer.
+- `pallets__flask-4045` reached FINALIZE after 67 steps, 493,518 tokens, and
+  300.2 seconds. The run ended at the configured wall-clock budget. Scoring
+  classified it as `harness_error`: the issue's Python requirement and
+  historical cutoff require a Python below 3.12, but the machine has Python
+  3.13 and 3.14 only. Dependency setup therefore could not provide an
+  interpreter and the scorer did not run its oracle tests.
+- `pallets__flask-4992` stopped after 1 step, 0 tokens, and 13.8 seconds when
+  OpenRouter returned HTTP 429 with its free daily request quota at zero. No
+  patch was produced; scoring classified it as `empty_patch`.
+- Runner data: `bench/results-integration-real-audit.jsonl`. Scorer output:
+  `bench/score-integration-audit.json`. Run traces, reports, and patches are
+  under `bench/runs/pallets__flask-4045/` and
+  `bench/runs/pallets__flask-4992/`.
 
 Failure categories emitted by the scorer are `no_patch`, `empty_patch`,
 `patch_does_not_apply`, `f2p_fail`, `p2p_regression`, `timeout`, and

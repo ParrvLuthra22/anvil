@@ -7,16 +7,43 @@ from unittest.mock import patch
 
 import pytest
 
-from bench.score import _score_instance
+from bench.score import _score_instance, _test_argv
 from bench.run_bench import _load_completed, _load_instances
 from bench.run_bench import _should_retry_rate_limit
 from tests.mock_llm import MockLLM
 from anvil.agent.orchestrator import run_harness
 from anvil.events import EventBus
 from anvil.llm.client import LLMResponse
+from anvil.repo.deps import DepsResult
 
 
-def test_score_instance_resolved(tmp_path: Path):
+def _stub_score_venv(sandbox, profile, *, as_of=None):
+    """Create an offline test venv with access to the test suite's pytest."""
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(sandbox.root / ".anvil_venv")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    site_packages = sandbox.root / ".anvil_venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    (site_packages / "anvil-test-site.pth").write_text(
+        str(Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"),
+        encoding="utf-8",
+    )
+    return DepsResult(ok=True, report="offline test venv", venv_python=".anvil_venv/bin/python")
+
+
+def test_test_argv_uses_the_instance_interpreter(tmp_path: Path):
+    interpreter = tmp_path / "instance" / ".anvil_venv" / "bin" / "python"
+    argv = _test_argv(
+        ".anvil_venv/bin/python -m pytest -x -q --tb=short tests/test_x.py::test_a",
+        ["tests/test_x.py::test_b"],
+        interpreter,
+    )
+    assert argv == [str(interpreter), "-m", "pytest", "-x", "-q", "--tb=short", "tests/test_x.py::test_b"]
+
+
+def test_score_instance_resolved(tmp_path: Path, monkeypatch):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=repo_dir, check=True)
@@ -53,8 +80,9 @@ def test_score_instance_resolved(tmp_path: Path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
+    monkeypatch.setattr("anvil.repo.deps.ensure_deps", _stub_score_venv)
     result = _score_instance(instance, run_result, work_dir)
-    assert result["resolved"] is True
+    assert result["resolved"] is True, (result.get("category"), result.get("error"), result.get("test_output"))
     assert result["category"] == "resolved"
 
 
@@ -96,7 +124,7 @@ def test_score_instance_patch_failed(tmp_path: Path):
     assert result["category"] == "patch_does_not_apply"
 
 
-def test_score_instance_syntax_error(tmp_path: Path):
+def test_score_instance_syntax_error(tmp_path: Path, monkeypatch):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=repo_dir, check=True)
@@ -116,12 +144,13 @@ def test_score_instance_syntax_error(tmp_path: Path):
     run_result = {"instance_id": "test_syntax", "patch_path": str(patch_path)}
     work_dir = tmp_path / "work"
     work_dir.mkdir()
+    monkeypatch.setattr("anvil.repo.deps.ensure_deps", _stub_score_venv)
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is False
     assert result["category"] == "patch_does_not_apply"
 
 
-def test_score_instance_regression(tmp_path: Path):
+def test_score_instance_regression(tmp_path: Path, monkeypatch):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=repo_dir, check=True)
@@ -148,6 +177,7 @@ def test_score_instance_regression(tmp_path: Path):
     run_result = {"instance_id": "test_reg", "patch_path": str(patch_path)}
     work_dir = tmp_path / "work"
     work_dir.mkdir()
+    monkeypatch.setattr("anvil.repo.deps.ensure_deps", _stub_score_venv)
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is False
     assert result["category"] == "p2p_regression"
@@ -215,7 +245,18 @@ def test_run_bench_does_not_retry_failed_run_without_trace_error(tmp_path: Path)
     assert _should_retry_rate_limit(1, trace) is False
 
 
-def test_mock_llm_and_fake_fixture_integration(tmp_path: Path):
+def test_run_bench_retries_llm_error_with_http_429(tmp_path: Path):
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"ts":1,"type":"error","phase":"understand","data":{"kind":"llm","message":"HTTP 429: Rate limit exceeded"}}\n',
+        encoding="utf-8",
+    )
+
+    # The harness catches provider failures and still finalizes with exit 0.
+    assert _should_retry_rate_limit(0, trace) is True
+
+
+def test_mock_llm_and_fake_fixture_integration(tmp_path: Path, monkeypatch):
     """Test MockLLM running the full pipeline on a fake fixture and getting scored correctly."""
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
@@ -296,6 +337,7 @@ def test_mock_llm_and_fake_fixture_integration(tmp_path: Path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
+    monkeypatch.setattr("anvil.repo.deps.ensure_deps", _stub_score_venv)
     result = _score_instance(instance, run_result, work_dir)
     assert result["resolved"] is True, result
     assert result["category"] == "resolved"

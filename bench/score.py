@@ -7,9 +7,10 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
+
+from anvil.sandbox.base import Sandbox
 
 ROOT = Path(__file__).resolve().parents[1]
 CATEGORIES = {"no_patch", "empty_patch", "patch_does_not_apply", "f2p_fail", "p2p_regression", "timeout", "harness_error"}
@@ -17,8 +18,12 @@ CATEGORIES = {"no_patch", "empty_patch", "patch_does_not_apply", "f2p_fail", "p2
 
 def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     """Run a bounded command without allowing it to prompt for input."""
+    from anvil.sandbox.worktree import _sanitized_env
+
+    env = _sanitized_env()
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          stdin=subprocess.DEVNULL, env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+                          stdin=subprocess.DEVNULL, env=env)
 
 
 def _repo_url(value: str) -> str:
@@ -33,25 +38,29 @@ def _repo_url(value: str) -> str:
     return value if "://" in value else f"https://github.com/{value}"
 
 
-def _command(text: str, cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess[str]:
-    """Execute a recorded shell command, adapting benchmark venv Python paths."""
-    words = shlex.split(text)
-    if not words:
-        return subprocess.CompletedProcess([], 0, "", "")
-    words = [str(cwd / ".anvil_venv/bin/python") if w.endswith("/.anvil_venv/bin/python") or w == ".anvil_venv/bin/python" else (sys.executable if w in {"python", "python3"} else w) for w in words]
-    return _run(words, cwd, timeout)
-
-
-def _test_command(test_cmd: str, targets: list[str]) -> str:
-    """Reuse the recorded runner and flags, substituting just its test selection."""
+def _test_argv(test_cmd: str, targets: list[str], venv_python: Path) -> list[str]:
+    """Use recorded test flags and targets with this instance's isolated Python."""
     words = shlex.split(test_cmd)
     # SWE-bench test_cmd ends with selected test node ids. Preserve the runner
     # and options while replacing those nodes with the requested oracle set.
     first_target = next((i for i, word in enumerate(words) if ".py::" in word or word.endswith(".py")), len(words))
     prefix = words[:first_target]
-    if prefix and prefix[0] in {"python", "python3"}:
-        prefix[0] = sys.executable
-    return " ".join(shlex.quote(w) for w in prefix + targets)
+    if not prefix:
+        raise RuntimeError("test_cmd must name a Python test runner")
+    if prefix[0] in {"python", "python3", ".anvil_venv/bin/python"} or prefix[0].endswith("/.anvil_venv/bin/python"):
+        prefix[0] = str(venv_python)
+    elif Path(prefix[0]).name == "pytest":
+        prefix = [str(venv_python), "-m", "pytest", *prefix[1:]]
+    else:
+        raise RuntimeError(f"test_cmd runner must use Python or pytest, got {prefix[0]!r}")
+    return [*prefix, *targets]
+
+
+def _instance_sandbox(repo: Path, work_dir: Path) -> Sandbox:
+    """Create a real isolated worktree for dependency installation and scoring."""
+    from anvil.sandbox.worktree import WorktreeSandbox
+
+    return WorktreeSandbox(repo, work_dir)
 
 
 def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
@@ -84,12 +93,6 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
         if applied.returncode:
             result.update(resolved=False, category="patch_does_not_apply")
             return result
-        # Reject syntactically invalid Python patches before tests, matching the
-        # general patch validity category without making language assumptions.
-        py_compile = _run([sys.executable, "-m", "compileall", "-q", "."], repo, timeout=120)
-        if py_compile.returncode:
-            result.update(resolved=False, category="patch_does_not_apply")
-            return result
         oracle = instance.get("test_patch", "")
         if oracle:
             oracle_path = work_dir / f"oracle-{instance['instance_id']}.diff"
@@ -101,35 +104,77 @@ def _score_instance(instance: dict, run_result: dict, work_dir: Path) -> dict:
             if applied_oracle.returncode:
                 raise RuntimeError(f"test_patch failed: {applied_oracle.stderr[-800:]}")
 
+        from dataclasses import replace
+        from anvil.repo.deps import ensure_deps
         from anvil.repo.profile import profile_repo
-        install_cmd = instance.get("install_cmd") or profile_repo(repo).install_cmd
-        if install_cmd:
-            # Keep dependency changes inside this instance's disposable tree.
-            venv_python = repo / ".anvil_venv" / "bin" / "python"
-            if not venv_python.exists():
-                created = _run([sys.executable, "-m", "venv", str(repo / ".anvil_venv")], repo)
-                if created.returncode:
-                    raise RuntimeError(f"venv creation failed: {created.stderr[-800:]}")
-            install_words = shlex.split(install_cmd)
-            if install_words[:2] == ["pip", "install"]:
-                install_words = [str(venv_python), "-m", "pip", *install_words[1:]]
-            installed = _run(install_words, repo, timeout=600)
-            if installed.returncode:
-                raise RuntimeError(f"dependency installation failed: {installed.stderr[-800:]}")
-        test_cmd = str(instance.get("test_cmd", "python -m pytest -q"))
-        for category, targets in (("p2p_regression", instance.get("PASS_TO_PASS", [])), ("f2p_fail", instance.get("FAIL_TO_PASS", []))):
-            if not targets:
-                continue
-            cmd = _test_command(test_cmd, [str(t) for t in targets])
-            try:
-                tested = _command(cmd, repo)
-            except subprocess.TimeoutExpired:
-                result.update(resolved=False, category="timeout")
+
+        profile = profile_repo(repo)
+        profile = replace(profile, primary_language="python")
+        if instance.get("install_cmd"):
+            profile = replace(profile, install_cmd=instance["install_cmd"])
+        # All curated benchmark instances are Python. Even a minimal fixture
+        # without package metadata gets an instance-local venv and pytest.
+        if not profile.install_cmd:
+            profile = replace(profile, install_cmd="python -m pip install pytest")
+
+        # Make the candidate patch and hidden oracle part of the disposable
+        # base checkout before creating the isolated scoring worktree.
+        from anvil.sandbox.worktree import _sanitized_env
+
+        env = {
+            **_sanitized_env(),
+            "GIT_AUTHOR_NAME": "ANVIL benchmark",
+            "GIT_AUTHOR_EMAIL": "anvil-bench@localhost",
+            "GIT_COMMITTER_NAME": "ANVIL benchmark",
+            "GIT_COMMITTER_EMAIL": "anvil-bench@localhost",
+        }
+        staged = _run(["git", "add", "-A"], repo)
+        committed = subprocess.run(
+            ["git", "commit", "-m", "ANVIL score fixture"], cwd=repo,
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+            env=env,
+        )
+        if staged.returncode or committed.returncode:
+            raise RuntimeError(f"could not prepare scoring worktree: {committed.stderr[-800:]}")
+
+        sandbox = _instance_sandbox(repo, work_dir / f"score-{instance['instance_id']}")
+        try:
+            installed = ensure_deps(
+                sandbox,
+                profile,
+                as_of=instance.get("base_commit_date") or None,
+            )
+            if not installed.ok:
+                if "timed out" in installed.report.lower():
+                    result.update(resolved=False, category="timeout", error=installed.report)
+                    return result
+                raise RuntimeError(f"dependency installation failed: {installed.report[-800:]}")
+            if not installed.venv_python:
+                raise RuntimeError("ensure_deps did not provide an isolated Python interpreter")
+            venv_python = sandbox.root / installed.venv_python
+            if not venv_python.is_file():
+                raise RuntimeError(f"instance venv interpreter was not created: {venv_python}")
+
+            py_compile = _run([str(venv_python), "-m", "compileall", "-q", "."], sandbox.root, timeout=120)
+            if py_compile.returncode:
+                result.update(resolved=False, category="patch_does_not_apply")
                 return result
-            if tested.returncode:
-                result.update(resolved=False, category=category, test_output=(tested.stdout + tested.stderr)[-2000:])
-                return result
-        result.update(resolved=True, category="resolved")
+
+            test_cmd = str(instance.get("test_cmd", "python -m pytest -q"))
+            for category, targets in (("f2p_fail", instance.get("FAIL_TO_PASS", [])), ("p2p_regression", instance.get("PASS_TO_PASS", []))):
+                if not targets:
+                    continue
+                try:
+                    tested = _run(_test_argv(test_cmd, [str(t) for t in targets], venv_python), sandbox.root, timeout=600)
+                except subprocess.TimeoutExpired:
+                    result.update(resolved=False, category="timeout")
+                    return result
+                if tested.returncode:
+                    result.update(resolved=False, category=category, test_output=(tested.stdout + tested.stderr)[-2000:])
+                    return result
+            result.update(resolved=True, category="resolved")
+        finally:
+            sandbox.close()
     except subprocess.TimeoutExpired:
         result.update(resolved=False, category="timeout")
     except (OSError, RuntimeError, KeyError) as exc:

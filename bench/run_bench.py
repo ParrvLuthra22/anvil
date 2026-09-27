@@ -16,17 +16,23 @@ _RETRYABLE_TRACE_ERRORS = {"rate_limit", "llm_error"}
 
 
 def _should_retry_rate_limit(returncode: int, trace_path: Path) -> bool:
-    """Retry only failed runs whose trace records a transient LLM error."""
-    if returncode == 0 or not trace_path.exists():
+    """Retry explicit rate limits, including runs the harness finalized gracefully."""
+    if not trace_path.exists():
         return False
     try:
         from anvil.trace.recorder import TraceRecorder
 
-        return any(
-            event.type == "error"
-            and str((event.data or {}).get("kind", "")).lower() in _RETRYABLE_TRACE_ERRORS
-            for event in TraceRecorder.load(trace_path)
-        )
+        for event in TraceRecorder.load(trace_path):
+            if event.type != "error":
+                continue
+            data = event.data or {}
+            kind = str(data.get("kind", "")).lower()
+            message = str(data.get("message", "")).lower()
+            if "429" in message and ("rate limit" in message or "rate_limit" in message):
+                return True
+            if returncode != 0 and kind in _RETRYABLE_TRACE_ERRORS:
+                return True
+        return False
     except (OSError, ValueError, TypeError):
         return False
 
@@ -61,6 +67,8 @@ async def _run_instance(
 ) -> None:
     instance_id = instance["instance_id"]
     async with semaphore:
+        wall_started = time.time()
+        deadline = time.monotonic() + timeout
         run_dir = _REPO_ROOT / "bench" / "runs" / instance_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,7 +106,6 @@ async def _run_instance(
 
         while True:
             print(f"Running {instance_id}...")
-            start = time.time()
             trace_path = run_dir / "trace.jsonl"
             trace_path.unlink(missing_ok=True)
             proc = await asyncio.create_subprocess_exec(
@@ -110,12 +117,20 @@ async def _run_instance(
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=remaining)
                 out = stdout.decode(errors="replace")
                 err = stderr.decode(errors="replace")
 
                 if _should_retry_rate_limit(proc.returncode, trace_path):
                     print(f"Rate limit hit for {instance_id}. Sleeping 60s and retrying...")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 60:
+                        await asyncio.sleep(max(0, remaining))
+                        error = f"timeout after {timeout}s while waiting to retry rate limit"
+                        break
                     await asyncio.sleep(60)
                     continue
 
@@ -135,7 +150,7 @@ async def _run_instance(
                 error = str(e)[:200]
                 break
 
-        duration = round(time.time() - start, 1)
+        duration = round(time.time() - wall_started, 1)
 
         # Parse trace for done event to get tokens/steps
         trace_path = run_dir / "trace.jsonl"
