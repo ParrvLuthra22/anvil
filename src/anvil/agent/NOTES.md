@@ -221,6 +221,11 @@ Each switch is on unless set to `false` (except `nav_tools`, which is off until 
   REVIEW add how errors are raised: the most specific built-in exception with a clear message, never `assert` for input
   validation, and follow how the module already reports similar errors. Same tools and the same `Phase: NAME` marker as the
   original prompts, which come back unchanged with the switch off.
+- **Validation prompts (both prompt tables, so they apply with `weak_model_prompts` off).** PATCH: if the issue asks for
+  validation, raise a specific exception (ValueError, TypeError, or the type the issue names) with a clear message, and never use
+  `assert` to validate input. REVIEW asks "Does the exception type and message match what the issue asks for?". Found on
+  `pallets__flask-4045`, where the model used `assert` and the issue asked for a `ValueError`. `patch_sanity` checks the patch too
+  (below).
 - **`patch_sanity`**: before FINALIZE the patch is built from the diff without `.anvil/`, `.anvil_venv/`, `*.egg-info`, bytecode
   and binary sections; changes to test files are taken out of it unless the issue is about tests (the title mentions tests,
   testing, coverage or flakiness, or the text asks to add or write tests); it must not be empty; and `git apply --check` must

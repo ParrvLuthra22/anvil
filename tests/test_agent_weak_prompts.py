@@ -156,7 +156,7 @@ def test_the_example_calls_a_tool_the_phase_actually_has(phase):
 
 def test_patch_says_which_exception_to_raise_never_assert_and_to_follow_how_the_module_reports_errors():
     prompt = WEAK_PHASE_SPECS[Phase.PATCH].system_prompt
-    assert "most specific built-in exception (ValueError, TypeError)" in prompt
+    assert "raise a specific exception (ValueError, TypeError, or the type the issue names)" in prompt
     assert "with a clear message that names the bad value" in prompt
     assert "Never use assert to validate input" in prompt
     assert "Grep the file, then its package, for how similar errors are reported and follow that" in prompt
@@ -165,13 +165,15 @@ def test_patch_says_which_exception_to_raise_never_assert_and_to_follow_how_the_
 
 def test_review_checks_the_exception_type_and_message_against_the_same_rules():
     prompt = WEAK_PHASE_SPECS[Phase.REVIEW].system_prompt
-    assert "type and the message of any new error" in prompt
+    assert "Does the exception type and message match what the issue asks for?" in prompt
     assert "never assert for input validation" in prompt and "ValueError, TypeError" in prompt
     assert "names the bad value" in prompt and "same convention as the other errors in that module" in prompt
 
 
-def test_the_old_prompts_are_untouched_and_carry_none_of_it():
+def test_the_old_prompts_carry_the_short_validation_rule_and_none_of_the_weak_style():
     old = " ".join(spec.system_prompt for spec in PHASE_SPECS.values())
     assert "Do not modify existing tests unless the issue is about them." in old
     assert "edit_file is an exact string replacement" in old
-    assert "Never use assert" not in old and "Example call:" not in old and "exactly ONE tool call" not in old
+    assert old.count("Never use assert to validate input") == 1, "the one short rule, in PATCH (tests/test_agent_validation_prompts.py)"
+    assert "Example call:" not in old and "exactly ONE tool call" not in old
+    assert "Grep the file, then its package" not in old and "neighbouring check" not in old, "the longer convention advice is weak-only"

@@ -62,6 +62,7 @@ Phase: PATCH. Fix the root cause with the smallest correct change. Tools: read_f
 - After editing, run the repro command with run_cmd and check that it now passes; use git_diff to review your change.
 - Do not edit files under .anvil/ except to correct the repro, and never weaken or delete tests to make them pass.
 - If an edit fails, read the hint in the error and the file again; do not retry the same edit blindly.
+- If the issue asks for validation, raise a specific exception (ValueError, TypeError, or the type the issue names) with a clear message. Never use assert to validate input.
 Finish with phase_done(summary): what you changed and why. If no fix is possible, call give_up(reason)."""
 
 _VERIFY = """\
@@ -71,7 +72,7 @@ Call phase_done(summary) if the repro and the relevant tests pass. Otherwise cal
 
 _REVIEW = """\
 Phase: REVIEW. Review your own patch as a strict maintainer would. Tools: git_diff, read_file, run_tests.
-Read the full diff and check: does it fix the root cause rather than a symptom? Is it minimal, with no debug output, stray files or unrelated edits? Does it handle the edge cases the issue implies (empty or None input, other call sites of the changed code)? Does it match the style of the surrounding code?
+Read the full diff and check: does it fix the root cause rather than a symptom? Is it minimal, with no debug output, stray files or unrelated edits? Does it handle the edge cases the issue implies (empty or None input, other call sites of the changed code)? Does it match the style of the surrounding code? Does the exception type and message match what the issue asks for? Validation must raise a specific exception (ValueError, TypeError, or the type the issue names), never assert.
 You cannot edit anything in this phase. Use run_tests only to check a doubt (for example that a test really exercises the changed code); it does not change the repository.
 Call phase_done(summary) to approve. If something must change, call give_up(reason) listing exactly what to change; the harness then sends you back to PATCH once."""
 
@@ -115,7 +116,7 @@ _WEAK_PATCH = """\
 Phase: PATCH. Fix the cause. Tools: read_file, grep, edit_file, run_cmd, git_diff.
 - Read the exact code first. edit_file replaces `old` (copied verbatim from read_file, indentation included) with `new`. If an edit fails, read the file again.
 - Then run the repro with run_cmd and check git_diff.
-- For invalid input raise the most specific built-in exception (ValueError, TypeError) with a clear message that names the bad value. Never use assert to validate input. Grep the file, then its package, for how similar errors are reported and follow that: same exception type, same message style. If a neighbouring check of the same input uses assert, raise the proper exception there too.
+- If the issue asks for validation, raise a specific exception (ValueError, TypeError, or the type the issue names) with a clear message that names the bad value. Never use assert to validate input. Grep the file, then its package, for how similar errors are reported and follow that: same exception type, same message style. If a neighbouring check of the same input uses assert, raise the proper exception there too.
 Finish with phase_done(summary): what you changed and why.
 Example call: edit_file(path="calc.py", old="return a - b", new="return a + b")"""
 
@@ -127,7 +128,7 @@ Example call: run_tests(targets=["tests/test_calc.py"])"""
 
 _WEAK_REVIEW = """\
 Phase: REVIEW. Review the patch as a strict maintainer. Tools: git_diff, read_file, run_tests.
-Check: it fixes the root cause; it is minimal, with no debug output or stray files; edge cases (empty or None input, other callers); the style around it. Check the type and the message of any new error: the most specific built-in exception (ValueError, TypeError), never assert for input validation, a clear message that names the bad value, and the same convention as the other errors in that module (read_file the nearby code to see how it reports similar ones).
+Check: it fixes the root cause; it is minimal, with no debug output or stray files; edge cases (empty or None input, other callers); the style around it. Does the exception type and message match what the issue asks for? A specific exception (ValueError, TypeError, or the type the issue names), never assert for input validation, a clear message that names the bad value, and the same convention as the other errors in that module (read_file the nearby code to see how it reports similar ones).
 You cannot edit in this phase; run_tests only checks a doubt and changes nothing.
 phase_done(summary) approves. give_up(reason) asks for changes: list exactly what to change (you get one rework).
 Example call: git_diff()"""
