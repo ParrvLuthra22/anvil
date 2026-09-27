@@ -5,7 +5,7 @@
 - Run `make setup` once and confirm `make run` opens the TUI.
 - To demonstrate without a key, run `make demo`; it starts a scripted TUI
   session. (`make run --demo` is not valid GNU Make syntax; `make run` is the
-  live, key-requiring target.)
+  live, key-requiring target.) Quit either TUI with Ctrl+C.
 - Set `AI_API_KEY` in the shell environment. Never paste it into the TUI or a
   command argument.
 - Have a small, public GitHub issue ready that describes a concrete bug in a

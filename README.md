@@ -28,6 +28,8 @@ make run
 make run ISSUE=https://github.com/owner/repo/issues/42
 ```
 
+Quit the TUI with **Ctrl+C** (output files are kept). No key? `make demo` plays a scripted run.
+
 > **First-time note:** `make setup` will warn (but not fail) if `git` or
 > `ripgrep` (`rg`) are missing.  `git` is required for cloning; `rg` is
 > optional — the grep tool falls back to system `grep`.
@@ -167,7 +169,8 @@ make demo
 ```
 
 Plays a scripted fake event stream through the TUI so you can explore the
-interface without any API key or network access.
+interface without any API key or network access. The target is `make demo`;
+`make run --demo` is not valid (make rejects the flag). Quit with **Ctrl+C**.
 
 ---
 
@@ -278,7 +281,8 @@ Every run writes three files to `output/`:
 
 | Key | Action |
 |-----|--------|
-| `q` | Quit (output files are preserved) |
+| `Ctrl+C` | Quit from anywhere (output files are preserved) |
+| `q` | Quit, when the input box is not focused (otherwise it types a `q`; use Ctrl+C) |
 | `r` | Restart (clear log, reset phases) |
 | `d` | Toggle diff preview pane |
 | `space` | Pause / resume replay |

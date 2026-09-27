@@ -101,34 +101,38 @@ instance is also reported separately by the analyzer.
 ## Early results (Qwen3-Coder-30B; not a pass rate)
 
 These are the only real runs recorded so far. They used **Qwen3-Coder-30B on
-OpenRouter**, with the settings that were current at the time. They are early
-observations, not a pass rate: four runs are too few for one, and two of them
-are on a toy repository written for the harness, not on scored issue instances.
-No per-run timing or token totals are reported because the run records for these
-four results are not in this checkout.
+OpenRouter**. They are early observations, not a pass rate: there are too few of
+them, and the toy repository was written for the harness, so it is not a scored
+issue instance. The latest runs used commit `f9d2968` with the default settings.
 
-| Run | Target | Result |
-|---|---|---|
-| Toy run 1 | Toy repository | Correct patch |
-| Toy run 2 | Toy repository | Correct patch |
-| Flask | `pallets__flask-4045` | Unresolved (`f2p_fail`): the patch used `assert` where the issue asked for `ValueError` |
-| pytest | `pytest-dev__pytest-11143` | Empty patch (`empty_patch`): `edit_file` could not apply the model's edits |
+| Target | Result |
+|---|---|
+| Toy repository | Correct patch: the two early runs, and the latest run (36 steps, 102,621 tokens) |
+| `pallets__flask-4045` | Unresolved (`f2p_fail`): the patch is a bare `assert` where the issue asked for `ValueError`. Both the early run and the latest run (89 steps, 499,099 tokens) |
+| `pytest-dev__pytest-11143` | Not run: HTTP 402 (out of credit) on the first model call, in two attempts |
+| `psf__requests-2317` | Not run: HTTP 402 (out of credit) on the first model call, in two attempts |
 
-So: the toy repository, 2 of 2 correct patches; the two real issues, 0 of 2
-resolved. Do not add these up into a resolved rate. The locally saved audit
-under `bench/results-integration-real-audit.jsonl` is a separate run set and is
-not one of these four results.
+The provider account ran out of credit after the Flask run. Each 402 stopped the
+run at its first model call; the harness finished cleanly and wrote
+`patch.diff`, `report.md` and `trace.jsonl` every time. Those two instances have
+no result, which is not the same as a failed attempt. Do not add these rows up
+into a resolved rate. The locally saved audit under
+`bench/results-integration-real-audit.jsonl` is a separate run set and is not
+part of this table.
 
 ## Known limitations
 
-- **There is no pass rate.** Four runs, one model, one provider. Nothing here
-  supports a claim about how often ANVIL resolves an issue.
-- **Neither real issue was resolved.** The Flask patch raised the wrong kind of error
-  (`assert`, not `ValueError`), and the pytest run produced no patch because the edit
-  tool could not apply the model's edits. Since then `edit_file` has been made
-  tolerant of indentation differences, and the retry that replaces a bare `assert`
-  has been changed so that a repro written for the assert cannot undo it. No rerun
-  is recorded in this document, so neither change is shown to fix these two issues.
+- **There is no pass rate.** A handful of runs, one model, one provider. Nothing
+  here supports a claim about how often ANVIL resolves an issue.
+- **The one real issue that ran is unresolved.** The Flask patch raised the wrong
+  kind of error (`assert`, not `ValueError`). In the latest run no repro was ever
+  confirmed and all three patch attempts were used, so the retry that replaces a
+  bare `assert` never ran. `pytest-dev__pytest-11143` and `psf__requests-2317`
+  have no result because the account ran out of credit. An earlier run on
+  pytest-11143 (its record is not in this checkout) ended with an empty patch
+  because `edit_file` could not apply the model's edits; `edit_file` has since
+  been made tolerant of indentation differences, but that change has not been
+  shown to fix that instance.
 - **The toy successes prove little.** The toy repository was written to exercise
   the harness. A correct patch there says the pipeline runs end to end, not that
   it can fix a real project.

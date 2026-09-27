@@ -233,11 +233,11 @@ own repro is capped at 0.50 and says no repository tests were run.
 ## Design decisions measured
 
 No implementation decision is labelled measured yet. The only real runs so far
-are the early Qwen3-Coder-30B results in `docs/EVALUATION.md`: two toy
-repositories and two SWE-bench-style issues, one unresolved and one with an empty
-patch. They are not a pass rate and cannot support a design or token-efficiency
-comparison. Add a measured decision here only after comparable before/after runs
-complete successfully.
+are the Qwen3-Coder-30B results in `docs/EVALUATION.md`: a toy repository
+(correct patches) and one Flask issue (unresolved); two more issues could not be
+run because the provider account ran out of credit. They are not a pass rate and
+cannot support a design or token-efficiency comparison. Add a measured decision
+here only after comparable before/after runs complete successfully.
 
 ## Support status and future work
 
