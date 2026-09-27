@@ -39,7 +39,9 @@ PROFILES: dict[str, ModelProfile] = {
     "default": ModelProfile("default"),
     # Chat models: their default reply limit is small (DeepSeek 4k, DashScope Qwen about 2k), and a whole-file edit needs more.
     "deepseek": ModelProfile("deepseek", max_output_tokens=8192),
-    "qwen": ModelProfile("qwen", max_output_tokens=8192),
+    # Qwen: 4096. The largest reply seen in real runs was 541 tokens, and providers reserve max_tokens against the account
+    # before answering: OpenRouter's free tier refused 8192 (HTTP 402) and accepted 4096.
+    "qwen": ModelProfile("qwen", max_output_tokens=4096),
     # Reasoning models think before answering, sometimes for tens of thousands of tokens: a small cap would cut the thinking
     # off and leave no answer, so the provider's own limit applies. Vendors recommend 0.6; greedy decoding makes them loop.
     "deepseek-reasoning": ModelProfile("deepseek-reasoning", temperature=0.6),

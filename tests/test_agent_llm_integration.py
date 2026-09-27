@@ -253,7 +253,7 @@ def test_a_whole_run_through_a_deepseek_or_qwen_shaped_endpoint(tmp_path, monkey
 
     sent = " ".join(json.dumps(r["messages"]) for r in requests)
     assert THOUGHT not in sent and "<think>" not in sent, "reasoning must not travel back to the model in the history"
-    assert requests[0]["model"] == model and requests[0]["max_tokens"] == 8192, "the DeepSeek/Qwen profile's output cap is sent"
+    assert requests[0]["model"] == model and requests[0]["max_tokens"] == (8192 if dialect.startswith("deepseek") else 4096), "the profile's output cap is sent"
     if dialect == "qwen-hermes" and tool_mode == "auto":
         assert client.active_tool_mode == "text", "two calls arrived as text, so the client moved to text mode for good"
         assert "tools" not in requests[-1]

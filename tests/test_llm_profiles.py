@@ -70,8 +70,8 @@ def test_every_profile_is_conservative_about_context():
 def test_reasoning_models_get_no_output_cap_and_the_recommended_temperature():
     for name in ("deepseek-reasoning", "qwen-reasoning"):
         assert PROFILES[name].max_output_tokens is None and PROFILES[name].temperature == 0.6
-    for name in ("deepseek", "qwen"):
-        assert PROFILES[name].max_output_tokens == 8192 and PROFILES[name].temperature == 0.0
+    assert PROFILES["deepseek"].max_output_tokens == 8192 and PROFILES["deepseek"].temperature == 0.0
+    assert PROFILES["qwen"].max_output_tokens == 4096 and PROFILES["qwen"].temperature == 0.0, "the largest reply seen was 541 tokens"
 
 
 # ---- config.yaml wins over the profile ---------------------------------------------------------------
@@ -87,7 +87,7 @@ def test_a_profile_fills_in_what_the_config_leaves_out():
         "deepseek-reasoning", 0.6, None, "auto", True
     )
     cfg = config_for("qwen-plus")
-    assert (cfg.profile, cfg.temperature, cfg.max_output_tokens) == ("qwen", 0.0, 8192)
+    assert (cfg.profile, cfg.temperature, cfg.max_output_tokens) == ("qwen", 0.0, 4096)
 
 
 def test_explicit_config_values_beat_the_profile():
@@ -102,12 +102,12 @@ def test_a_temperature_of_zero_in_the_config_is_an_explicit_choice_not_unset():
 
 def test_max_output_tokens_null_means_the_providers_default_not_the_profiles():
     assert config_for("qwen-plus", max_output_tokens=None).max_output_tokens is None
-    assert config_for("qwen-plus").max_output_tokens == 8192
+    assert config_for("qwen-plus").max_output_tokens == 4096
 
 
 def test_model_profile_in_the_config_forces_a_profile():
     cfg = config_for("my-finetune", model_profile="qwen")
-    assert (cfg.profile, cfg.max_output_tokens) == ("qwen", 8192)
+    assert (cfg.profile, cfg.max_output_tokens) == ("qwen", 4096)
 
 
 def test_an_unknown_model_profile_in_the_config_is_a_config_error():
@@ -134,7 +134,7 @@ def body_for(model, **overrides):
 
 def test_a_chat_model_gets_an_output_cap_in_its_requests():
     assert body_for("deepseek-chat")["max_tokens"] == 8192
-    assert body_for("Qwen/Qwen2.5-Coder-32B-Instruct")["max_tokens"] == 8192
+    assert body_for("Qwen/Qwen2.5-Coder-32B-Instruct")["max_tokens"] == 4096
 
 
 def test_a_reasoning_model_is_not_capped_and_an_unknown_model_gets_nothing_new():
@@ -187,3 +187,15 @@ def test_the_shipped_config_resolves_cleanly():
 
 def test_the_model_profile_type_is_exported():
     assert isinstance(profile_for("x"), ModelProfile)
+
+
+def test_the_qwen_cap_can_be_raised_or_removed_in_the_config_without_a_code_edit():
+    assert config_for("qwen3-coder", max_output_tokens=8192).max_output_tokens == 8192
+    assert config_for("qwen3-coder", max_output_tokens=None).max_output_tokens is None
+    assert body_for("qwen3-coder", max_output_tokens=8192)["max_tokens"] == 8192
+
+
+def test_the_shipped_qwen_profile_stays_below_what_a_free_tier_refused():
+    """OpenRouter's free tier answered HTTP 402 to max_tokens=8192 and accepted 4096."""
+    assert PROFILES["qwen"].max_output_tokens < 8192
+

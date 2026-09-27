@@ -15,9 +15,10 @@ model_profile: auto
 # delete this line to use the profile's 0.6, or set it. `python -m anvil.llm.probe` warns when this applies.
 temperature: 0
 
-# Cap on tokens per reply (sent as max_tokens). Unset: the profile decides (8192 for chat models, none for reasoning
-# models, whose thinking would be cut off). `null` means the provider's own default.
-# max_output_tokens: 8192
+# Cap on tokens per reply (sent as max_tokens). Unset: the profile decides (4096 for Qwen, 8192 for DeepSeek chat, none for
+# reasoning models, whose thinking would be cut off). `null` means the provider's own default. Providers reserve this much
+# against the account before answering, so a low-credit key can be refused (HTTP 402) at a large value: lower it if so.
+# max_output_tokens: 4096
 
 # Remove <think>...</think> blocks and reasoning_content from replies (they still count towards token usage).
 strip_reasoning: true

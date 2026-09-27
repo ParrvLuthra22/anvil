@@ -237,7 +237,7 @@ def test_the_header_shows_the_effective_settings(config_file):
     _, out = run(config_file, Provider(), model="qwen-plus", llm_extra_params={"top_p": 0.8})
     flat = squash(out)
     assert "model: qwen-plus" in flat and "profile: qwen" in flat
-    assert "max_output: 8192" in flat and "extra params: top_p" in flat
+    assert "max_output: 4096" in flat and "extra params: top_p" in flat
     assert "endpoint: https://llm.example.com/v1" in flat
 
 
