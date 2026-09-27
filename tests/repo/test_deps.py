@@ -800,3 +800,112 @@ class TestCandidateSelectionEraRule:
         assert not _python_version_available_by("3.15", "2026-09-27")
         assert not _python_version_available_by("4.0", "2099-01-01")
 
+
+class TestPytestCompatibilityBump:
+    """Item 3: Only if chosen interpreter is >= 3.11 and date-pinned pytest is < 7.2,
+    bump pytest to the newest version that works (<8) and tell the model nothing else.
+    """
+
+    def test_pytest_bumped_when_python_312_and_pytest_under_72(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.12" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.12\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-312\n")
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="6.2.4\n")  # date-pinned pytest is 6.2.4 (< 7.2)
+            if "pytest --version" in cmd:
+                return _exec_result(0, stdout="pytest 7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        # Must have bumped pytest to >=7.2,<8 and uninstalled py
+        assert any("pytest>=7.2,<8" in cmd for cmd in executed_commands)
+        assert any("pip uninstall" in cmd and "py" in cmd for cmd in executed_commands)
+        assert any("pytest --version" in cmd for cmd in executed_commands)
+        # And tell the model nothing else
+        assert "7.4.4" not in result.report
+        assert "bump" not in result.report.lower()
+
+    def test_pytest_not_bumped_when_python_is_39(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.9" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.9\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-39\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        # No pytest bumping when interpreter is < 3.11
+        assert not any("pytest>=7.2,<8" in cmd for cmd in executed_commands)
+
+
+class TestEvaluatorMachineRobustness:
+    """Item 5: Single Python, uv absent, plain report and continue with working venv."""
+
+    def test_single_python_too_new_reports_plainly_and_continues(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+
+        def mock_exec(cmd, **kwargs):
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.14" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.14\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-314\n")
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        assert result.venv_python is not None
+        # Plain report stating python is newer than era
+        assert "is newer than the repository era" in result.report
+
+    def test_uv_absent_installs_with_pip_and_continues(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.12" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.12\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-312\n")
+            if "test -x" in cmd and "uv" in cmd:
+                return _exec_result(1)  # uv is absent!
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        assert result.venv_python is not None
+        assert "WARNING: uv was unavailable" in result.report
+        assert any(".anvil_venv/bin/pip install" in cmd for cmd in executed_commands)
+
