@@ -339,12 +339,11 @@ def test_auto_mode_rescues_a_qwen_tag_reply_from_a_server_with_no_tool_parser():
     client, _ = build(Server(chat_body({"content": HERMES.replace("src/calc.py", "a.py")})))
     response = client.chat(USER, ALL_TOOLS)
     assert response.tool_calls[0]["tool"] == "read_file" and response.tool_calls[0]["args"]["path"] == "a.py"
-    assert client.active_tool_mode == "native", "one miss is not yet a reason to switch"
+    assert client.active_tool_mode == "text", "the first miss switches the run to text mode for good"
 
 
-def test_auto_mode_switches_to_text_after_two_qwen_style_misses():
+def test_auto_mode_switches_to_text_at_the_first_qwen_style_miss():
     client, _ = build(Server(chat_body({"content": HERMES})))
-    client.chat(USER, ALL_TOOLS)
     client.chat(USER, ALL_TOOLS)
     assert client.active_tool_mode == "text"
 
@@ -519,9 +518,9 @@ def test_the_client_rescues_a_python_syntax_call_from_a_native_reply_and_counts_
     client, _ = build(server)
     first = client.chat(USER, tools)
     assert first.tool_calls[0]["tool"] == "phase_done" and first.tool_calls[0]["args"] == {"summary": "done"}
-    assert first.text == "" and client.active_tool_mode == "native"
+    assert first.text == "" and client.active_tool_mode == "text", "a miss: the endpoint is not doing native tool calls"
     client.chat(USER, tools)
-    assert client.active_tool_mode == "text", "two misses in a row: the endpoint is not doing native tool calls"
+    assert "tools" not in server.body(1), "and native is not tried again"
 
 
 # ---- Qwen3-Coder XML with a missing wrapper --------------------------------------------------------------------

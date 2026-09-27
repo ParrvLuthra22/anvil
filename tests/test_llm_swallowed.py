@@ -2,7 +2,7 @@
 
 With ``tools`` attached, the provider's own tool-call parser sometimes consumes the model's output and answers
 ``content: null`` with no ``tool_calls``. Nothing is left for the client to read, so in auto mode it repeats the
-request in text mode, where no server-side parser is involved, and after two such replies stays there.
+request in text mode, where no server-side parser is involved, and from the first such reply stays there.
 """
 
 import httpx
@@ -41,7 +41,7 @@ def test_a_swallowed_native_reply_is_repeated_in_text_mode_and_the_text_reply_is
     assert response.tool_calls[0]["tool"] == "read_file" and response.tool_calls[0]["args"] == {"path": "a.py"}
     assert len(server.requests) == 2
     assert sent_tools(server, 0) and not sent_tools(server, 1), "the repeat carries the tools in the prompt, not the API"
-    assert client.active_tool_mode == "native", "one swallowed reply is not yet a reason to leave native mode"
+    assert client.active_tool_mode == "text", "the first swallowed reply moves the rest of the run to text mode"
 
 
 def test_the_wasted_calls_tokens_are_still_counted_in_the_response_and_in_the_totals():
@@ -57,26 +57,16 @@ def test_the_wasted_calls_tokens_are_still_counted_in_the_response_and_in_the_to
     assert (client.totals.calls, client.totals.total_tokens) == (2, 774)
 
 
-def test_two_swallowed_replies_switch_to_text_mode_for_good():
-    server = Server(swallowed(), ok(CALL_BLOCK), swallowed(), ok(CALL_BLOCK), ok(CALL_BLOCK))
+def test_the_first_swallowed_reply_switches_to_text_mode_for_good():
+    server = Server(swallowed(), ok(CALL_BLOCK), ok(CALL_BLOCK), ok(CALL_BLOCK))
     client, _ = build(server)
 
-    client.chat(USER, TOOLS)
-    assert client.active_tool_mode == "native"
     client.chat(USER, TOOLS)
     assert client.active_tool_mode == "text"
 
     client.chat(USER, TOOLS)
-    assert len(server.requests) == 5 and not sent_tools(server, 4), "the third call goes straight to text mode"
-
-
-def test_the_swallowed_replies_need_not_be_consecutive():
-    """A provider that drops a third of its native replies is not reliable however the good ones fall between."""
-    server = Server(swallowed(), ok(CALL_BLOCK), ok("fine", tool_calls=[native_call()]), swallowed(), ok(CALL_BLOCK))
-    client, _ = build(server)
-    for _ in range(3):
-        client.chat(USER, TOOLS)
-    assert client.active_tool_mode == "text"
+    client.chat(USER, TOOLS)
+    assert len(server.requests) == 4 and not sent_tools(server, 2) and not sent_tools(server, 3), "later calls go straight to text mode"
 
 
 def test_a_healthy_native_reply_is_not_repeated():

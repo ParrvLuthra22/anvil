@@ -47,8 +47,10 @@ API_KEY_ENV = "AI_API_KEY"
 _REDACTED = "[REDACTED]"
 # Statuses that, in auto mode, may mean "this provider does not accept the tools parameter".
 _POSSIBLE_TOOL_REJECTIONS = (400, 404, 422)
-_MISSES_BEFORE_TEXT_MODE = 2
-_SWALLOWED_BEFORE_TEXT_MODE = 2
+# In auto mode the first native tool-call failure of a run (a swallowed reply, a call written as text) moves the rest of the run
+# to text mode: native is never tried again, because each try costs a billed call and a repeat.
+_MISSES_BEFORE_TEXT_MODE = 1
+_SWALLOWED_BEFORE_TEXT_MODE = 1
 _EMPTY_TEXT_RETRIES = 2
 _RETRY_TEMPERATURE = 0.5  # a greedy repeat of a request whose reply was swallowed is swallowed the same way
 _REMINDER_WITH_TOOLS = (
@@ -214,8 +216,7 @@ class OpenAICompatClient(LLMClient):
         Some providers run their own tool-call parser over the model's output and, when it cannot read it, return
         ``content: null`` without a call, whether the model was calling a tool or answering. Text mode has no server-side
         parser to swallow anything. The wasted call stays in the totals and is added to the response's usage, so the
-        caller's budget sees everything that was billed. After ``_SWALLOWED_BEFORE_TEXT_MODE`` such replies the client
-        stays in text mode.
+        caller's budget sees everything that was billed. From the first such reply the client stays in text mode.
         """
         wasted = self._finish("", [], payload, data, reply).usage
         self._swallowed_replies += 1
@@ -319,8 +320,7 @@ class OpenAICompatClient(LLMClient):
     def _rescue_native_miss(self, text: str, calls: list[dict], tools: list[dict]) -> tuple[str, list[dict]]:
         """Auto mode: spot replies that put a tool call in the text instead of ``tool_calls``.
 
-        The call is rescued from the text. After two such replies in a row the
-        client switches to text mode for good.
+        The call is rescued from the text, and from the first such reply the client switches to text mode for good.
         """
         remaining, rescued = self._first_text_call(text, tools) if not calls else (text, [])
         if not rescued:
@@ -328,7 +328,7 @@ class OpenAICompatClient(LLMClient):
             return text, calls
         self._native_misses += 1
         if self._native_misses >= _MISSES_BEFORE_TEXT_MODE:
-            logger.warning("provider ignored native tool calling twice in a row; switching to text mode")
+            logger.warning("provider put a tool call in the text instead of tool_calls; switching to text mode for good")
             self._use_text = True
         return remaining, rescued
 

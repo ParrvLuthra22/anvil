@@ -162,8 +162,9 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 Observed with Qwen3-Coder through OpenRouter (upstream provider Novita); no other provider or model family has been run yet.
 
 - **Swallowed replies.** The provider bills tokens and returns `content: null` and no `tool_calls`, with `tools` attached and
-  also without them. In auto mode a swallowed native reply is repeated once in text mode; two of them in a run keep the client
-  in text mode. In text mode an empty but billed reply is asked again up to twice, with a reminder added for that call only and
+  also without them. In auto mode the first native tool-call failure of a run (a swallowed reply, or a call written as text
+  instead of `tool_calls`) moves the rest of the run to text mode: the swallowed reply is repeated once in text mode, and native
+  is never tried again (each try costs a billed call). An HTTP 400/404/422 that rejects `tools` does the same. In text mode an empty but billed reply is asked again up to twice, with a reminder added for that call only and
   a temperature of at least 0.5 (a greedy repeat is swallowed the same way). Cut-off replies, replies with no tokens billed
   and reasoning-only replies are not retried. The tokens of every attempt are added to the response's usage and to the
   budget, so the agent loop sees at most one reply and never a provider glitch. Explicit `tool_mode: native` stays strict.

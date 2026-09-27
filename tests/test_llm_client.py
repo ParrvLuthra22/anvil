@@ -481,28 +481,30 @@ def test_auto_auth_failure_does_not_trigger_fallback():
     assert len(server.requests) == 1
 
 
-def test_auto_switches_after_two_missed_native_calls_in_a_row_and_rescues_them():
+def test_auto_switches_at_the_first_missed_native_call_and_rescues_it():
     server = Server(ok(CALL_BLOCK), ok(CALL_BLOCK), ok(CALL_BLOCK))
     client, _ = build(server)
 
     first = client.chat(USER, TOOLS)
     assert first.tool_calls[0]["args"] == {"path": "a.py"} and first.text == ""
-    assert client.active_tool_mode == "native"
-
-    second = client.chat(USER, TOOLS)
-    assert second.tool_calls and client.active_tool_mode == "text"
+    assert client.active_tool_mode == "text", "one native miss is enough: native is not tried again"
 
     client.chat(USER, TOOLS)
-    assert "tools" in server.body(0) and "tools" in server.body(1)
-    assert "tools" not in server.body(2)
+    client.chat(USER, TOOLS)
+    assert "tools" in server.body(0)
+    assert "tools" not in server.body(1) and "tools" not in server.body(2)
 
 
-def test_auto_a_working_native_call_resets_the_miss_counter():
-    server = Server(ok(CALL_BLOCK), ok(None, tool_calls=[native_call()]), ok(CALL_BLOCK))
+def test_auto_working_native_calls_keep_the_run_native_until_the_first_miss():
+    server = Server(ok(None, tool_calls=[native_call()]), ok(None, tool_calls=[native_call()]), ok(CALL_BLOCK), ok(CALL_BLOCK))
     client, _ = build(server)
-    for _ in range(3):
+    for _ in range(2):
         client.chat(USER, TOOLS)
     assert client.active_tool_mode == "native"
+    client.chat(USER, TOOLS)
+    assert client.active_tool_mode == "text", "the first miss, whenever it comes"
+    client.chat(USER, TOOLS)
+    assert "tools" not in server.body(3)
 
 
 def test_auto_plain_answers_are_not_counted_as_attempts():
