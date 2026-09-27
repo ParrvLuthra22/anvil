@@ -10,6 +10,95 @@ from anvil.tools.base import Tool, ToolResult
 _CLOSE_MATCH_LINES = 5   # how many close lines to show on mismatch
 
 
+_MAX_SHOWN_LINES = 30  # lines of a tolerant edit's result shown back to the model
+
+
+def _indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _indent_unit(lines: list[str]) -> str:
+    """One level of indentation as ``lines`` use it: a tab, or the number of spaces between their indentation levels."""
+    indents = [_indent(line) for line in lines if line.strip()]
+    if any("\t" in indent for indent in indents):
+        return "\t"
+    widths = sorted({len(indent) for indent in indents if indent})
+    steps = [b - a for a, b in zip([0] + widths, widths)]
+    return " " * (min(steps) if steps else 4)
+
+
+def _in_units(extra: str, model_unit: str, file_unit: str) -> str:
+    """``extra`` (indentation beyond the first line, in the model's unit) written in the file's unit."""
+    if not extra or model_unit == file_unit:
+        return extra
+    if set(extra) == {"\t"}:
+        levels, rest = len(extra), 0
+    elif set(extra) == {" "} and model_unit != "\t":
+        levels, rest = divmod(len(extra), len(model_unit))
+    else:
+        return extra
+    return file_unit * levels + " " * rest
+
+
+def _line_ending(line: str) -> str:
+    return line[len(line.rstrip("\r\n")):]
+
+
+def _lines_matching_ignoring_indentation(content: str, old: str) -> list[tuple[int, int]]:
+    """Where in ``content`` the lines of ``old`` occur when leading whitespace is ignored, as ``(first, end)`` line indexes."""
+    wanted = [line.lstrip() for line in old.splitlines()]  # (splitlines has already taken the line endings off)
+    if not wanted:
+        return []
+    lines = content.splitlines(keepends=True)
+    return [
+        (i, i + len(wanted))
+        for i in range(len(lines) - len(wanted) + 1)
+        if [line.lstrip().rstrip("\r\n") for line in lines[i : i + len(wanted)]] == wanted
+    ]
+
+
+def _replace_lines_reindented(content: str, span: tuple[int, int], old: str, new: str) -> tuple[str, tuple[int, int, str]]:
+    """Replace the lines ``span`` of ``content`` with ``new``, indented as the file indents them.
+
+    Each line of ``new`` keeps its indentation relative to the first non-blank line of ``old`` (deeper stays deeper, shallower
+    stays shallower) on top of the file's own indentation there, so a model that is two levels off is put right and a tab-indented
+    file gets tabs. The file's line ending is used throughout, and the line break after the block is kept even when ``new``
+    has none: the block replaces whole lines, and the next line must stay on its own line.
+    """
+    first, end = span
+    lines = content.splitlines(keepends=True)
+    matched = lines[first:end]
+    old_lines = old.splitlines()
+    reference = next((i for i, line in enumerate(old_lines) if line.strip()), 0)
+    old_indent, file_indent = _indent(old_lines[reference]), _indent(matched[reference])
+    eol = _line_ending(matched[0]) or _line_ending(matched[-1]) or "\n"
+    model_unit, file_unit = _indent_unit(old_lines), _indent_unit(matched)
+
+    block: list[str] = []
+    for line in new.splitlines():
+        if not line.strip():
+            block.append("")
+            continue
+        indent = _indent(line)
+        if indent.startswith(old_indent):
+            extra = _in_units(indent[len(old_indent):], model_unit, file_unit)
+            block.append(file_indent + extra + line[len(indent):])
+        else:  # shallower than the reference line: as much shallower in the file
+            keep = max(0, len(file_indent) - (len(old_indent) - len(indent)))
+            block.append(file_indent[:keep] + line[len(indent):])
+    text = eol.join(block)
+    if block:
+        text += eol if new.endswith(("\n", "\r")) else _line_ending(matched[-1])
+    lines[first:end] = [text] if text else []
+    updated = "".join(lines)
+
+    now = updated.splitlines()[first : first + len(block)]
+    shown = [f"{first + 1 + n:6d}  {line}" for n, line in enumerate(now[:_MAX_SHOWN_LINES])]
+    if len(now) > _MAX_SHOWN_LINES:
+        shown.append(f"        ... {len(now) - _MAX_SHOWN_LINES} more lines")
+    return updated, (first + 1, first + max(len(block), 1), "\n".join(shown))
+
+
 class EditFileTool:
     """Replace an exact string in a file with new content.
 
@@ -69,75 +158,23 @@ class EditFileTool:
 
         count = content.count(old)
         updated = ""
+        tolerant: tuple[int, int, str] | None = None  # (first line, last line, those lines as they now read) of a tolerant match
 
         if count == 1:
             updated = content.replace(old, new, 1)
         elif count == 0:
-            # Fallback 1: try a match ignoring leading whitespace per line
-            def _strip_leading(s: str) -> str:
-                return "\n".join(line.lstrip() for line in s.splitlines())
-
-            old_stripped = _strip_leading(old)
-            # Find all potential matches in content that map to old_stripped
-            import re
-            
-            lines = content.splitlines(keepends=True)
-            # We want to find a sequence of lines whose lstripped version matches old_stripped.
-            # To be safe, we will just find instances of old_stripped in a stripped version of content,
-            # but that destroys the original spacing. Let's do a line-by-line sliding window.
-            old_lines_stripped = old.splitlines()
-            old_lines_stripped_norm = [l.lstrip() for l in old_lines_stripped]
-            
-            matches = []
-            for i in range(len(lines) - len(old_lines_stripped_norm) + 1):
-                window = lines[i:i + len(old_lines_stripped_norm)]
-                window_stripped = [l.lstrip().rstrip("\n\r") for l in window]
-                # Compare without trailing newlines just for matching
-                old_cmp = [l.rstrip("\n\r") for l in old_lines_stripped_norm]
-                if window_stripped == old_cmp:
-                    matches.append((i, i + len(old_lines_stripped_norm), window))
-
-            if len(matches) == 1:
-                # Exactly one match ignoring leading whitespace. Re-indent new_string.
-                start_idx, end_idx, matched_lines = matches[0]
-                
-                # Determine original indentation of the first line of the block
-                first_line = matched_lines[0]
-                indent = first_line[:len(first_line) - len(first_line.lstrip())]
-                
-                # Re-indent new
-                new_lines = new.splitlines(keepends=True)
-                reindented_new = []
-                for j, nl in enumerate(new_lines):
-                    # Only add indent if the new line doesn't already have it
-                    # But actually, the instruction says "re-indent new_string to the file's indentation".
-                    # Let's see how much indent to add. If old was dedented, new is dedented.
-                    # We just prepend `indent` if it's relative, but it's simpler to assume new has same relative indentation.
-                    # Let's calculate the delta between `indent` and the first line of `old`
-                    old_first = old_lines_stripped[0] if old_lines_stripped else ""
-                    old_indent_str = old_first[:len(old_first) - len(old_first.lstrip())]
-                    
-                    if nl.startswith(old_indent_str):
-                        reindented_new.append(indent + nl[len(old_indent_str):])
-                    else:
-                        reindented_new.append(indent + nl)
-                
-                new_block = "".join(reindented_new)
-                
-                # Replace the matched lines in content
-                lines[start_idx:end_idx] = [new_block]
-                updated = "".join(lines)
-            else:
-                # 0 or multiple fuzzy matches
+            # Fallback: the same lines with different indentation (tabs vs spaces, one level too deep or too shallow).
+            spans = _lines_matching_ignoring_indentation(content, old)
+            if len(spans) != 1:
                 close = self._closest_actual_block(old, content)
                 hint = f"\nClosest existing block (with original indentation):\n{close}" if close else ""
-                
-                msg = f"String not found in {path!r}." if len(matches) == 0 else f"String found {len(matches)} times (ignoring indentation) in {path!r} — edit is ambiguous."
-                return ToolResult(
-                    ok=False,
-                    output=f"{msg}{hint}",
-                    meta={"match_count": 0},
+                msg = (
+                    f"String not found in {path!r}."
+                    if not spans
+                    else f"String found {len(spans)} times (ignoring indentation) in {path!r} — edit is ambiguous."
                 )
+                return ToolResult(ok=False, output=f"{msg}{hint}", meta={"match_count": 0})
+            updated, tolerant = _replace_lines_reindented(content, spans[0], old, new)
         else:
             return ToolResult(
                 ok=False,
@@ -164,6 +201,12 @@ class EditFileTool:
             )
 
         msg = f"Successfully replaced 1 occurrence in {path!r}."
+        if tolerant is not None:
+            first, last, shown = tolerant
+            msg += (
+                f" Whitespace-tolerant match: your `old` differed from the file in indentation, so it was matched line by line "
+                f"(lines {first}-{last}) and `new` was re-indented to fit. Those lines now read:\n{shown}"
+            )
         if whitespace_only:
             msg += (
                 " ⚠ Warning: old and new differ only in whitespace — "
@@ -172,7 +215,13 @@ class EditFileTool:
         return ToolResult(
             ok=True,
             output=msg,
-            meta={"path": path, "match_count": 1, "whitespace_only": whitespace_only},
+            meta={
+                "path": path,
+                "match_count": 1,
+                "whitespace_only": whitespace_only,
+                "tolerant_match": tolerant is not None,
+                **({"lines": [tolerant[0], tolerant[1]]} if tolerant is not None else {}),
+            },
         )
 
     @staticmethod
