@@ -26,7 +26,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -40,6 +40,7 @@ from anvil.llm.errors import LLMConfigError, LLMError
 from anvil.sandbox.base import Sandbox
 
 LOOP_REPEATS = 3  # identical calls in a row that make a loop
+REPEAT_LIMIT = 3  # identical calls a phase may make, in a row or not, before the next one is refused
 LOOP_STRIKE_LIMIT = 3  # strikes after which the phase is ended
 MAX_SILENT_REPLIES = 1  # nudges for a reply without a tool call, before the phase is ended
 
@@ -128,6 +129,13 @@ _LOOP_HINTS: dict[Phase, str] = {
     Phase.REVIEW: "you already have what you need: call phase_done to approve, or give_up(reason) to request changes",
 }
 _DEFAULT_LOOP_HINT = "use different arguments or a different tool, or end the phase with phase_done or give_up"
+
+REPEAT_REFUSAL = "Not run: You already did this three times: act or call phase_done."
+_EDIT_REPEAT_NOTE = (
+    " Every earlier edit with this old_string failed: read_file the exact lines and copy them, or call phase_done."
+)
+# Calls that change the code or the repro: after one succeeds the same read, repro run or test run can give a new answer.
+_STATE_CHANGING = frozenset({"edit_file", "write_repro"})
 
 
 # ---- arguments and schemas ------------------------------------------------------------------
@@ -396,6 +404,8 @@ class PhaseGuard:
         self._tools = tools
         self._loops = LoopDetector()
         self._silent = 0
+        self._identical: Counter[str] = Counter()  # attempts of each (tool, arguments) since the code last changed
+        self._failed_edits: Counter[str] = Counter()  # failed edit_file calls per old_string, whatever path and new text
 
     def announce(self, error_class: ErrorClass, message: str) -> None:
         """Publish a recovery action as an ``error`` event."""
@@ -418,10 +428,29 @@ class PhaseGuard:
         return self.invalid_arguments(name, "; ".join(problems)) if problems else None
 
     def repeated(self, name: str, args: Mapping[str, Any]) -> LoopVerdict | None:
-        """Note a call; if it makes a loop, the corrective reply to give instead of running it."""
+        """Note a call; if it makes a loop, the corrective reply to give instead of running it.
+
+        Two rules, the loop detector first: the same call several times in a row, or two calls alternating, is refused with
+        a strike, and the third strike ends the phase. What the detector cannot see is the second rule: the 4th identical call
+        (same tool, same arguments) of a phase is refused whether or not other calls came between, and so is an edit whose ``old`` string has already failed in three edits (``new`` and the path may differ):
+        a model that re-reads the same range or resends the same wrong text is not making progress. A successful edit
+        starts the counts again, because the code has changed and the same repro run or read now gives a new answer. Those
+        refusals carry no strike.
+        """
+        signature_ = call_signature(name, args)
+        old = str(args["old"]) if name == "edit_file" and args.get("old") is not None else None
+        earlier = self._identical[signature_]
+        self._identical[signature_] += 1
+        failed_edits = self._failed_edits[old] if old is not None else 0
         pattern = self._loops.observe(name, args)
         if pattern is None:
-            return None
+            if earlier < REPEAT_LIMIT and failed_edits < REPEAT_LIMIT:
+                return None
+            call = format_call(name, args)
+            self.announce(ErrorClass.LOOP, f"{call}: identical call number {earlier + 1} in this phase; refused")
+            note = _EDIT_REPEAT_NOTE if failed_edits >= REPEAT_LIMIT else ""
+            reason = f"the model kept repeating itself (last call {call})"
+            return LoopVerdict(f"{REPEAT_REFUSAL}{note}", reason, False)  # no strike: the phase's call cap ends it, with a summary
         strikes = self._loops.strikes
         hint = _LOOP_HINTS.get(self._phase, _DEFAULT_LOOP_HINT)
         reply = (
@@ -453,6 +482,11 @@ class PhaseGuard:
         self, tool: str, args: Mapping[str, Any], ok: bool, output: str, meta: Mapping[str, Any], sandbox: Sandbox
     ) -> str:
         """The text the model should read for a finished tool call (see ``review_result``)."""
+        if ok and tool in _STATE_CHANGING:
+            self._identical.clear()
+            self._failed_edits.clear()
+        elif tool == "edit_file" and not ok and args.get("old") is not None:
+            self._failed_edits[str(args["old"])] += 1
         review = review_result(tool, args, ok, output, meta, sandbox)
         if review.error_class is not None:
             self.announce(review.error_class, review.detail)

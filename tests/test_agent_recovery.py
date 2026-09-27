@@ -131,7 +131,11 @@ def test_changing_course_between_loops_keeps_the_phase_alive_but_the_strikes_add
     script = [reply(x)] * 3 + [reply(y)] + [reply(x)] * 2 + [reply(y)] * 2 + [done("ok")]
     h = Harness(script, registry=registry_with(grep))
     assert h.run().done
-    assert kinds(h) == ["loop"]
+    # x came back five times in all: the third in a row is a strike, and the 4th and 5th are refused as identical calls
+    # of the phase (no strike), so the phase stays alive and only the first of the three events carries a strike.
+    assert kinds(h) == ["loop", "loop", "loop"]
+    messages = [e.data["message"] for e in h.events("error") if e.data["kind"] == "loop"]
+    assert sum("strike" in m for m in messages) == 1 and sum("identical call number" in m for m in messages) == 2
 
 
 def test_repeated_rejections_of_phase_done_are_the_gates_business_not_a_loop():
