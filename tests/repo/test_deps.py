@@ -89,12 +89,9 @@ def _make_sandbox(exec_side_effects: list) -> MagicMock:
 
 
 def _py_probe_ok() -> list:
-    """Mock 5 exec calls: command -v found (exit 0) + version print (exit 0) + rm -rf (exit 0) + venv create (exit 0) + verify (exit 0) + rm -rf (exit 0).
-
-    This simulates _pick_python_interpreter succeeding on the first candidate
-    (python3.13).
-    """
+    """Mock exec calls: python3.14 not found, python3.13 found and usable."""
     return [
+        _exec_result(1),  # python3.14 not found
         _exec_result(0),  # command -v
         _exec_result(0, stdout="3.13\n"),  # version
         _exec_result(0, stdout="/tmp/anvil-probe-test\n"),  # tempfile.mkdtemp
@@ -216,15 +213,23 @@ class TestParseRequiresPython:
 
 class TestPickPythonInterpreter:
     def test_first_candidate_found(self):
-        """When python3.13 is available and can create a venv, it is chosen."""
-        sb = _make_sandbox(_py_probe_ok())
+        """When python3.14 is available and can create a venv, it is chosen."""
+        sb = _make_sandbox([
+            _exec_result(0),  # python3.14 found
+            _exec_result(0, stdout="3.14\n"),  # version
+            _exec_result(0, stdout="/tmp/anvil-probe-test\n"),  # tempfile.mkdtemp
+            _exec_result(0),  # venv create
+            _exec_result(0),  # verify python -c import
+            _exec_result(0),  # finally: rm -rf temporary probe
+        ])
         result = _pick_python_interpreter(sb)
-        assert result == "python3.13"
+        assert result == "python3.14"
 
     def test_fallback_to_python3(self):
         """Falls back through candidates until python3 works."""
-        # candidates: 3.13, 3.12, 3.11, 3.10, 3.9, 3 all fail command -v except python3
+        # candidates: 3.14, 3.13, 3.12, 3.11, 3.10, 3.9 all fail command -v except python3
         sb = _make_sandbox([
+            _exec_result(1),  # python3.14 not found
             _exec_result(1),  # python3.13 not found
             _exec_result(1),  # python3.12 not found
             _exec_result(1),  # python3.11 not found
@@ -249,6 +254,7 @@ class TestPickPythonInterpreter:
     def test_skips_when_venv_not_supported(self):
         """Skips interpreter that can't create a venv."""
         sb = _make_sandbox([
+            _exec_result(1),  # python3.14 not found
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # python3.13 version
             _exec_result(0, stdout="/tmp/anvil-probe-13\n"),  # tempfile.mkdtemp
@@ -299,6 +305,7 @@ class TestPickPythonInterpreter:
     def test_skips_when_missing_modules(self):
         """Skips interpreter that has broken ensurepip/pyexpat/ssl."""
         sb = _make_sandbox([
+            _exec_result(1),  # python3.14 not found
             _exec_result(0),  # python3.13 found
             _exec_result(0, stdout="3.13\n"),  # version
             _exec_result(0, stdout="/tmp/anvil-probe-13\n"),  # tempfile.mkdtemp
@@ -350,9 +357,9 @@ class TestPickPythonInterpreter:
             return _pick_python_interpreter(sb)
 
         assert run_with_spec(">=3.8,<3.12") == "python3.11"
-        assert run_with_spec("!=3.12.*") == "python3.13"
+        assert run_with_spec("!=3.12.*") == "python3.14"
         assert run_with_spec("==3.10.*") == "python3.10"
-        assert run_with_spec(">=3.13") == "python3.13"
+        assert run_with_spec(">=3.13") == "python3.14"
         assert run_with_spec(">=4.0") is None
 
     @pytest.mark.parametrize(
@@ -719,3 +726,186 @@ class TestEnsureDepsJava:
         ensure_deps(sb, _java_profile())
         install_cmd = sb.exec.call_args_list[1][0][0]
         assert "dependency:resolve" in install_cmd
+
+
+class TestCandidateSelectionEraRule:
+    """Tests for:
+    - 2021 repo with [3.9, 3.11, 3.14] installed picks 3.9
+    - 2021 repo with only [3.11, 3.14] picks 3.11 (oldest candidate, closest to that era)
+    - 2025 repo with the same set picks 3.14 (or newest that satisfies requires-python)
+    - Version newer than table counts as released after every cutoff
+    """
+
+    def _setup_sandbox(self, tmp_path, installed_versions: dict[str, str], requires_python: str | None = None):
+        sb = MagicMock()
+        sb.root = tmp_path
+        if requires_python:
+            (tmp_path / "pyproject.toml").write_text(f'[project]\nrequires-python = "{requires_python}"\n')
+
+        def mock_exec(cmd, **kwargs):
+            if cmd.startswith("command -v "):
+                cand = cmd.rsplit(" ", 1)[-1]
+                return _exec_result(0 if cand in installed_versions else 1)
+            interpreter = cmd.split(" -c ", 1)[0]
+            if "import sys" in cmd:
+                ver = installed_versions.get(interpreter, "3.9")
+                return _exec_result(0, stdout=f"{ver}\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout=f"/tmp/{interpreter.replace('.', '_').replace('/', '_')}-probe\n")
+            if "-m venv" in cmd or "import ensurepip" in cmd or cmd.startswith("rm -rf"):
+                return _exec_result(0)
+            return _exec_result(1)
+
+        sb.exec.side_effect = mock_exec
+        return sb
+
+    def test_2021_repo_with_39_311_314_picks_39(self, tmp_path):
+        installed = {
+            "python3.14": "3.14",
+            "python3.11": "3.11",
+            "python3.9": "3.9",
+        }
+        sb = self._setup_sandbox(tmp_path, installed)
+        assert _pick_python_interpreter(sb, as_of="2021-05-13") == "python3.9"
+
+    def test_2021_repo_with_only_311_314_picks_311(self, tmp_path):
+        installed = {
+            "python3.14": "3.14",
+            "python3.11": "3.11",
+        }
+        sb = self._setup_sandbox(tmp_path, installed)
+        # Oldest candidate closest to that era must be chosen, never a newer one just because it's newer
+        assert _pick_python_interpreter(sb, as_of="2021-05-13") == "python3.11"
+
+    def test_2025_repo_with_same_set_picks_314(self, tmp_path):
+        installed = {
+            "python3.14": "3.14",
+            "python3.11": "3.11",
+            "python3.9": "3.9",
+        }
+        sb = self._setup_sandbox(tmp_path, installed)
+        assert _pick_python_interpreter(sb, as_of="2025-11-01") == "python3.14"
+
+    def test_2025_repo_with_requires_python_picks_newest_satisfying(self, tmp_path):
+        installed = {
+            "python3.14": "3.14",
+            "python3.11": "3.11",
+            "python3.9": "3.9",
+        }
+        sb = self._setup_sandbox(tmp_path, installed, requires_python="<3.12")
+        assert _pick_python_interpreter(sb, as_of="2025-11-01") == "python3.11"
+
+    def test_version_newer_than_table_counts_after_every_cutoff(self, tmp_path):
+        from anvil.repo.deps import _python_version_available_by
+        assert not _python_version_available_by("3.15", "2026-09-27")
+        assert not _python_version_available_by("4.0", "2099-01-01")
+
+
+class TestPytestCompatibilityBump:
+    """Item 3: Only if chosen interpreter is >= 3.11 and date-pinned pytest is < 7.2,
+    bump pytest to the newest version that works (<8) and tell the model nothing else.
+    """
+
+    def test_pytest_bumped_when_python_312_and_pytest_under_72(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.12" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.12\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-312\n")
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="6.2.4\n")  # date-pinned pytest is 6.2.4 (< 7.2)
+            if "pytest --version" in cmd:
+                return _exec_result(0, stdout="pytest 7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        # Must have bumped pytest to >=7.2,<8 and uninstalled py
+        assert any("pytest>=7.2,<8" in cmd for cmd in executed_commands)
+        assert any("pip uninstall" in cmd and "py" in cmd for cmd in executed_commands)
+        assert any("pytest --version" in cmd for cmd in executed_commands)
+        # And tell the model nothing else
+        assert "7.4.4" not in result.report
+        assert "bump" not in result.report.lower()
+
+    def test_pytest_not_bumped_when_python_is_39(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.9" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.9\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-39\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        # No pytest bumping when interpreter is < 3.11
+        assert not any("pytest>=7.2,<8" in cmd for cmd in executed_commands)
+
+
+class TestEvaluatorMachineRobustness:
+    """Item 5: Single Python, uv absent, plain report and continue with working venv."""
+
+    def test_single_python_too_new_reports_plainly_and_continues(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+
+        def mock_exec(cmd, **kwargs):
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.14" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.14\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-314\n")
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        assert result.venv_python is not None
+        # Plain report stating python is newer than era
+        assert "is newer than the repository era" in result.report
+
+    def test_uv_absent_installs_with_pip_and_continues(self, tmp_path):
+        sb = MagicMock()
+        sb.root = tmp_path
+        executed_commands = []
+
+        def mock_exec(cmd, **kwargs):
+            executed_commands.append(cmd)
+            if "command -v" in cmd:
+                return _exec_result(0 if "python3.12" in cmd else 1)
+            if "import sys" in cmd:
+                return _exec_result(0, stdout="3.12\n")
+            if "tempfile.mkdtemp" in cmd:
+                return _exec_result(0, stdout="/tmp/probe-312\n")
+            if "test -x" in cmd and "uv" in cmd:
+                return _exec_result(1)  # uv is absent!
+            if "importlib.metadata" in cmd:
+                return _exec_result(0, stdout="7.4.4\n")
+            return _exec_result(0)
+
+        sb.exec.side_effect = mock_exec
+        result = ensure_deps(sb, _python_profile(), as_of="2021-05-13")
+        assert result.ok
+        assert result.venv_python is not None
+        assert "WARNING: uv was unavailable" in result.report
+        assert any(".anvil_venv/bin/pip install" in cmd for cmd in executed_commands)
+

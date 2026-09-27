@@ -27,13 +27,26 @@ _INSTALL_TIMEOUT = 300   # 5 minutes maximum for any install command
 _VENV_DIR = ".anvil_venv"  # relative to sandbox root; separate from the harness venv
 
 # Interpreter candidates probed in order (newest first).
-_PYTHON_CANDIDATES = ["python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python3"]
+_PYTHON_CANDIDATES = [
+    "python3.14",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3.9",
+    "python3",
+    "/usr/bin/python3",
+]
 _PYTHON_RELEASE_DATES = {
+    "3.8": "2019-10-14",
+    "3.9": "2020-10-05",
     "3.10": "2021-10-04",
     "3.11": "2022-10-24",
     "3.12": "2023-10-02",
     "3.13": "2024-10-07",
+    "3.14": "2025-10-07",
 }
+_INTERP_VERSION_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -158,16 +171,14 @@ def _parse_requires_python(sandbox: Sandbox) -> str | None:
 
 
 def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str | None:
-    """Return the first interpreter that satisfies requires-python and can create a venv.
+    """Return an interpreter that satisfies requires-python and can create a venv.
 
-    Probes ``python3.13`` down to ``python3`` in order.
-    For each candidate:
-    1. Check it is on PATH (``command -v``).
-    2. Verify its version satisfies ``requires-python`` using packaging.specifiers.
-    3. Verify it can create a venv (``-m venv --help``).
-
-    Returns:
-        The interpreter name (e.g. ``"python3.11"``), or ``None`` if none qualifies.
+    Selection rule:
+    - candidates = installed interpreters that can really create a venv (probe)
+      AND satisfy requires-python.
+    - Among candidates released on or before as_of, pick the newest.
+    - If none was released by as_of, pick the OLDEST candidate (closest to that era).
+    - Never pick a newer one just because it is newer.
     """
     spec_str = _parse_requires_python(sandbox)
     specifier = None
@@ -180,7 +191,12 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
             specifier = None
 
     newer_than_cutoff = []
+    seen_candidates = set()
     for interp in _PYTHON_CANDIDATES:
+        if interp in seen_candidates:
+            continue
+        seen_candidates.add(interp)
+
         # 1. Is it on PATH?
         probe = sandbox.exec(f"command -v {interp}", timeout=5)
         if probe.exit_code != 0:
@@ -193,14 +209,14 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
         )
         if ver_result.exit_code != 0:
             continue
-            
+
         actual_version = ver_result.stdout.strip()
-        
+
         if specifier is not None:
             if not specifier.contains(actual_version):
                 log.debug(
                     "Skipping %s (version %s does not satisfy %s)",
-                    interp, actual_version, spec_str
+                    interp, actual_version, spec_str,
                 )
                 continue
 
@@ -210,14 +226,19 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
 
         # 3. Can it create a venv and does it have required modules?
         if _can_create_python_venv(sandbox, interp):
-            log.info("Selected Python interpreter: %s", interp)
+            log.info("Selected Python interpreter: %s (version %s)", interp, actual_version)
+            _INTERP_VERSION_CACHE[interp] = actual_version
             return interp
 
-    # The cutoff is a preference, not a hard constraint: old interpreters may
-    # be unavailable on the host, so try the newest working newer candidate.
-    for interp, _ in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1]), reverse=True):
+    # If none was released by as_of, pick the OLDEST candidate (closest to that era).
+    # Never pick a newer one just because it is newer.
+    for interp, actual_version in sorted(newer_than_cutoff, key=lambda candidate: _version_tuple(candidate[1])):
         if _can_create_python_venv(sandbox, interp):
-            log.info("Selected Python interpreter %s as a fallback newer than cutoff %s", interp, as_of)
+            log.info(
+                "Selected Python interpreter %s (version %s) as fallback newer than cutoff %s",
+                interp, actual_version, as_of,
+            )
+            _INTERP_VERSION_CACHE[interp] = actual_version
             return interp
 
     return None
@@ -226,15 +247,39 @@ def _pick_python_interpreter(sandbox: Sandbox, as_of: str | None = None) -> str 
 def _version_tuple(version: str) -> tuple[int, ...]:
     """Return a sortable numeric Python major/minor version tuple."""
     try:
-        return tuple(int(part) for part in version.split("."))
-    except ValueError:
+        nums = []
+        for part in version.split("."):
+            m = re.match(r"^(\d+)", part)
+            if m:
+                nums.append(int(m.group(1)))
+            else:
+                break
+        return tuple(nums) if nums else (0,)
+    except Exception:
         return (0,)
+
+
+def _python_release_date(version: str) -> str:
+    """Return the ISO release date for *version*.
+
+    A version newer than the table counts as released AFTER every cutoff.
+    A version older than the table counts as released BEFORE every cutoff.
+    """
+    parts = version.split(".")
+    major_minor = ".".join(parts[:2]) if len(parts) >= 2 else version
+    if major_minor in _PYTHON_RELEASE_DATES:
+        return _PYTHON_RELEASE_DATES[major_minor]
+    v_tuple = _version_tuple(major_minor)
+    max_known = max((_version_tuple(k) for k in _PYTHON_RELEASE_DATES), default=(0,))
+    if v_tuple > max_known:
+        return "9999-12-31"
+    return "1970-01-01"
 
 
 def _python_version_available_by(version: str, as_of: str) -> bool:
     """Whether a known Python minor release existed by the dependency cutoff."""
-    release_date = _PYTHON_RELEASE_DATES.get(version)
-    return release_date is None or release_date <= as_of[:10]
+    release_date = _python_release_date(version)
+    return release_date <= as_of[:10]
 
 
 def _can_create_python_venv(sandbox: Sandbox, interp: str) -> bool:
@@ -311,6 +356,43 @@ def _normalize_as_of(value: str | date | datetime) -> str:
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _maybe_bump_pytest(
+    sandbox: Sandbox,
+    venv_path: str,
+    venv_python: str,
+    venv_pip: str,
+    has_uv: bool,
+) -> None:
+    """If installed pytest is < 7.2 on Python >= 3.11, bump it to newest working < 8."""
+    probe = sandbox.exec(
+        f'{venv_python} -c "import importlib.metadata as m; print(m.version(\'pytest\'))"',
+        timeout=10,
+    )
+    if probe.exit_code != 0:
+        return
+    pytest_ver_str = probe.stdout.strip()
+    if _version_tuple(pytest_ver_str) >= (7, 2):
+        return
+
+    log.info("Installed pytest is %s (< 7.2) on Python >= 3.11; bumping to >=7.2,<8", pytest_ver_str)
+    uv_path = f"{venv_path}/bin/uv"
+    if has_uv:
+        sandbox.exec(f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet 'pytest>=7.2,<8'", timeout=60)
+        sandbox.exec(f"VIRTUAL_ENV={venv_path} {uv_path} pip uninstall --quiet py", timeout=30)
+    else:
+        sandbox.exec(f"{venv_pip} install --quiet 'pytest>=7.2,<8'", timeout=60)
+        sandbox.exec(f"{venv_pip} uninstall -y --quiet py", timeout=30)
+
+    # Verify by running the real thing, not by assuming
+    verify = sandbox.exec(f"{venv_python} -m pytest --version", timeout=15)
+    if verify.exit_code != 0:
+        log.warning("pytest verification after bump failed: %s", verify.stderr[:200])
+        sandbox.exec(f"{venv_pip} uninstall -y --quiet py", timeout=15)
+        verify2 = sandbox.exec(f"{venv_python} -m pytest --version", timeout=15)
+        if verify2.exit_code != 0:
+            log.warning("pytest second verification failed: %s", verify2.stderr[:200])
+
+
 def _ensure_python_deps(
     sandbox: Sandbox,
     profile: RepoProfile,
@@ -335,6 +417,11 @@ def _ensure_python_deps(
             ),
             skipped=True,
         )
+    interp_version = _INTERP_VERSION_CACHE.get(interp, "")
+    if not interp_version:
+        m = re.search(r"(\d+\.\d+)", interp)
+        interp_version = m.group(1) if m else "3.9"
+    is_fallback = bool(as_of and interp_version and not _python_version_available_by(interp_version, as_of))
 
     # Step 1: Create the venv
     log.info("Creating isolated Python venv at %s/%s using %s", sandbox.root, venv_path, interp)
@@ -362,34 +449,40 @@ def _ensure_python_deps(
     install_cmd = profile.install_cmd
     if install_cmd is None:
         install_cmd = ""
-        
+
+    uv_path = f"{venv_path}/bin/uv"
+    uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
+    has_uv = (uv_probe.exit_code == 0)
+
     strategies = []
     if install_cmd and "pip install" in install_cmd:
-        uv_path = f"{venv_path}/bin/uv"
-        uv_probe = sandbox.exec(f"test -x {uv_path}", timeout=5)
-
-        if uv_probe.exit_code == 0:
+        if has_uv:
             uv_cmd = f"VIRTUAL_ENV={venv_path} {uv_path} pip install"
             if as_of:
                 uv_cmd += f" --exclude-newer {as_of} --no-build-isolation"
             strategies.append(("uv_pinned", install_cmd.replace("pip install", uv_cmd, 1)))
+        elif as_of:
+            # Item 5: When uv is absent, do not abort; fall back to pip
+            pip_cmd = install_cmd.replace("pip install", f"{venv_pip} install", 1)
+            strategies.append(("pip_fallback", pip_cmd))
 
         if as_of is None:
             strategies.append(("pip_plain", install_cmd.replace("pip install", f"{venv_pip} install", 1)))
-        elif uv_probe.exit_code != 0:
-            return _date_pin_failure("uv is unavailable for the requested cutoff.", venv_python)
     elif install_cmd:
-        if as_of:
+        if as_of and not has_uv:
+            strategies.append(("generic", install_cmd))
+        elif as_of:
             return _date_pin_failure("the repository install command cannot be date-pinned.", venv_python)
-        strategies.append(("generic", install_cmd))
-        
+        else:
+            strategies.append(("generic", install_cmd))
+
     result = None
     used_strategy = None
     if strategies:
         for strategy_name, cmd in strategies:
             log.info("Running Python install strategy %s: %s", strategy_name, cmd)
             result = sandbox.exec(cmd, timeout=_INSTALL_TIMEOUT)
-            
+
             if result.exit_code == 0 and not result.timed_out:
                 used_strategy = strategy_name
                 break
@@ -404,7 +497,7 @@ def _ensure_python_deps(
                 f"stdout: {result.stdout[:400] if result else ''}\n"
                 f"stderr: {result.stderr[:400] if result else ''}"
             )
-            if as_of:
+            if as_of and has_uv:
                 return _date_pin_failure(details, venv_python)
             return DepsResult(
                 ok=False,
@@ -415,20 +508,16 @@ def _ensure_python_deps(
     # Step 4: Guarantee the test framework is in the venv
     test_framework_pkg = _test_framework_package(profile)
     if test_framework_pkg:
-        # Always use the best tool available for the framework
         cmd_framework = f"{venv_pip} install --quiet {test_framework_pkg}"
-        if as_of:
-            uv_path = f"{venv_path}/bin/uv"
-            if sandbox.exec(f"test -x {uv_path}", timeout=5).exit_code != 0:
-                return _date_pin_failure("uv is unavailable to install the test framework with the requested cutoff.", venv_python)
+        if as_of and has_uv:
             cmd_framework = (
                 f"VIRTUAL_ENV={venv_path} {uv_path} pip install --quiet "
                 f"--exclude-newer {as_of} --no-build-isolation {test_framework_pkg}"
             )
-            
+
         framework_result = sandbox.exec(cmd_framework, timeout=60)
         if framework_result.exit_code != 0 or framework_result.timed_out:
-            if as_of:
+            if as_of and has_uv:
                 return _date_pin_failure(
                     f"the pinned test-framework install failed: {framework_result.stderr[:400]}",
                     venv_python,
@@ -439,16 +528,30 @@ def _ensure_python_deps(
                 venv_python=venv_python,
             )
 
+        # Item 3: Only if chosen interpreter is >= 3.11 and date-pinned pytest is < 7.2,
+        # bump pytest to newest version that works on that interpreter and tell the model nothing else.
+        if test_framework_pkg == "pytest" and interp_version and _version_tuple(interp_version) >= (3, 11):
+            _maybe_bump_pytest(sandbox, venv_path, venv_python, venv_pip, has_uv)
+
     if as_of and not install_cmd and not test_framework_pkg:
         report = (
             f"Python venv prepared at {venv_path}/ using {interp}; "
             "no dependencies were installed, so no date pin was needed."
         )
-    else:
+    elif as_of is None:
+        report = f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy})."
+    elif not has_uv and used_strategy == "pip_fallback":
         report = (
-            f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy})."
-            if as_of is None
-            else f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of} (strategy: {used_strategy})."
+            f"Python deps installed into {venv_path}/ using {interp} (strategy: {used_strategy}). "
+            f"WARNING: uv was unavailable, so date pin {as_of} could not be applied."
+        )
+    else:
+        report = f"Python deps installed into {venv_path}/ using {interp}, excluding uploads after {as_of} (strategy: {used_strategy})."
+
+    if is_fallback:
+        report += (
+            f" WARNING: {interp} (Python {interp_version}) is newer than the repository era "
+            f"({as_of[:10]}); continuing with this environment as no older interpreter is installed."
         )
 
     return DepsResult(
