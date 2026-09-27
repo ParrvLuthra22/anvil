@@ -108,6 +108,18 @@ capped at `medium`. The done event carries 0.0, 0.3, 0.6 or 0.9.
 - A checkpoint result that is empty, `None` or starts with `error` is a failed checkpoint (a limitation is recorded and
   no rollback will be attempted). If a sandbox's checkpoint empties the working tree (a `git stash` does), the edited files
   are written back through the Sandbox interface; if that is impossible the checkpoint is undone and reported as failed.
+- **VERIFY is decided by evidence when the model does not decide it.** If VERIFY ends without `phase_done` or `give_up` (stalled,
+  looped, step limit, or closed at its call cap) the harness looks at what it holds: its own repro re-run (which passed, or VERIFY
+  would not have started) and the phase's `run_tests` calls. The last test run failed: verification failed, and its output goes to
+  the retry. The last passed: verified, with a limitation note. No test run but a repro that passes: verified on the repro alone,
+  flagged (`verify_without_tests`) so the confidence cannot be high. Neither: failed. A `give_up` is the model's own verdict and
+  stands. A real run went back through PATCH and VERIFY for a fix that worked because its VERIFY stalled after the tests passed.
+- **How many times VERIFY can send the run back to PATCH.** A failed verification is a loop-back: the first attempt plus
+  `max_patch_attempts - 1` (2 by default) retries per approach. After that the tree is rolled back and the model must take a
+  different approach (at most `max_rollbacks`, 2 by default), each approach again getting up to 3 attempts, so PATCH runs at most
+  `max_patch_attempts * (1 + max_rollbacks)` times (9 by default). A VERIFY that merely stops without a verdict never loops
+  back by itself when the evidence passes, so it cannot re-open a fix that works, and a VERIFY after a loop-back is decided the
+  same way as the first.
 - REVIEW reads and may run tests but cannot edit: its tools are `git_diff`, `read_file` and `run_tests` (not `run_cmd`, not
   `edit_file`). `run_tests` is there because a real model spent its REVIEW calls on it and was refused; it changes nothing in the
   repository.

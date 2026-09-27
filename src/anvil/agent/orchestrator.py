@@ -30,7 +30,7 @@ import yaml
 
 from anvil.agent.budget import Budget, BudgetExceeded
 from anvil.agent.emitter import Emitter
-from anvil.agent.loop import Gate, PhaseOutcome, PhaseRunner, PhaseStatus, RunAborted
+from anvil.agent.loop import Gate, PhaseOutcome, PhaseRunner, PhaseStatus, RunAborted, ToolRecord
 from anvil.agent.outputs import SCRATCH_DIR, changed_files, filter_diff, render_report, write_outputs
 from anvil.agent.pipeline import Checkout, Ingested, Pipeline, RepoPipeline, Workspace
 from anvil.agent.prompts import (
@@ -569,12 +569,41 @@ class Orchestrator:
             if not passed:
                 return _Verdict(False, self._trim(f"The repro still fails after your patch:\n{text}"))
         outcome = self._run_phase(Phase.VERIFY, verify_kickoff(repro_cmd=state.repro_cmd))
-        for record in outcome.records:
-            if record.tool == "run_tests":
-                state.checks.append(CheckRun(f"run_tests {_test_targets(record.args)}".strip(), record.ok))
+        tests = [record for record in outcome.records if record.tool == "run_tests"]
+        for record in tests:
+            state.checks.append(CheckRun(f"run_tests {_test_targets(record.args)}".strip(), record.ok))
         if outcome.done:
             return _Verdict(True)
-        return _Verdict(False, self._trim(outcome.summary or f"verification did not finish ({outcome.status.value})"))
+        if outcome.status is PhaseStatus.GAVE_UP:
+            return _Verdict(False, self._trim(outcome.summary or "verification failed"))
+        return self._verdict_from_evidence(outcome, tests)
+
+    def _verdict_from_evidence(self, outcome: PhaseOutcome, tests: list[ToolRecord]) -> _Verdict:
+        """VERIFY ended without the model's verdict (stalled, looped, step limit, or closed at its cap): decide from the evidence.
+
+        A model that has run the tests and then wanders off has still verified the patch, and sending it back to PATCH for
+        that alone re-opens a fix that works (a real run did, twice). The evidence is the harness's own repro re-run, which
+        passed or VERIFY would not have started, and the ``run_tests`` calls of the phase: if the last one failed the patch
+        failed verification, if it passed the patch is verified. With no test run at all the repro alone verifies it, and the
+        confidence stays below high; with neither there is no evidence and verification failed.
+        """
+        state, status = self._state, outcome.status.value
+        if tests and not tests[-1].ok:
+            return _Verdict(False, self._trim(f"Verification did not finish ({status}) and the last test run failed:\n{tests[-1].output}"))
+        if tests:
+            state.limit(
+                f"VERIFY ended without the model's verdict ({status}); the harness closed it on the evidence: the repro "
+                "passes and the last test run passed."
+            )
+            return _Verdict(True)
+        if state.repro_cmd:
+            state.verify_without_tests = True
+            state.limit(
+                f"VERIFY ended without the model's verdict ({status}) and ran no tests; the harness verified the patch on "
+                "the repro alone."
+            )
+            return _Verdict(True)
+        return _Verdict(False, self._trim(f"Verification did not finish ({status}) and there is no repro and no test run to go on."))
 
     def _review(self) -> str:
         """The model reviews its own diff. Returns the requested changes, or ``""`` to go ahead."""

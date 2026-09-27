@@ -46,6 +46,7 @@ class RunState:
     halted: str = ""  # why the run was cut short (budget, aborted, error, interrupted), if it was
     sanity: str = ""  # the outcome of the pre-delivery patch check, one line for report.md ("" when it did not run)
     sanity_failed: bool = False  # the patch is empty or does not apply even after the one forced-fix retry
+    verify_without_tests: bool = False  # VERIFY was closed by the harness on the repro alone: no test was run
 
     def limit(self, note: str) -> None:
         """Record a known limitation for the report (duplicates are ignored)."""
@@ -61,10 +62,12 @@ class RunState:
         """``"none"`` | ``"low"`` | ``"medium"`` | ``"high"``.
 
         High needs all of: the bug reproduced before the patch, verification
-        passing after it, no failing test run, and the reviewer's approval. A
-        verified patch with a caveat (unapproved review, failing tests) is
-        medium; anything unverified or never reproduced is low. A run that was
-        cut short (``halted``) is never higher than medium, whatever it had by then.
+        passing after it (with at least one test run: ``verify_without_tests``
+        is a verification on the repro alone), no failing test run, and the
+        reviewer's approval. A verified patch with a caveat (unapproved review,
+        failing tests, no test run) is medium; anything unverified or never
+        reproduced is low. A run that was cut short (``halted``) is never higher
+        than medium, whatever it had by then.
         """
         if not has_patch:
             return "none"
@@ -72,7 +75,12 @@ class RunState:
             return "low"  # a patch that cannot be applied cannot be trusted whatever else is true of it
         if not (self.repro_confirmed and self.verified):
             return "low"
-        clean = self.review == REVIEW_APPROVED and all(c.passed for c in self.checks) and not self.halted
+        clean = (
+            self.review == REVIEW_APPROVED
+            and all(c.passed for c in self.checks)
+            and not self.halted
+            and not self.verify_without_tests
+        )
         return "high" if clean else "medium"
 
     def confidence_score(self, has_patch: bool) -> float:
