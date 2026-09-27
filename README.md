@@ -34,6 +34,47 @@ make run ISSUE=https://github.com/owner/repo/issues/42
 
 ---
 
+## How a run works
+
+```
+INGEST → PROFILE → UNDERSTAND → LOCALIZE → REPRODUCE → PATCH ⇄ VERIFY → REVIEW → FINALIZE
+```
+
+- **INGEST and PROFILE are plain code.** The issue comes from the GitHub API (or from `--issue-text`), the repository is cloned
+  at the revision the issue was reported against (or `--ref`), the language and test command are detected, and the
+  dependencies are installed into `.anvil_venv/`. For an old repository that means a Python of its era and packages dated to the
+  base commit.
+- **The other phases are model tool loops.** Each phase sees only the tools it needs (LOCALIZE cannot edit, REVIEW can run tests
+  but cannot edit) and works from the summaries of the phases before it.
+- **Reproduce first.** The model must write a script under `.anvil/` that fails for the reason in the issue. Anything it changes
+  outside `.anvil/` during REPRODUCE is reverted, and if it shows the bug but never confirms it, the harness adopts that failing
+  command as the repro.
+- **The harness checks the facts itself.** It re-runs the repro, reads the diff and counts test failures instead of trusting the
+  model. An unfinished VERIFY is decided from that evidence.
+- **Bounded.** Each phase has a call cap; when a model does not close a phase, the harness closes it with a summary of what was
+  done. A run makes at most 3 PATCH attempts, whatever else asks for one. There are step, token and wall-clock budgets too.
+- **Recovery.** Loops are caught (the same call three times in a row, or a fourth identical call in a phase), failed edits get
+  the closest real lines, and repeated failures roll back to a checkpoint.
+- **The patch is checked before delivery.** It must be non-empty, apply to the base commit, leave the tests alone (unless the
+  issue is about tests) and not add a bare `assert`; a patch that fails gets one forced-fix retry.
+- **FINALIZE always runs.** Whatever goes wrong, `patch.diff`, `report.md` and `trace.jsonl` are written.
+
+Behaviour details and the reasons for them are in [`src/anvil/agent/NOTES.md`](src/anvil/agent/NOTES.md).
+
+### Reading `report.md`
+
+| Confidence | Meaning |
+|---|---|
+| **high** (0.90) | The bug was reproduced before the patch, the patch verified after it, no test run failed, the review approved, and the run was not cut short |
+| **medium** (0.60) | Verified, with a caveat: the review asked for changes or did not finish, a test run failed, or verification rested on the repro alone |
+| **low** (0.30) | Not reproduced, not verified, or the patch failed its sanity check |
+| **none** (0) | No patch |
+
+The **Known limitations** section lists everything the harness had to do for the run: phases it closed itself, a repro it
+adopted, a retry that was undone, a limit that stopped patching. Read it before trusting a patch.
+
+---
+
 ## Demo mode (no API key needed)
 
 ```bash
@@ -60,7 +101,7 @@ key in `config.yaml`:
 | `max_output_tokens` | Profile: Qwen `4096`, DeepSeek chat `8192`, reasoning models provider default | Cap on tokens per LLM reply (`null` = provider default) |
 | `strip_reasoning` | `true` | Strip `<think>...</think>` and `reasoning_content` blocks from replies |
 | `llm_extra_params` | `{}` | Extra dictionary of provider-specific parameters sent with every request body |
-| `tool_mode` | `auto` | How tools are offered: `native` (provider tool-calling API) \| `text` (describe in prompt) \| `auto` (try native, fall back to text) |
+| `tool_mode` | `auto` | How tools are offered: `native` (provider tool-calling API) \| `text` (describe in prompt) \| `auto` (try native; the first native tool-call failure of a run switches the rest of the run to text mode for good) |
 | `llm_max_attempts` | `5` | Total tries per LLM request, including the first |
 | `llm_timeout_seconds` | `120` | Per-request read/write timeout |
 | `llm_connect_timeout_seconds` | `10` | TCP connect timeout |
@@ -111,6 +152,8 @@ separate from `llm_max_attempts` and the 429/5xx/network backoff settings.
 | `AI_API_KEY` | **(required)** API key — read only from the environment, never hard-coded |
 | `AI_BASE_URL` | Overrides `base_url` without editing `config.yaml` |
 | `AI_MODEL` | Overrides `model` without editing `config.yaml` |
+| `GITHUB_TOKEN` | *(optional)* Raises GitHub's API rate limit for fetching the issue (see Troubleshooting) |
+| `ANVIL_OUTPUT_DIR` | *(optional)* Where `patch.diff`, `report.md` and `trace.jsonl` are written; the benchmark runner sets it per instance |
 
 ---
 
@@ -160,6 +203,31 @@ Every run writes three files to `output/`:
 
 ---
 
+## Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `Could not fetch the issue from GitHub: ... rate-limited (HTTP 403)` | GitHub allows 60 unauthenticated API calls an hour. Set `GITHUB_TOKEN`, or skip the API: `python -m anvil --repo <repo-url> --issue-text "the issue" --headless` |
+| `Out of credit: ... refused the request (HTTP 402)` | The account behind `AI_API_KEY` has no credit. Add credit, or set `AI_API_KEY`, `AI_BASE_URL` and `AI_MODEL` for another provider. A 402 that asks you to retry after in-flight requests settle is retried automatically |
+| `Rate limit exceeded: free-models-per-day` (HTTP 429) | Free models on a provider such as OpenRouter have a daily request cap for the whole account, and a run needs dozens of model calls. Use a paid model or another provider |
+| The model answers but never calls tools | Run `python -m anvil.llm.probe` to see which tool mode the endpoint supports. In `auto` mode the client switches to text mode at the first native failure |
+| Tests cannot run in an old repository | The dependency step picks the newest Python that existed at the base commit, falls back to `uv python install`, and says what it did in the TUI and `report.md`. Check the message, and that `git` and `uv` are installed |
+| `make setup` cannot find a Python | It needs Python 3.11 or newer with `venv`; Homebrew Pythons without `ensurepip` are skipped |
+
+---
+
+## Known limitations
+
+- **Verified on Python repositories only.** The pipeline is language-agnostic (profile, tools, sandbox), but a JavaScript,
+  TypeScript, Go, Rust or Java issue has not been run end to end.
+- **Small or weak models often do not close phases.** The harness closes them itself and lowers the confidence, so results with
+  such a model are usually medium at best.
+- **Old repositories depend on the machine.** Their tests need a Python of the right era; without one installed the harness
+  fetches it with `uv` (network required).
+- **Benchmarks use real provider quota** and clone from GitHub; they are not part of `make test`.
+
+---
+
 ## Running tests
 
 ```bash
@@ -203,26 +271,24 @@ anvil/
 ├── src/anvil/
 │   ├── __main__.py            # CLI entry point (Sneha)
 │   ├── events.py              # AgentEvent · Phase · EventBus (Parrv)
-│   ├── agent/
-│   │   ├── orchestrator.py   # Phase cycle driver + load_config (Parrv)
-│   │   ├── loop.py           # Per-phase LLM + tool loop (Parrv)
-│   │   ├── pipeline.py       # Phase sequencer (Parrv)
-│   │   ├── budget.py         # Step / token / wall-clock budgets (Parrv)
-│   │   ├── prompts.py        # Phase-specific system prompts (Parrv)
-│   │   ├── outputs.py        # patch.diff / report.md writer (Parrv)
-│   │   └── state.py          # Mutable run state (Parrv)
-│   ├── context/
-│   │   └── manager.py        # Context window manager + pruning (Parrv)
-│   ├── llm/
-│   │   └── client.py         # OpenAI-compatible LLM client (Parrv)
-│   ├── repo/
-│   │   ├── ingest.py         # GitHub issue fetch + clone (Akshat)
-│   │   └── profile.py        # Language/framework detection (Akshat)
-│   ├── sandbox/
-│   │   └── base.py           # Sandbox protocol + worktree impl (Akshat)
-│   ├── tools/
-│   │   ├── base.py           # Tool protocol + ToolResult (Akshat)
-│   │   └── registry.py       # ToolRegistry (Akshat)
+│   ├── agent/                 # the harness (Parrv)
+│   │   ├── orchestrator.py    # runs the phase cycle, checks the facts itself, always finalizes; load_config
+│   │   ├── pipeline.py        # INGEST + PROFILE: issue, clone at the right revision, dependencies, sandbox, tools
+│   │   ├── loop.py            # one phase: the tool loop, call caps, the harness's own phase close
+│   │   ├── closure.py         # the summary the harness writes when it closes a phase itself
+│   │   ├── recovery.py        # loop detector, repeated-call refusal, edit hints, checkpoints and rollback
+│   │   ├── repro.py           # write_repro tool; does a failing output match the issue?
+│   │   ├── sanity.py          # checks on the patch before delivery (empty, applies, tests, bare assert)
+│   │   ├── prompts.py         # phase prompts, tool allowlists, kickoff messages
+│   │   ├── settings.py · budget.py · usage.py · state.py   # typed settings, budgets, token use, run state
+│   │   ├── outputs.py · emitter.py · summarizer.py · text.py · prepared_sandbox.py
+│   │   └── NOTES.md           # behaviour notes: what the harness does, and why
+│   ├── context/               # context window: pruning, read-file caps, token estimates (Parrv)
+│   ├── llm/                   # OpenAI-compatible client, model profiles, text-mode tool-call parser, probe (Parrv)
+│   ├── repo/                  # ingest.py (issue + clone) · profile.py (language, test command) · deps.py (dependencies) (Akshat)
+│   ├── sandbox/               # Sandbox protocol; worktree (default) and docker (experimental) (Akshat)
+│   ├── tools/                 # list_dir · grep · read_file · edit_file · run_cmd · run_tests · git_diff · related_tests
+│   │                          # · outline · find_symbol · find_references (Akshat)
 │   ├── trace/
 │   │   └── recorder.py       # JSONL trace recorder/loader (Sneha)
 │   └── tui/
@@ -244,6 +310,7 @@ anvil/
 └── docs/
     ├── ARCHITECTURE.md        # Implemented lifecycle and component contracts
     ├── EVALUATION.md          # Run protocol and measured comparison
+    ├── DEMO.md                # Demo walkthrough
     └── sample_trace.jsonl     # Trace sample for offline replay
 ```
 
